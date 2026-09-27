@@ -814,6 +814,82 @@ func mustLinkEvent(t *testing.T, id, subject string, at time.Time, hash string) 
 	return e
 }
 
+// TestNeighbors_KindHashLastSeenIndexExists is R4 (round 2): Neighbors'
+// per-key query ORDER BY last_seen DESC had no supporting index, forcing
+// a full sort of every row for a hot (kind, hash) key on every call.
+func TestNeighbors_KindHashLastSeenIndexExists(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	_ = s
+	pool := openScopedPool(t, ctx)
+	var exists bool
+	if err := pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND tablename = 'links' AND indexdef LIKE '%last_seen%')`,
+		runSchema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("query pg_indexes: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected an index covering links(tenant, kind, hash, last_seen) to support Neighbors' ORDER BY")
+	}
+}
+
+// TestNeighbors_DeterministicAcrossRepeatedCalls is R4 (round 2)'s
+// contract test: neither the per-key neighbor query (ORDER BY last_seen
+// DESC alone, with several neighbors sharing an identical last_seen) nor
+// the outer key-list query (SELECT DISTINCT kind, hash with no ORDER BY
+// at all, with two different link keys) is guaranteed a deterministic
+// order by the SQL standard — Postgres is free to return tied or
+// unordered rows in any sequence, so which neighbors survive truncation
+// could vary run to run (a different query plan, a parallel worker, a
+// vacuum-reordered heap) even against unchanged data, even though a
+// same-process repeated call in this test tends to observe a stable
+// order either way (Postgres doesn't literally shuffle an unchanged
+// table between two back-to-back queries on the same connection) —
+// this asserts the now-explicit, index-backed ORDER BY clauses rather
+// than relying on that incidental stability.
+func TestNeighbors_DeterministicAcrossRepeatedCalls(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	base := mustTime(t, "2031-01-01T00:00:00Z")
+	hashA := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	hashB := "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+	var events []event.Event
+	events = append(events, mustLinkEvent(t, "evt_q_a", "acct_query_det", base, hashA))
+	events = append(events, mustLinkEvent(t, "evt_q_b", "acct_query_det", base, hashB))
+	// Three same-key, same-timestamp neighbors on hashA (capPerKey will be
+	// 2, forcing a same-last_seen tiebreak) and two on hashB.
+	for _, name := range []string{"na1", "na2", "na3"} {
+		events = append(events, mustLinkEvent(t, "evt_"+name, name, base, hashA))
+	}
+	for _, name := range []string{"nb1", "nb2"} {
+		events = append(events, mustLinkEvent(t, "evt_"+name, name, base, hashB))
+	}
+	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", events); err != nil {
+		t.Fatalf("AppendEvents: %v", err)
+	}
+
+	first, firstTruncated, err := s.Neighbors(ctx, testTenant, "acct_query_det", 2, 3)
+	if err != nil {
+		t.Fatalf("Neighbors (1st): %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		got, gotTruncated, err := s.Neighbors(ctx, testTenant, "acct_query_det", 2, 3)
+		if err != nil {
+			t.Fatalf("Neighbors (repeat %d): %v", i, err)
+		}
+		if gotTruncated != firstTruncated || len(got) != len(first) {
+			t.Fatalf("non-deterministic Neighbors shape: first=%v/%v, repeat %d=%v/%v", first, firstTruncated, i, got, gotTruncated)
+		}
+		for j := range got {
+			if got[j] != first[j] {
+				t.Fatalf("non-deterministic Neighbors order: first=%v, repeat %d=%v", first, i, got)
+			}
+		}
+	}
+}
+
 func TestNeighbors_TenantSubjectIndexExists(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

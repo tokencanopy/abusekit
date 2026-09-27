@@ -30,8 +30,12 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 		capTotal = DefaultNeighborCapTotal
 	}
 
+	// R4 (round 2): ORDER BY kind, hash — SELECT DISTINCT with no ORDER BY
+	// has no defined row order, so which keys get processed first (and
+	// therefore which of them fill up capTotal before the rest are simply
+	// skipped) was not deterministic call to call against unchanged data.
 	keyRows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT kind, hash FROM links WHERE tenant = $1 AND subject = $2`, tenant, subject)
+		`SELECT DISTINCT kind, hash FROM links WHERE tenant = $1 AND subject = $2 ORDER BY kind, hash`, tenant, subject)
 	if err != nil {
 		return nil, false, fmt.Errorf("store: query link keys for subject %s: %w", subject, err)
 	}
@@ -68,10 +72,15 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 		// S13: ORDER BY last_seen DESC (not subject) — when a key's
 		// neighbors exceed capPerKey, the ones worth keeping are the most
 		// recently active, not whichever sort alphabetically first.
+		// R4 (round 2): ", subject" breaks a last_seen tie deterministically
+		// — several neighbors sharing an identical last_seen (routine when
+		// they were all touched by the same batch/backfill) otherwise left
+		// Postgres free to return them in any order, so which ones survived
+		// a capPerKey truncation could vary call to call.
 		rows, err := s.pool.Query(ctx, `
 			SELECT subject FROM links
 			WHERE tenant = $1 AND kind = $2 AND hash = $3 AND subject <> $4
-			ORDER BY last_seen DESC
+			ORDER BY last_seen DESC, subject
 			LIMIT $5
 		`, tenant, kh.kind, kh.hash, subject, capPerKey+1)
 		if err != nil {
