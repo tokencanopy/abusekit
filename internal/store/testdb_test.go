@@ -336,13 +336,14 @@ func newThrowawayDatabaseURL(t *testing.T) string {
 	return target
 }
 
-// truncateAll resets every abusekit table between tests. All eight tables
-// are reachable without FK CASCADE concerns since S1's schema has no
-// foreign keys between them (see 001_core.sql's comment on
-// current_verdict_id) — a plain multi-table TRUNCATE is enough.
+// truncateAll resets every abusekit table between tests. All tables are
+// reachable without FK CASCADE concerns since S1's schema has no foreign
+// keys between them (see 001_core.sql's comment on current_verdict_id) —
+// a plain multi-table TRUNCATE is enough. budget_usage (S7 fix round,
+// migrations/007) is included alongside the original eight.
 func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 	_, err := pool.Exec(ctx, `
-		TRUNCATE events, links, subjects, verdicts, rule_state, labels, corpus_examples, calibrations
+		TRUNCATE events, links, subjects, verdicts, rule_state, labels, corpus_examples, calibrations, budget_usage
 	`)
 	return err
 }

@@ -503,3 +503,50 @@ func TestClaimDirtySubjects_UsesIndexesNotSequentialScans(t *testing.T) {
 		}
 	}
 }
+
+func TestBudgetUsage_IncrementAndGet(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	zero, err := s.GetBudgetUsage(ctx, "2031-01-01", "adapter", "jev")
+	if err != nil {
+		t.Fatalf("GetBudgetUsage (before any increment): %v", err)
+	}
+	if zero != 0 {
+		t.Fatalf("GetBudgetUsage (before any increment) = %d, want 0", zero)
+	}
+
+	for i := 1; i <= 3; i++ {
+		got, err := s.IncrementBudgetUsage(ctx, "2031-01-01", "adapter", "jev")
+		if err != nil {
+			t.Fatalf("IncrementBudgetUsage (call %d): %v", i, err)
+		}
+		if got != i {
+			t.Fatalf("IncrementBudgetUsage (call %d) = %d, want %d", i, got, i)
+		}
+	}
+
+	got, err := s.GetBudgetUsage(ctx, "2031-01-01", "adapter", "jev")
+	if err != nil {
+		t.Fatalf("GetBudgetUsage: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("GetBudgetUsage = %d, want 3", got)
+	}
+
+	// A different day/dim/key is an independent counter.
+	otherDay, err := s.GetBudgetUsage(ctx, "2031-01-02", "adapter", "jev")
+	if err != nil {
+		t.Fatalf("GetBudgetUsage (other day): %v", err)
+	}
+	if otherDay != 0 {
+		t.Fatalf("GetBudgetUsage (other day) = %d, want 0", otherDay)
+	}
+	otherDim, err := s.GetBudgetUsage(ctx, "2031-01-01", "subject", "jev")
+	if err != nil {
+		t.Fatalf("GetBudgetUsage (other dim): %v", err)
+	}
+	if otherDim != 0 {
+		t.Fatalf("GetBudgetUsage (other dim) = %d, want 0", otherDim)
+	}
+}

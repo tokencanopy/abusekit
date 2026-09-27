@@ -121,7 +121,9 @@ func TestWorker_RecordsBudgetDenialMetric(t *testing.T) {
 
 	now := replayBase.Add(time.Minute)
 	budgets := NewBudgets(1, 1, 1)
-	budgets.Record("fake_test_scorer", testTenant, "acct_metrics_budget", now)
+	if err := budgets.Record(context.Background(), "fake_test_scorer", testTenant, "acct_metrics_budget", now); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
 	metrics := NewMetrics()
 
 	w, err := New(Deps{Store: s, Config: cfg, Budgets: budgets, Metrics: metrics, Now: func() time.Time { return now }})

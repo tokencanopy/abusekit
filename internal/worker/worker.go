@@ -471,7 +471,11 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 
 		budgeted := r.Scorer != "local" && w.deps.Budgets != nil
 		if budgeted {
-			if allowed, code := w.deps.Budgets.Allow(r.Scorer, d.Tenant, d.Subject, isElevated, now); !allowed {
+			allowed, code, berr := w.deps.Budgets.Allow(ctx, r.Scorer, d.Tenant, d.Subject, isElevated, now)
+			if berr != nil {
+				return false, fmt.Errorf("check budget for %s: %w", r.Name, berr)
+			}
+			if !allowed {
 				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: code}
 				costCapped = true
 				if w.deps.Metrics != nil {
@@ -503,7 +507,9 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 		}
 
 		if budgeted {
-			w.deps.Budgets.Record(r.Scorer, d.Tenant, d.Subject, now)
+			if berr := w.deps.Budgets.Record(ctx, r.Scorer, d.Tenant, d.Subject, now); berr != nil {
+				return false, fmt.Errorf("record budget usage for %s: %w", r.Name, berr)
+			}
 		}
 		if backoff.Attempts > 0 {
 			if cerr := w.deps.Store.ClearRuleBackoff(ctx, d.Tenant, d.Subject, r.Name); cerr != nil {

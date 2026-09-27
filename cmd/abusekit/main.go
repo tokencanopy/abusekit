@@ -129,6 +129,7 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 		Neighbors: deps.neighbors,
 		Brands:    deps.brands,
 		Metrics:   deps.metrics,
+		Budgets:   deps.budgets,
 		Logger:    slog.Default(),
 	})
 	if err != nil {
@@ -146,6 +147,21 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 	return nil
 }
 
+// Placeholder daily budget defaults (S7 fix round; design §8 open question
+// 3, "$5/day per vendor adapter, 20 calls/subject/day, 2,000/producer/day —
+// confirm"): v0 has no vendor adapter registered at all, so these are
+// currently dead code on every real request (internal/worker never checks
+// a budget for a rule scored by "local"). defaultPerTenantDailyBudget
+// reuses design's "2,000/producer/day" figure under internal/worker.
+// Budgets' documented producer-to-tenant substitution; there is no
+// per-adapter dollar-to-call conversion available yet, so
+// defaultPerAdapterDailyBudget is a round, deliberately generous
+// placeholder pending real per-adapter cost data.
+const (
+	defaultPerAdapterDailyBudget = 5000
+	defaultPerTenantDailyBudget  = 2000
+)
+
 // bootDeps are the pieces of boot's startup sequence that only `serve`
 // (not `serve --check` or `migrate`) needs to go on and construct a
 // worker.Worker from.
@@ -153,6 +169,7 @@ type bootDeps struct {
 	neighbors feature.Neighbors
 	brands    feature.BrandSet
 	metrics   *worker.Metrics
+	budgets   *worker.Budgets
 }
 
 // boot performs the startup sequence every `serve` invocation needs:
@@ -216,6 +233,7 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 	deps := bootDeps{
 		neighbors: feature.NewStoreNeighbors(s, feature.Config{}), // default link-kind policy (S1 fix round) until a tenant-specific override exists
 		brands:    brands,
+		budgets:   worker.NewPersistedBudgets(s, defaultPerAdapterDailyBudget, worker.DefaultPerSubjectDailyBudget, defaultPerTenantDailyBudget),
 		metrics:   metrics,
 	}
 	return s, cfg, deps, nil

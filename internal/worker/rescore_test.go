@@ -86,7 +86,9 @@ func TestScoreSubject_RescheduleOnCostCap(t *testing.T) {
 
 	now := replayBase.Add(time.Minute)
 	budgets := NewBudgets(1, 1, 1)
-	budgets.Record("fake_test_scorer", testTenant, "acct_reschedule_costcap", now) // pre-exhaust the cap
+	if err := budgets.Record(context.Background(), "fake_test_scorer", testTenant, "acct_reschedule_costcap", now); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
 
 	w, err := New(Deps{Store: s, Config: cfg, Budgets: budgets, Now: func() time.Time { return now }})
 	if err != nil {
