@@ -54,10 +54,24 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 	out := make([]string, 0, capTotal)
 
 	for _, kh := range keys {
+		// S13: bound the OUTER loop at capTotal too — once the total cap
+		// is already reached, every further per-key query would only
+		// discover more truncation, never a new neighbor, so stop issuing
+		// them. (Reaching capTotal mid-key, inside the row loop below,
+		// still needs its own check to mark truncated and stop reading
+		// that key's remaining rows.)
+		if len(out) >= capTotal {
+			truncated = true
+			break
+		}
+
+		// S13: ORDER BY last_seen DESC (not subject) — when a key's
+		// neighbors exceed capPerKey, the ones worth keeping are the most
+		// recently active, not whichever sort alphabetically first.
 		rows, err := s.pool.Query(ctx, `
-			SELECT DISTINCT subject FROM links
+			SELECT subject FROM links
 			WHERE tenant = $1 AND kind = $2 AND hash = $3 AND subject <> $4
-			ORDER BY subject
+			ORDER BY last_seen DESC
 			LIMIT $5
 		`, tenant, kh.kind, kh.hash, subject, capPerKey+1)
 		if err != nil {

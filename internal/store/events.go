@@ -150,11 +150,18 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 }
 
 func touchSubjectTx(ctx context.Context, tx pgx.Tx, tenant, subject string, at time.Time) error {
+	// S7: first_seen_at uses LEAST(existing, new) rather than "whatever was
+	// there at first INSERT" — events don't always arrive in `at` order
+	// (a backfill, a retried batch, or plain network reordering can
+	// deliver an earlier event after a later one), and first_seen_at
+	// feeds subject-age features that must reflect the account's true
+	// earliest known activity, not just the earliest EVENT DELIVERY.
 	_, err := tx.Exec(ctx, `
 		INSERT INTO subjects (tenant, subject, dirty_seq, first_seen_at, last_event_at)
 		VALUES ($1, $2, 1, $3, $3)
 		ON CONFLICT (tenant, subject) DO UPDATE SET
 			dirty_seq     = subjects.dirty_seq + 1,
+			first_seen_at = LEAST(subjects.first_seen_at, EXCLUDED.first_seen_at),
 			last_event_at = GREATEST(subjects.last_event_at, EXCLUDED.last_event_at)
 	`, tenant, subject, at)
 	if err != nil {
@@ -164,11 +171,14 @@ func touchSubjectTx(ctx context.Context, tx pgx.Tx, tenant, subject string, at t
 }
 
 func upsertLinkTx(ctx context.Context, tx pgx.Tx, tenant, kind, hash, subject string, at time.Time) error {
+	// S7: same LEAST(existing, new) fix as touchSubjectTx, for the same
+	// out-of-order-delivery reason.
 	_, err := tx.Exec(ctx, `
 		INSERT INTO links (tenant, kind, hash, subject, first_seen, last_seen)
 		VALUES ($1, $2, $3, $4, $5, $5)
 		ON CONFLICT (tenant, kind, hash, subject) DO UPDATE SET
-			last_seen = GREATEST(links.last_seen, EXCLUDED.last_seen)
+			first_seen = LEAST(links.first_seen, EXCLUDED.first_seen),
+			last_seen  = GREATEST(links.last_seen, EXCLUDED.last_seen)
 	`, tenant, kind, hash, subject, at)
 	if err != nil {
 		return fmt.Errorf("store: upsert link %s/%s for subject %s: %w", kind, hash, subject, err)

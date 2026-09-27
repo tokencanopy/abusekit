@@ -100,16 +100,45 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 	}
 
 	lastID := ids[len(ids)-1]
-	if _, err := tx.Exec(ctx, `
+	// S5: only materialize this round's summary if it is at least as new
+	// as whatever scored_seq the subject already has recorded. Without the
+	// "AND scored_seq <= $4" guard, a round that started reading dirty_seq
+	// early (dirtySeqAtStart is small) but COMMITS after a later, newer
+	// round already advanced scored_seq would overwrite current_tier with
+	// its own, older, now-stale summary — proven: seq=3 recording "high"
+	// followed by a late-committing seq=1 round recording "low" left the
+	// subject at "low". GREATEST(scored_seq, $4) in the SET list is now
+	// only reached when the WHERE clause's own scored_seq <= $4 already
+	// holds, so it can never regress either.
+	cmdTag, err := tx.Exec(ctx, `
 		UPDATE subjects SET
 			current_tier       = $1,
 			current_score      = $2,
 			current_verdict_id = $3,
 			current_scored_at  = now(),
 			scored_seq         = GREATEST(scored_seq, $4)
-		WHERE tenant = $5 AND subject = $6
-	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject); err != nil {
+		WHERE tenant = $5 AND subject = $6 AND scored_seq <= $4
+	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject)
+	if err != nil {
 		return nil, fmt.Errorf("store: update subject summary for %s: %w", subject, err)
+	}
+	if cmdTag.RowsAffected() == 0 {
+		// Zero rows affected means either (a) the subject row doesn't
+		// exist at all — a real error, not a silent no-op, since the
+		// caller believes it just recorded a scoring round for a real
+		// subject — or (b) the subject exists but a newer round already
+		// recorded a higher scored_seq, in which case this round's
+		// summary is correctly, intentionally not applied (see above).
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM subjects WHERE tenant = $1 AND subject = $2)`,
+			tenant, subject,
+		).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("store: check subject existence for %s: %w", subject, err)
+		}
+		if !exists {
+			return nil, fmt.Errorf("store: cannot record verdicts for %s/%s: subject row does not exist", tenant, subject)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -163,19 +192,26 @@ type SubjectView struct {
 // §4.4: "404 not_found only for a subject never seen in this tenant" — a
 // seen-but-unscored subject is a normal SubjectView with Tier "unknown"
 // and no Signals, not an error).
-func (s *Store) SubjectView(ctx context.Context, tenant, subject string) (*SubjectView, error) {
+//
+// currentRules, when non-nil, restricts Signals (and the Degraded
+// computed from them) to rules present in the caller's current config
+// (S14): a rule renamed or dropped from config.rules.yaml still has old
+// verdicts rows in history, but they must stop contributing to the live
+// view. Pass nil to see every rule that ever recorded a verdict for this
+// subject (e.g. for an operator/debug view), matching the pre-S14
+// behavior.
+func (s *Store) SubjectView(ctx context.Context, tenant, subject string, currentRules []string) (*SubjectView, error) {
 	v := &SubjectView{Subject: subject}
 	var (
 		currentScore    *float64
 		currentScoredAt *time.Time
 		dirtySeq        int64
 		scoredSeq       int64
-		lastEventAt     time.Time
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT class, current_tier, current_score, current_scored_at, dirty_seq, scored_seq, last_event_at
+		SELECT class, current_tier, current_score, current_scored_at, dirty_seq, scored_seq
 		FROM subjects WHERE tenant = $1 AND subject = $2
-	`, tenant, subject).Scan(&v.Class, &v.Tier, &currentScore, &currentScoredAt, &dirtySeq, &scoredSeq, &lastEventAt)
+	`, tenant, subject).Scan(&v.Class, &v.Tier, &currentScore, &currentScoredAt, &dirtySeq, &scoredSeq)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -187,19 +223,32 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string) (*Subje
 	}
 	v.ScoredAt = currentScoredAt
 	v.EventsSinceScore = dirtySeq - scoredSeq
-	if currentScoredAt != nil {
-		v.Stale = lastEventAt.After(*currentScoredAt)
-	} else {
-		v.Stale = dirtySeq > 0
-	}
+	// S4: Stale is purely dirty_seq > scored_seq — comparing wall-clock
+	// timestamps (last_event_at vs. current_scored_at) from two different
+	// clocks (the app server that stamped the event's `at`, and Postgres's
+	// own now()) is wrong even a few hundred milliseconds of drift away,
+	// and is *always* wrong for a fictional test timestamp far from the
+	// real clock.
+	v.Stale = dirtySeq > scoredSeq
 
-	rows, err := s.pool.Query(ctx, `
+	query := `
 		SELECT DISTINCT ON (rule)
 			rule, mode, status, risk, flagged, model, checkpoint, calibration, reason, error_code, scored_at
 		FROM verdicts
-		WHERE tenant = $1 AND subject = $2
-		ORDER BY rule, scored_at DESC
-	`, tenant, subject)
+		WHERE tenant = $1 AND subject = $2`
+	args := []any{tenant, subject}
+	if len(currentRules) > 0 {
+		query += ` AND rule = ANY($3)`
+		args = append(args, currentRules)
+	}
+	// S14: a DISTINCT ON tiebreak solely on scored_at is non-deterministic
+	// when two verdicts for the same rule share an identical timestamp
+	// (e.g. two records from the same UpsertVerdicts call, which share one
+	// transaction's now()) — id DESC breaks the tie toward the
+	// later-inserted row.
+	query += ` ORDER BY rule, scored_at DESC, id DESC`
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: query verdicts for subject %s: %w", subject, err)
 	}
