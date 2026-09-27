@@ -2,8 +2,12 @@ package event
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // fieldSpec describes how one `data` key of a known event type is handled.
@@ -28,6 +32,10 @@ type fieldSpec struct {
 //
 // Ingest never consults rules (design §4.3): this table is the only
 // source of truth for what leaves the wire and reaches storage.
+//
+// Every listed field is a scalar (string, number, or bool) — see Redact's
+// doc comment for why an object or array under a listed key is a hard
+// rejection rather than a pass-through.
 var schema = map[string]map[string]fieldSpec{
 	"subject.created": {
 		"channel":            {maxLen: 64},
@@ -78,25 +86,62 @@ var schema = map[string]map[string]fieldSpec{
 }
 
 // emailRe flags a value that looks like an email address anywhere in a
-// string. It is intentionally simple (not a full RFC 5322 matcher):
-// redaction's job is to catch accidental PII, not to validate addresses,
-// and a stricter matcher would only create false negatives that let real
-// emails through.
-var emailRe = regexp.MustCompile(`[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}`)
+// string, once the string has been NFKC-folded (see looksLikeEmail). It is
+// intentionally simple (not a full RFC 5322 matcher): redaction's job is
+// to catch accidental PII, not to validate addresses, and a stricter
+// matcher would only create false negatives that let real emails through.
+//
+// \p{L} and \p{N} (rather than A-Za-z0-9) make the local part, domain and
+// TLD Unicode-aware, so an internationalized address (e.g. a Unicode local
+// part, or an IDN domain like "例え.テスト") is still caught — a plain ASCII
+// matcher would silently let those through.
+var emailRe = regexp.MustCompile(`[\p{L}\p{N}._%+\-]+@[\p{L}\p{N}.\-]+\.[\p{L}]{2,}`)
+
+// looksLikeEmail reports whether s contains an email-shaped substring,
+// after NFKC folding. NFKC normalizes compatibility characters to their
+// canonical form — notably the full-width '＠' (U+FF20) folds to the ASCII
+// '@' (U+0040) — so a producer cannot dodge the check by using a
+// Unicode-compatible look-alike of '@' or of an ASCII letter/digit.
+func looksLikeEmail(s string) bool {
+	return emailRe.MatchString(norm.NFKC.String(s))
+}
+
+// hasControlChar reports whether s contains any Unicode control character
+// (category Cc, which includes NUL and every other C0/C1 control code).
+// Redact and Validate both reject these outright: a NUL byte in specific
+// reaches Postgres as an untranslatable character (error 22021 in a
+// non-UTF8-safe path, 22P05 from a text column), so rejecting it at the
+// boundary is cheaper and clearer than letting the insert fail downstream.
+func hasControlChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
+}
 
 // Redact rewrites e.Data in place per the static schema for e.Type
 // (design §4.3):
-//   - For a known type: listed keys pass through capped (over-cap string
-//     values are truncated, not rejected); unlisted keys are silently
-//     dropped; a field with `skeleton: true` also gets a computed
-//     `<key>_skeleton` sibling (any producer-supplied value under that
-//     name is dropped as unlisted, then replaced by our own computation).
+//
+//   - First, e.Data is walked recursively — every map key and every string
+//     value, at any depth — and rejected with CodeRedactionFailed if any
+//     string contains a control character or looks like an email address.
+//     This runs before any type-checking, dropping or truncation, so a
+//     producer cannot dodge it by nesting a value inside an unlisted key,
+//     an array, or a field belonging to an event type Redact doesn't
+//     recognize.
+//   - For a known type: listed keys pass through, but ONLY as a scalar
+//     (string, number, or bool) — an object or array under a listed key is
+//     rejected with CodeRedactionFailed rather than silently stored,
+//     stringified, or size-capped, since the field's cap and skeleton
+//     handling only make sense for a single scalar value. Unlisted keys
+//     are dropped (not hashed). A string field with `skeleton: true` also
+//     gets a computed `<key>_skeleton` sibling (any producer-supplied
+//     value under that name is dropped as unlisted, then replaced by our
+//     own computation); an over-cap string is truncated, not rejected.
 //   - For an unknown type: every key is kept as-is (no allow-listing to
-//     apply), subject to the same email check and size cap.
-//   - In every case: any string value anywhere in data that looks like an
-//     email address fails the whole event with CodeRedactionFailed. This
-//     runs before truncation/dropping so a producer cannot dodge it by
-//     stuffing an address into an unlisted key.
+//     apply) — the recursive scan above already proved it clean.
 //
 // After rewriting, the JSON-encoded size of e.Data must be <= MaxDataBytes
 // or the event fails with CodeTooLarge.
@@ -108,15 +153,14 @@ func (e *Event) Redact() error {
 		return nil
 	}
 
+	if err := scanForLeaks(e.Data, "data"); err != nil {
+		return err
+	}
+
 	fields, known := schema[e.Type]
 	out := make(map[string]any, len(e.Data))
 
 	for k, v := range e.Data {
-		s, isString := v.(string)
-		if isString && emailRe.MatchString(s) {
-			return badErr(CodeRedactionFailed, "data."+k+" looks like an email address")
-		}
-
 		if !known {
 			out[k] = v
 			continue
@@ -125,13 +169,20 @@ func (e *Event) Redact() error {
 		if !listed {
 			continue // unlisted keys dropped, not an error
 		}
-		if isString && spec.maxLen > 0 && len(s) > spec.maxLen {
-			s = truncateUTF8(s, spec.maxLen)
-			v = s
-		}
-		out[k] = v
-		if spec.skeleton && isString {
-			out[k+"_skeleton"] = Skeleton(s)
+		switch val := v.(type) {
+		case string:
+			s := val
+			if spec.maxLen > 0 && len(s) > spec.maxLen {
+				s = truncateUTF8(s, spec.maxLen)
+			}
+			out[k] = s
+			if spec.skeleton {
+				out[k+"_skeleton"] = Skeleton(s)
+			}
+		case float64, bool, nil:
+			out[k] = v
+		default:
+			return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be a string, number, or bool, got %T", k, v))
 		}
 	}
 
@@ -147,6 +198,45 @@ func (e *Event) Redact() error {
 	}
 
 	e.Data = out
+	return nil
+}
+
+// scanForLeaks walks v recursively (v is always one of the types
+// encoding/json produces into an `any`: string, float64, bool, nil,
+// []any, or map[string]any — including when a test constructs a value by
+// hand rather than through json.Unmarshal), checking every string value
+// and every map key against hasControlChar/looksLikeEmail. path is used
+// only to build a human-readable error message.
+func scanForLeaks(v any, path string) error {
+	switch val := v.(type) {
+	case string:
+		return checkLeakString(val, path)
+	case map[string]any:
+		for k, vv := range val {
+			if err := checkLeakString(k, path+"."+k+" (key)"); err != nil {
+				return err
+			}
+			if err := scanForLeaks(vv, path+"."+k); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for i, vv := range val {
+			if err := scanForLeaks(vv, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func checkLeakString(s, path string) error {
+	if hasControlChar(s) {
+		return badErr(CodeRedactionFailed, path+" contains a control character")
+	}
+	if looksLikeEmail(s) {
+		return badErr(CodeRedactionFailed, path+" looks like an email address")
+	}
 	return nil
 }
 

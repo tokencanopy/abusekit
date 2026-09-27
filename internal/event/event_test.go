@@ -98,6 +98,24 @@ func TestEvent_Validate(t *testing.T) {
 			mutate:   func(e *Event) { e.Links.ASN = strings.Repeat("1", MaxASNLen+1) },
 			wantCode: CodeBadLinks,
 		},
+		// B1: NUL and other control characters must be rejected in id,
+		// subject and type, so a downstream Postgres insert can never see
+		// one (proven: \x00 in subject -> Postgres 22021/22P05).
+		{
+			name:     "NUL byte in id is rejected",
+			mutate:   func(e *Event) { e.ID = "evt_\x00_bad" },
+			wantCode: CodeBadID,
+		},
+		{
+			name:     "NUL byte in subject is rejected",
+			mutate:   func(e *Event) { e.Subject = "acct_\x00_bad" },
+			wantCode: CodeBadSubject,
+		},
+		{
+			name:     "other control character in subject is rejected",
+			mutate:   func(e *Event) { e.Subject = "acct_\x07_bad" },
+			wantCode: CodeBadSubject,
+		},
 	}
 
 	for _, tc := range tests {

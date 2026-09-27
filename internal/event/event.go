@@ -157,11 +157,11 @@ type ValidateOptions struct {
 //
 // Validate never mutates e and never panics.
 func (e *Event) Validate(opts ValidateOptions) error {
-	if e.ID == "" || len(e.ID) > MaxIDLen {
-		return badErr(CodeBadID, "id must be 1..64 bytes")
+	if e.ID == "" || len(e.ID) > MaxIDLen || hasControlChar(e.ID) {
+		return badErr(CodeBadID, "id must be 1..64 bytes with no control characters")
 	}
-	if e.Subject == "" || len(e.Subject) > MaxSubjectLen {
-		return badErr(CodeBadSubject, "subject must be 1..256 bytes")
+	if e.Subject == "" || len(e.Subject) > MaxSubjectLen || hasControlChar(e.Subject) {
+		return badErr(CodeBadSubject, "subject must be 1..256 bytes with no control characters")
 	}
 	if e.Type == "" || len(e.Type) > MaxTypeLen || !typeRe.MatchString(e.Type) {
 		return badErr(CodeBadType, "type must match ^[a-z_.]+$ and be 1..64 bytes")

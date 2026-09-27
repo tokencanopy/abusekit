@@ -122,6 +122,106 @@ func TestEvent_Redact(t *testing.T) {
 				}
 			},
 		},
+		// B1: listed fields must be type-checked scalars — an object or
+		// array under a listed key is rejected, not silently stored or
+		// stringified.
+		{
+			name:     "object under a listed skeleton field is rejected",
+			typ:      "resource.created",
+			data:     map[string]any{"name": map[string]any{"x": "alice@example.com"}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "object under a listed non-skeleton field is rejected",
+			typ:      "resource.created",
+			data:     map[string]any{"kind": map[string]any{"x": "safe"}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "array under a listed field is rejected",
+			typ:      "resource.created",
+			data:     map[string]any{"kind": []any{"bob@example.com"}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "array under a listed field is rejected even without an embedded email",
+			typ:      "resource.created",
+			data:     map[string]any{"kind": []any{"agent", "widget"}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "large array under subject_line is rejected, not size-capped",
+			typ:      "content.sent",
+			data:     map[string]any{"subject_line": makeStringSlice(300, "x")},
+			wantCode: CodeRedactionFailed,
+		},
+		// B1: unknown event types must be walked recursively — an email
+		// nested inside an object (at any depth) must be caught, not just
+		// top-level string values.
+		{
+			name:     "unknown type: nested email is rejected",
+			typ:      "some.custom_type",
+			data:     map[string]any{"nested": map[string]any{"to": "victim@example.com"}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "unknown type: email nested inside an array of objects is rejected",
+			typ:      "some.custom_type",
+			data:     map[string]any{"list": []any{map[string]any{"email": "deep@example.com"}}},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "unknown type: nested non-email data passes through",
+			typ:  "some.custom_type",
+			data: map[string]any{"nested": map[string]any{"kind": "agent"}},
+			check: func(t *testing.T, out map[string]any) {
+				nested, ok := out["nested"].(map[string]any)
+				if !ok || nested["kind"] != "agent" {
+					t.Fatalf("expected nested non-email data to pass through, got %#v", out)
+				}
+			},
+		},
+		// B1: the email check must run on NFKC-folded text and accept
+		// Unicode local parts/domains, including full-width '＠'.
+		{
+			name:     "full-width at-sign is still recognized as an email",
+			typ:      "some.custom_type",
+			data:     map[string]any{"anything": "alice＠example.com"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "unicode local part is recognized as an email",
+			typ:      "some.custom_type",
+			data:     map[string]any{"anything": "ü@example.com"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "unicode domain (IDN) is recognized as an email",
+			typ:      "some.custom_type",
+			data:     map[string]any{"anything": "alice@例え.テスト"},
+			wantCode: CodeRedactionFailed,
+		},
+		// B1: NUL and other control characters must be rejected in every
+		// string value, so a Postgres 22021/22P05 insert error can never
+		// happen downstream.
+		{
+			name:     "NUL byte in a string value is rejected",
+			typ:      "payment.attempt",
+			data:     map[string]any{"reason": "bad\x00value"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "NUL byte in an unlisted field is still rejected",
+			typ:      "subject.created",
+			data:     map[string]any{"totally_unlisted": "bad\x00value"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "other control character (bell) is rejected",
+			typ:      "payment.attempt",
+			data:     map[string]any{"reason": "bad\x07value"},
+			wantCode: CodeRedactionFailed,
+		},
 	}
 
 	for _, tc := range tests {
@@ -146,6 +246,17 @@ func TestEvent_Redact(t *testing.T) {
 			}
 		})
 	}
+}
+
+// makeStringSlice builds a []any of n copies of s, mimicking what a
+// producer sending a JSON array (rather than the expected string) for a
+// listed field would decode into.
+func makeStringSlice(n int, s string) []any {
+	out := make([]any, n)
+	for i := range out {
+		out[i] = s
+	}
+	return out
 }
 
 func TestSkeleton(t *testing.T) {
