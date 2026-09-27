@@ -1,0 +1,55 @@
+# config/local_weights.yaml — the `local` scorer's logistic model
+# (internal/model/local, design §4.6).
+#
+# PLACEHOLDER WEIGHTS. Every sign and magnitude below is hand-set to a
+# plausible direction from a synthetic reference scenario (design §1),
+# not fit against labelled data. They exist so the local scorer can
+# always answer something and so S2's replay fixtures (burst/fast/churn)
+# have a rule to score against; they are reviewed like code, and are
+# expected to be replaced by the first `abusekit calibrate`/gate run
+# (design §4.6, open question 5; plan.md S9).
+#
+# linear = bias + sum(weight[feature] * features[feature])
+# p(non-benign) = sigmoid(linear); p(benign) = 1 - p(non-benign)
+#
+# Feature set is exactly design §4.5's `new_account_velocity` inputs list.
+# A feature named here with no corresponding rule input is harmless (dead
+# weight); a rule input with no weight here contributes 0 — see
+# internal/model/local.Scorer.Score's doc comment.
+version: v1
+benign_label: benign
+bias: -4.0
+weights:
+  # Negative: an older account is less likely to be a fresh throwaway.
+  subject_age_h: -0.02
+
+  # Resource (agent/key) creation velocity and totals: the churn fixture's
+  # signature is many resources in a short window.
+  resource_velocity_1h: 0.8
+  resource_total: 0.05
+  key_velocity_1h: 0.9
+  key_total: 0.05
+
+  # Permanent onboarding facts (never age out, design §4.5).
+  upgrade_delay_min: -0.01 # a quick upgrade after signup is the burst fixture's shape
+  declines_before_first_success: 0.6
+  first_funding_prepaid: 0.7
+
+  # Name/identity patterns.
+  name_brand_match: 1.2
+  name_has_at: 0.5
+  first_day_distinct_domains: 0.3
+
+  # Rehearsal-to-self before an external blast (design §4.3's
+  # recipient_is_own_identity signal, aggregated into a feature).
+  self_send_before_external: 1.0
+
+  # Linked-subject evidence (design §4.2): a predecessor account sharing a
+  # link key that was deleted or already labelled abusive is strong
+  # evidence for a churn incarnation.
+  linked_deleted_n: 0.4
+  linked_labelled_abusive_n: 1.5
+  fingerprint_seen_on_other_subjects: 0.9
+
+  # Dormant-then-blast pattern.
+  burst_ratio_24h_vs_lifetime: 0.7

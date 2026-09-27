@@ -181,7 +181,13 @@ Response `202` `{accepted, duplicates, rejected: [{index, code, message}]}`; cod
 **Redaction [r2]** is a static, versioned schema per event type in code (`ingest/redact.go`):
 listed keys pass with their caps; unlisted keys are dropped (not hashed); any value matching an
 email address in a field that is not a hash is rejected with `redaction_failed`. Ingest never
-consults rules.
+consults rules. **[S1]** A listed field's cap truncates an over-cap string value rather than
+rejecting the event (truncation is lossy but keeps the event usable; a hard reject for a producer's
+minor length overshoot would be disproportionate); a listed field's value must be a scalar
+(string/number/bool) — an object or array is a `redaction_failed`, not a silent drop or
+stringification. The schema version that produced a given row is recorded on it
+(`events.redaction_version`) so a later schema change can identify rows redacted under an older
+rule set.
 
 ### 4.4 Score API
 
@@ -208,7 +214,12 @@ consults rules.
   `degraded = true` whenever any advise rule is unscored. Callers must treat `unknown` as
   "no evidence".
 - `stale = last_event_at > scored_at`; `events_since_score` counts them. A caller that needs
-  freshness calls `evaluate`.
+  freshness calls `evaluate`. **[S1]** The store implements this as `dirty_seq > scored_seq` (both
+  monotonic counters bumped/advanced by the same events/scoring rounds this compares) rather than
+  literally comparing the two timestamps: two different clocks (the app server that stamps an
+  event's `at`, and Postgres's own `now()` for `scored_at`) make a direct timestamp comparison wrong
+  under real clock skew, and unconditionally wrong for any test or backfill timestamp far from the
+  real wall clock.
 - `Cache-Control: no-store`; `ETag` = hash of the verdict ids in the response.
 
 **`POST /v1/subjects/{subject}/evaluate` [r2]** `{deadline_ms ≤ 3000}` → scores the subject now
@@ -302,7 +313,10 @@ type Explainer interface{ Name() string; Policy() DataPolicy; Explain(context.Co
 Adapters in v1 **[r2]**:
 - **local** — deterministic logistic model over registered features with hand-set weights in
   `config/local_weights.yaml`; no network, no cost; always registered; the advise rule of last
-  resort. Its weights are reviewed like code and gated by the harness like any scorer.
+  resort. Its weights are reviewed like code and gated by the harness like any scorer. **[S1]**
+  Non-benign probability mass is split evenly across every other requested label (only `risk = 1 -
+  P(benign)` is ever read off a signal); the harness's per-label precision/recall is therefore not
+  meaningful for local specifically — only its binary `flagged` metrics are.
 - **jev** — hosted typed decisions; `LabelMode: Open`, `Calibrated: true` (verified by the harness,
   not assumed); features are rendered to text by a versioned template (`Render`); text inputs are
   refused until `Policy().AllowsText` is set from recorded terms.
@@ -338,7 +352,14 @@ make, applying `stage` conditions and `input_hash` skipping (unchanged inputs re
 verdict). The worker or the harness executes calls through adapters (or replays recorded results).
 `core.Combine(rules, results, calibration) Verdict` reduces, purely, to risks, flags, score, tier,
 `degraded`. The harness and CI drive `Plan` and `Combine` with recorded results; only the nightly
-job touches vendors.
+job touches vendors. **[S1]** The caller supplies each rule's prior-round state (last input hash,
+last calibrated risk) as plain data on `RuleState` rather than `Plan` reaching into a store itself;
+one consequence is that a `stage: {min_local_risk: ...}` condition gates on the risk from the
+*previous* scoring round, not the one currently being planned, so a staged rule's activation lags
+the gating rule's own by one round. The input hash also covers the scorer's own version/checkpoint,
+the render template version, the calibration id in effect, and the rule's `benign_label` — not just
+the resolved features/text/labels — so a scorer upgrade, a newly fitted calibration, or a
+`benign_label` config change always forces a rescore rather than reusing a stale verdict.
 
 ### 4.8 Worker **[r2]**
 
@@ -440,12 +461,18 @@ erasure rules. Migrations embedded, expand-only.
   headroom for elevated subjects, staged vendor rules; the local rule is unaffected.
 - Hostile text in names or subject lines → never reaches the explainer; scorers receive it only as
   data in structured requests; a text rule alone cannot raise `score` above `medium` unless a
-  feature rule is ≥ `medium` (config `text_rules_need_feature_support: true`).
-- Duplicate / out-of-order / late events → idempotent ids; features over `at`; late events bump
-  `dirty_seq`.
+  feature rule is ≥ `medium` (config `text_rules_need_feature_support: true`). **[S1]** "text rule"
+  means any rule declaring `text` at all, even one that also declares `inputs` — a trivial/permanent
+  onboarding-fact input (e.g. `email_domain_class`) alongside `text` does not exempt a rule from this
+  cap, and such a rule does not itself count as the feature-only evidence another text rule needs.
+- Duplicate / out-of-order / late events → idempotent ids; features over `at`, with `first_seen_at`/
+  `first_seen` taking `LEAST(existing, new)` so out-of-order delivery can't leave first-seen at a
+  later time than the true earliest event; late events bump `dirty_seq`.
 - Account churn → links carry evidence across subjects; `subject.deleted` is a feature, not an
   erasure.
-- Homoglyph names → NFKC + confusables skeleton before brand matching.
+- Homoglyph names → NFKC + confusables skeleton before brand matching. **[S1]** The confusables table
+  is a curated subset (Cyrillic/Greek Latin-lookalikes plus common leetspeak digit substitutions)
+  covering lookalikes seen in labelled examples, not a full UTS #39 confusables implementation.
 - Invalid config → reload rejected, previous config live, `/healthz` reports it.
 - Lost update in the worker → `dirty_seq` compare-and-clear.
 - Clock skew → ±24 h on events (except `backfill` scope), ±5 min on request signatures.
