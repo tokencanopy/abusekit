@@ -21,6 +21,26 @@ type fieldSpec struct {
 	// brand/lure matching keys off: resource.created/deleted's `name`
 	// and content.sent's `subject_line`.
 	skeleton bool
+	// enum, when non-nil, is the closed set of values design §4.3's
+	// built-in vocabulary table allows for this field (S8); a string
+	// value outside it is rejected with CodeRedactionFailed rather than
+	// silently stored. nil means no enum restriction (a free-form
+	// string field, still capped/skeletoned as configured above).
+	enum []string
+}
+
+// isEnumValue reports whether s is one of spec's allowed enum values.
+// spec.enum == nil means "no restriction" and always reports true.
+func (spec fieldSpec) isEnumValue(s string) bool {
+	if spec.enum == nil {
+		return true
+	}
+	for _, v := range spec.enum {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // schema is the static, versioned redaction schema from design §4.3: for
@@ -39,16 +59,16 @@ type fieldSpec struct {
 var schema = map[string]map[string]fieldSpec{
 	"subject.created": {
 		"channel":            {maxLen: 64},
-		"email_domain_class": {maxLen: 32}, // webmail|corporate|disposable|unknown
+		"email_domain_class": {maxLen: 32, enum: []string{"webmail", "corporate", "disposable", "unknown"}},
 		"identity_kind":      {maxLen: 64},
 	},
 	"subject.deleted": {
-		"mode": {maxLen: 16}, // trash|permanent
+		"mode": {maxLen: 16, enum: []string{"trash", "permanent"}},
 	},
 	"payment.attempt": {
-		"outcome":      {maxLen: 32}, // succeeded|declined|blocked
+		"outcome":      {maxLen: 32, enum: []string{"succeeded", "declined", "blocked"}},
 		"reason":       {maxLen: 128},
-		"funding":      {maxLen: 16}, // prepaid|debit|credit|unknown
+		"funding":      {maxLen: 16, enum: []string{"prepaid", "debit", "credit", "unknown"}},
 		"amount_minor": {},
 		"currency":     {maxLen: 8},
 	},
@@ -81,7 +101,7 @@ var schema = map[string]map[string]fieldSpec{
 		"score":    {},
 	},
 	"subject.class": {
-		"class": {maxLen: 32}, // customer|internal|synthetic
+		"class": {maxLen: 32, enum: []string{"customer", "internal", "synthetic"}},
 	},
 }
 
@@ -172,6 +192,9 @@ func (e *Event) Redact() error {
 		switch val := v.(type) {
 		case string:
 			s := val
+			if !spec.isEnumValue(s) {
+				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q is not one of %v", k, s, spec.enum))
+			}
 			if spec.maxLen > 0 && len(s) > spec.maxLen {
 				s = truncateUTF8(s, spec.maxLen)
 			}

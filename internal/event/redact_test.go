@@ -222,6 +222,79 @@ func TestEvent_Redact(t *testing.T) {
 			data:     map[string]any{"reason": "bad\x07value"},
 			wantCode: CodeRedactionFailed,
 		},
+		// S8: closed-set enum fields reject an out-of-set value rather
+		// than silently storing it — design §4.3's built-in vocabulary
+		// table.
+		{
+			name: "email_domain_class accepts a listed value",
+			typ:  "subject.created",
+			data: map[string]any{"email_domain_class": "webmail"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["email_domain_class"] != "webmail" {
+					t.Fatalf("expected webmail to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "email_domain_class rejects an out-of-set value",
+			typ:      "subject.created",
+			data:     map[string]any{"email_domain_class": "definitely_not_a_real_class"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "subject.deleted mode rejects an out-of-set value",
+			typ:      "subject.deleted",
+			data:     map[string]any{"mode": "vaporized"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "subject.deleted mode accepts a listed value",
+			typ:  "subject.deleted",
+			data: map[string]any{"mode": "permanent"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["mode"] != "permanent" {
+					t.Fatalf("expected permanent to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "payment.attempt outcome rejects an out-of-set value",
+			typ:      "payment.attempt",
+			data:     map[string]any{"outcome": "maybe"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "payment.attempt funding rejects an out-of-set value",
+			typ:      "payment.attempt",
+			data:     map[string]any{"funding": "monopoly_money"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "payment.attempt funding accepts a listed value",
+			typ:  "payment.attempt",
+			data: map[string]any{"funding": "prepaid"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["funding"] != "prepaid" {
+					t.Fatalf("expected prepaid to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "subject.class rejects an out-of-set value",
+			typ:      "subject.class",
+			data:     map[string]any{"class": "vip"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "subject.class accepts a listed value",
+			typ:  "subject.class",
+			data: map[string]any{"class": "synthetic"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["class"] != "synthetic" {
+					t.Fatalf("expected synthetic to pass through, got %#v", out)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {
