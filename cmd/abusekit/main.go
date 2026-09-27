@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tokencanopy/abusekit/internal/config"
+	"github.com/tokencanopy/abusekit/internal/feature"
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/local"
 	"github.com/tokencanopy/abusekit/internal/store"
@@ -46,21 +47,6 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown subcommand %q (want \"serve\" or \"migrate\")", args[0])
 	}
-}
-
-// v0FeatureNames is design §4.5's new_account_velocity input list — the
-// only features S1 knows the NAMES of; internal/feature (S2) is what
-// actually computes them. Registering just the names here is what lets
-// internal/config's loader validate config/rules.yaml's `inputs` today
-// without a real feature implementation existing yet (task S1 scope:
-// "a Registry of feature names is passed in (S2 fills it, S1 registers
-// the names only)").
-var v0FeatureNames = []string{
-	"subject_age_h", "resource_velocity_1h", "resource_total", "key_velocity_1h", "key_total",
-	"upgrade_delay_min", "declines_before_first_success", "first_funding_prepaid",
-	"name_brand_match", "name_has_at", "first_day_distinct_domains", "self_send_before_external",
-	"linked_deleted_n", "linked_labelled_abusive_n", "fingerprint_seen_on_other_subjects",
-	"burst_ratio_24h_vs_lifetime",
 }
 
 type serveConfig struct {
@@ -158,7 +144,7 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, err
 	}
 	cfg, err := config.Load(rulesData, config.Dependencies{
 		Registry: registry,
-		Features: config.NewFeatureSet(v0FeatureNames...),
+		Features: config.NewFeatureSet(feature.Names...),
 		Vendors:  vendors,
 	})
 	if err != nil {
