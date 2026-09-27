@@ -272,8 +272,12 @@ type RuleOutcome struct {
 	// Reason is a pre-rendered explanation (internal/model's template
 	// explainer, S2/S4) — Combine only forwards it onto the signal.
 	Reason string
-	// Calibration is the calibration id applied when producing Result's
-	// risk, if any — forwarded onto the signal for the verdict record.
+	// Calibration is accepted for the caller's own bookkeeping but is NOT
+	// consulted by Combine (R7, round 2): the id actually recorded on the
+	// signal always comes from whichever CalibrationSet entry matched (or
+	// the literal "none" if no entry matched), never from this field — a
+	// caller-supplied id could be wrong or stale (e.g. copied forward
+	// from a previous round) in a way Combine has no way to verify.
 	Calibration string
 }
 
@@ -343,13 +347,13 @@ type CalibrationEntry struct {
 
 // CalibrationSet looks up a CalibrationEntry by (rule, scorer, checkpoint)
 // — design §4.6: "a map per (rule, scorer, checkpoint)". A triple with no
-// entry falls back to the caller's own RuleOutcome.Calibration (typically
-// "none"): internal/config's loader already requires every uncalibrated
-// scorer to have a calibration on record before its rule can run at all,
-// so by the time Combine runs, "no entry for this exact checkpoint" only
-// ever means the scorer's own probabilities were already
-// vendor-calibrated (design §4.6's Capabilities.Calibrated) or that the
-// checkpoint just rolled and a new map hasn't been recorded yet.
+// entry records the literal calibration id "none" (R7, round 2 — never a
+// caller-supplied fallback): internal/config's loader already requires
+// every uncalibrated scorer to have a calibration on record before its
+// rule can run at all, so by the time Combine runs, "no entry for this
+// exact checkpoint" only ever means the scorer's own probabilities were
+// already vendor-calibrated (design §4.6's Capabilities.Calibrated) or
+// that the checkpoint just rolled and a new map hasn't been recorded yet.
 type CalibrationSet map[string]CalibrationEntry
 
 // Key builds the CalibrationSet lookup key for (ruleName, scorer,
@@ -459,7 +463,16 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 		}
 
 		risk := raw
-		calibrationID := o.Calibration
+		// R7 (round 2): "none" unless a CalibrationSet entry actually
+		// matched — never the caller's own o.Calibration as a fallback.
+		// The caller's field can be wrong or stale (e.g. copied forward
+		// from a previous round), and by the time Combine runs, "no entry
+		// for this exact (rule, scorer, checkpoint)" only ever means the
+		// scorer's own probabilities were already vendor-calibrated
+		// (design §4.6's Capabilities.Calibrated) — the correct recorded
+		// id for that case is always "none", regardless of what the
+		// caller happened to pass.
+		calibrationID := "none"
 		if entry, ok := calib.lookup(o.Rule.Name, o.Rule.Scorer, o.Result.Checkpoint); ok {
 			// S12: the id recorded on the signal always comes from this
 			// SAME lookup — never from a caller-supplied id that might not
@@ -467,7 +480,12 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 			risk = entry.Calibrator.Calibrate(risk)
 			calibrationID = entry.ID
 		}
-		if math.IsNaN(risk) {
+		// R9 (round 2): a calibrator returning ±Inf is unscored/
+		// invalid_result, not clamped — clamping a genuinely infinite
+		// value (unlike a finite but out-of-range one, still clamped
+		// below) would mask a real calibrator bug behind a plausible-
+		// looking boundary score.
+		if math.IsNaN(risk) || math.IsInf(risk, 0) {
 			sig.Status = "unscored"
 			sig.ErrorCode = ErrorCodeInvalidResult
 			signals = append(signals, sig)
@@ -539,7 +557,15 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 	}
 
 	tier := "unknown"
-	if scoredAdviseCount >= minScoredAdvise {
+	// R8 (round 2): a zero-value or otherwise invalid Tiers (e.g. High <=
+	// Medium, a NaN/Inf/negative cut point) must never produce "high" or
+	// "medium" — score is always >= 0, so an unvalidated Tiers{} (High=0)
+	// made `score >= params.Tiers.High` true for any scored subject.
+	// internal/config.Load already validates a loaded Tiers this
+	// strictly; Combine is a pure function tests and other callers can
+	// invoke directly, so it validates its own input rather than trusting
+	// every caller to have gone through Load first.
+	if validTiers(params.Tiers) && scoredAdviseCount >= minScoredAdvise {
 		switch {
 		case score >= params.Tiers.High:
 			tier = "high"
@@ -551,4 +577,20 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 	}
 
 	return Verdict{Score: score, Tier: tier, Degraded: degraded, Signals: signals}
+}
+
+// validTiers reports whether t is usable for cutting a score into a tier:
+// both cut points finite, in (0,1], and High strictly greater than
+// Medium. Mirrors internal/config.validateTiers's load-time checks so
+// Combine never trusts an invalid Tiers just because it came from a
+// caller that skipped Load (a test, or a future caller building
+// CombineParams by hand).
+func validTiers(t config.Tiers) bool {
+	if math.IsNaN(t.Medium) || math.IsInf(t.Medium, 0) || t.Medium <= 0 || t.Medium > 1 {
+		return false
+	}
+	if math.IsNaN(t.High) || math.IsInf(t.High, 0) || t.High <= 0 || t.High > 1 {
+		return false
+	}
+	return t.High > t.Medium
 }

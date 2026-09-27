@@ -589,6 +589,47 @@ func TestCombine_CalibratorOutputIsClamped(t *testing.T) {
 	}
 }
 
+// TestCombine_NoMatchingCalibrationEntryAlwaysRecordsNone is R7 (round
+// 2): when no CalibrationSet entry matches (rule, scorer, checkpoint),
+// the recorded calibration id must ALWAYS be "none" — never whatever the
+// caller happened to put on RuleOutcome.Calibration, which the caller
+// could get wrong or leave stale (e.g. copying a previous round's id
+// forward). Only a genuine lookup hit may name a real calibration id.
+func TestCombine_NoMatchingCalibrationEntryAlwaysRecordsNone(t *testing.T) {
+	outcomes := []core.RuleOutcome{
+		// The caller passes a wrong/stale id; no CalibrationSet entry
+		// exists for (r, local, v1) at all.
+		{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5), Calibration: "cal_stale_from_caller"},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, nil)
+	if v.Signals[0].Calibration != "none" {
+		t.Fatalf("expected calibration=\"none\" when no entry matches (never the caller's own id), got %q", v.Signals[0].Calibration)
+	}
+}
+
+// TestCombine_CalibratorReturningInfIsInvalidResult is R9 (round 2): a
+// calibrator returning +Inf or -Inf must be unscored/invalid_result, not
+// silently clamped to 1 or 0 — clamping a genuinely infinite value (as
+// opposed to a finite but out-of-range one, still clamped) would mask a
+// real calibrator bug behind a plausible-looking boundary score.
+func TestCombine_CalibratorReturningInfIsInvalidResult(t *testing.T) {
+	for _, inf := range []float64{math.Inf(1), math.Inf(-1)} {
+		outcomes := []core.RuleOutcome{
+			{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5)},
+		}
+		calib := core.CalibrationSet{
+			core.Key("r", "local", "v1"): core.CalibrationEntry{ID: "cal_broken", Calibrator: core.CalibratorFunc(func(raw float64) float64 { return inf })},
+		}
+		v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, calib)
+		if v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+			t.Fatalf("calibrator returning %v: expected unscored/invalid_result, got %#v", inf, v.Signals[0])
+		}
+		if v.Tier != "unknown" {
+			t.Fatalf("calibrator returning %v: expected tier=unknown, got %s", inf, v.Tier)
+		}
+	}
+}
+
 func TestCombine_ZeroOutcomesNeverScoresLowOrHigh(t *testing.T) {
 	// Proven: CombineParams{} (zero value, MinScoredAdvise=0) against zero
 	// outcomes currently returns tier=high.
@@ -605,5 +646,35 @@ func TestCombine_ZeroAdviseRulesNeverScoresLowOrHigh(t *testing.T) {
 	v := core.Combine(outcomes, core.CombineParams{}, nil)
 	if v.Tier != "unknown" {
 		t.Fatalf("expected tier=unknown with zero advise rules scored, got %s", v.Tier)
+	}
+}
+
+// TestCombine_InvalidTiersNeverScoresLowOrHigh is R8 (round 2): with a
+// REAL scored advise rule (unlike the zero-outcomes case above, already
+// covered), a zero-value or otherwise invalid Tiers{} must still produce
+// tier=unknown rather than "high" — score(>=0) >= Tiers.High(0) is true
+// for any non-negative score, so an unvalidated zero Tiers silently
+// treated every scored subject as high.
+func TestCombine_InvalidTiersNeverScoresLowOrHigh(t *testing.T) {
+	tests := []struct {
+		name  string
+		tiers config.Tiers
+	}{
+		{"zero-value Tiers", config.Tiers{}},
+		{"high <= medium", config.Tiers{Medium: 0.5, High: 0.5}},
+		{"NaN medium", config.Tiers{Medium: math.NaN(), High: 0.8}},
+		{"Inf high", config.Tiers{Medium: 0.4, High: math.Inf(1)}},
+		{"negative medium", config.Tiers{Medium: -0.1, High: 0.8}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			outcomes := []core.RuleOutcome{
+				{Rule: rule("r", config.ModeAdvise), Result: scoredResult(0.05)}, // risk 0.95, a real scored rule
+			}
+			v := core.Combine(outcomes, core.CombineParams{Tiers: tc.tiers, MinScoredAdvise: 1}, nil)
+			if v.Tier != "unknown" {
+				t.Fatalf("expected tier=unknown for invalid Tiers %+v despite a scored advise rule, got %s", tc.tiers, v.Tier)
+			}
+		})
 	}
 }
