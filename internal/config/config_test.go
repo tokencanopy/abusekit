@@ -561,6 +561,15 @@ rules:
 	}
 }
 
+// TestRule_IsTextOnly is S15. Decision (documented on IsTextOnly's doc
+// comment and in the design amendment): a rule declaring ANY `text`
+// counts as needing the text_rules_need_feature_support cap, regardless
+// of whether it also has `inputs` — the reviewer's "simplest" option.
+// Proven gap in the old "no inputs at all" definition: a rule with text
+// PLUS a trivial/onboarding-fact input (e.g. `email_domain_class`, which
+// never ages out and never itself signals risk) escaped the cap entirely,
+// even though nothing about that rule's contribution is genuinely
+// feature-driven.
 func TestRule_IsTextOnly(t *testing.T) {
 	tests := []struct {
 		name string
@@ -569,7 +578,7 @@ func TestRule_IsTextOnly(t *testing.T) {
 	}{
 		{"text only", config.Rule{Text: []string{"a"}}, true},
 		{"inputs only", config.Rule{Inputs: []string{"a"}}, false},
-		{"both", config.Rule{Text: []string{"a"}, Inputs: []string{"b"}}, false},
+		{"text plus inputs is still capped", config.Rule{Text: []string{"a"}, Inputs: []string{"b"}}, true},
 		{"neither", config.Rule{}, false},
 	}
 	for _, tc := range tests {

@@ -400,6 +400,30 @@ func TestCombine_TextRuleCannotCrossTierAlone(t *testing.T) {
 	}
 }
 
+// TestCombine_TextPlusTrivialInputsIsStillCapped is S15: a rule that
+// declares BOTH text and a feature input is still subject to the
+// text_rules_need_feature_support cap (design's chosen definition: any
+// `text` at all makes the rule need independent feature support,
+// regardless of what else it also inputs) — a trivial input alongside
+// text must not be enough to escape the cap when no OTHER feature-only
+// advise rule reaches medium.
+func TestCombine_TextPlusTrivialInputsIsStillCapped(t *testing.T) {
+	mixedRule := rule("mixed_rule", config.ModeAdvise, withText("t"), withInputs("email_domain_class"))
+	mixedRule.Threshold = 0.0
+	outcomes := []core.RuleOutcome{
+		{Rule: mixedRule, Result: scoredResult(0.05)}, // risk 0.95
+	}
+	params := core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1, TextRulesNeedFeatureSupport: true}
+	v := core.Combine(outcomes, params, nil)
+
+	if v.Score >= params.Tiers.Medium {
+		t.Fatalf("expected a text-plus-trivial-input rule's contribution to be capped below medium, got %v", v.Score)
+	}
+	if v.Tier != "low" {
+		t.Fatalf("expected tier=low, got %s", v.Tier)
+	}
+}
+
 func TestCombine_TextRuleUncappedWithFeatureSupport(t *testing.T) {
 	featureRule := rule("feature_rule", config.ModeAdvise, withInputs("x"))
 	textRule := rule("text_rule", config.ModeAdvise, withText("t"))

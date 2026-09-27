@@ -68,11 +68,27 @@ type Rule struct {
 	Stage map[string]float64
 }
 
-// IsTextOnly reports whether r scores text with no feature inputs — the
-// case design §5's text_rules_need_feature_support guards ("a text rule
-// alone cannot raise score above medium unless a feature rule is >=
-// medium").
-func (r Rule) IsTextOnly() bool { return len(r.Text) > 0 && len(r.Inputs) == 0 }
+// IsTextOnly reports whether r needs text_rules_need_feature_support's cap
+// (design §5: "a text rule alone cannot raise score above medium unless a
+// feature rule is >= medium").
+//
+// S15 decision: ANY rule that declares `text` counts, regardless of
+// whether it also declares `inputs`. The two options on the table were
+// "no non-feature inputs at all" (the original, narrower definition) vs.
+// "no non-feature inputs OR only inputs from an allowlist of onboarding
+// facts" vs. this one — the reviewer's own "simplest" suggestion, chosen
+// here: a rule mixing `text` with a trivial/permanent onboarding-fact
+// input (e.g. `email_domain_class`, which never ages out and carries no
+// risk signal on its own) previously escaped the cap entirely just by
+// having ANY input at all, even though nothing about its contribution is
+// genuinely feature-driven. Treating every text-declaring rule as needing
+// independent feature support elsewhere in the batch is conservative in
+// the safe direction: a rule that legitimately combines text with a
+// strong feature signal is still uncapped as soon as feature support
+// exists (Combine's featureAdviseMax check, unaffected by this), so the
+// only rules this affects are ones whose only "feature" input was never
+// going to reach Medium on its own anyway.
+func (r Rule) IsTextOnly() bool { return len(r.Text) > 0 }
 
 // Tiers holds the global score cut points (design §4.4).
 type Tiers struct {
