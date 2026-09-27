@@ -159,12 +159,56 @@ func (s *Store) neighbors(ctx context.Context, tenant, subject string, capPerKey
 	return out, truncated, nil
 }
 
+// PropagateToNeighbors bumps dirty_seq for every same-tenant subject
+// sharing any link key with subject (capped at DefaultNeighborCapTotal),
+// so their linked_deleted_n/linked_labelled_abusive_n features — computed
+// from evidence that just changed for THIS subject — get rescored rather
+// than sitting stale until their own next unrelated event (S2 fix round).
+// Called after a subject is labelled "abusive" (PutLabel) or permanently
+// deleted (AppendEvents' subject.deleted handling), the two events that
+// change what a neighbour's linked_* features should read.
+//
+// Every link kind is considered here, deliberately more inclusive than
+// internal/feature.Config's default candidate set: over-propagating just
+// means a neighbour gets rescored and its features come out unchanged (a
+// wasted but harmless round), whereas under-propagating would leave a
+// neighbour's evidence stale until something else happens to touch it.
+func (s *Store) PropagateToNeighbors(ctx context.Context, tenant, subject string) error {
+	neighbors, _, err := s.Neighbors(ctx, tenant, subject, 0, DefaultNeighborCapTotal)
+	if err != nil {
+		return fmt.Errorf("store: resolve neighbors to propagate to for %s: %w", subject, err)
+	}
+	if len(neighbors) == 0 {
+		return nil
+	}
+	// Only dirty_seq is bumped — last_event_at deliberately untouched, so a
+	// propagated recompute never masquerades as real subject activity in
+	// ClaimDirtySubjects' "oldest dirty" priority ordering.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE subjects SET dirty_seq = dirty_seq + 1
+		WHERE tenant = $1 AND subject = ANY($2)
+	`, tenant, neighbors); err != nil {
+		return fmt.Errorf("store: bump dirty_seq for neighbors of %s: %w", subject, err)
+	}
+	return nil
+}
+
 // NeighborOutcomes reports, among the given same-tenant subjects (typically
 // a Neighbors/NeighborsByKinds result), how many have ever emitted a
-// subject.deleted event and how many carry at least one "abusive" label —
-// the two counts internal/feature's linked_deleted_n and
+// PERMANENT subject.deleted event and how many carry at least one
+// "abusive" label — the two counts internal/feature's linked_deleted_n and
 // linked_labelled_abusive_n features need (design §4.2). Both are computed
 // with one query each rather than round-tripping once per neighbor.
+//
+// Only mode="permanent" counts toward deletedCount (N3 fix round): a
+// trash-mode deletion is reversible within e2a's own retention window (its
+// own soft-deletion design explicitly supports restoring one), so treating
+// it as permanent abandonment evidence forever would misjudge any
+// restored account for good with no way to un-flag it — there is no
+// subject.restored event in the current vocabulary to correct the record
+// if we did. Trash-mode deletions are still stored (nothing here erases
+// them) for whenever that event exists; this is deliberately the more
+// conservative of the two fixes the review offered.
 //
 // A label row's rule is deliberately not restricted here: a per-rule
 // "abusive" verdict from a rule whose own label vocabulary includes it is
@@ -179,6 +223,7 @@ func (s *Store) NeighborOutcomes(ctx context.Context, tenant string, subjects []
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT subject) FROM events
 		WHERE tenant = $1 AND subject = ANY($2) AND type = 'subject.deleted'
+		  AND data ->> 'mode' = 'permanent'
 	`, tenant, subjects).Scan(&deletedCount); err != nil {
 		return 0, 0, fmt.Errorf("store: count deleted neighbors: %w", err)
 	}

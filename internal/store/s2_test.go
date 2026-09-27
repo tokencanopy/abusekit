@@ -170,7 +170,9 @@ func TestNeighborOutcomes(t *testing.T) {
 	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	appendAt(t, ctx, s, "acct_deleted", "subject.created", now, nil)
-	appendAt(t, ctx, s, "acct_deleted", "subject.deleted", now.Add(time.Second), map[string]any{"mode": "trash"})
+	appendAt(t, ctx, s, "acct_deleted", "subject.deleted", now.Add(time.Second), map[string]any{"mode": "permanent"})
+	appendAt(t, ctx, s, "acct_trashed", "subject.created", now, nil)
+	appendAt(t, ctx, s, "acct_trashed", "subject.deleted", now.Add(time.Second), map[string]any{"mode": "trash"})
 	appendAt(t, ctx, s, "acct_labelled", "subject.created", now, nil)
 	appendAt(t, ctx, s, "acct_clean", "subject.created", now, nil)
 
@@ -178,12 +180,15 @@ func TestNeighborOutcomes(t *testing.T) {
 		t.Fatalf("PutLabel: %v", err)
 	}
 
-	deleted, labelled, err := s.NeighborOutcomes(ctx, testTenant, []string{"acct_deleted", "acct_labelled", "acct_clean"})
+	deleted, labelled, err := s.NeighborOutcomes(ctx, testTenant, []string{"acct_deleted", "acct_trashed", "acct_labelled", "acct_clean"})
 	if err != nil {
 		t.Fatalf("NeighborOutcomes: %v", err)
 	}
+	// N3 fix round: only the PERMANENT deletion counts — acct_trashed's
+	// trash-mode deletion is reversible and must not count as abandonment
+	// evidence.
 	if deleted != 1 {
-		t.Errorf("deletedCount = %d, want 1", deleted)
+		t.Errorf("deletedCount = %d, want 1 (only acct_deleted, not the trash-mode acct_trashed)", deleted)
 	}
 	if labelled != 1 {
 		t.Errorf("labelledAbusiveCount = %d, want 1", labelled)

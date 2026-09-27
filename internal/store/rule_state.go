@@ -82,3 +82,22 @@ func (s *Store) ClearRuleBackoff(ctx context.Context, tenant, subject, rule stri
 	}
 	return nil
 }
+
+// PruneRuleState deletes every rule_state row for (tenant, subject) whose
+// rule is NOT in currentRules (S11 fix round): a rule renamed or removed
+// from config/rules.yaml otherwise leaves an orphaned backoff row behind
+// forever — harmless to scoring (GetRuleBackoff is only ever queried by
+// name, and a config that no longer has that rule never queries it), but
+// a permanently-growing table for no reason. currentRules empty deletes
+// every row for the subject (a config with zero rules is itself rejected
+// by internal/config.Load, so this only happens for a subject with no
+// rule_state rows to begin with in practice).
+func (s *Store) PruneRuleState(ctx context.Context, tenant, subject string, currentRules []string) error {
+	_, err := s.pool.Exec(ctx, `
+		DELETE FROM rule_state WHERE tenant = $1 AND subject = $2 AND NOT (rule = ANY($3))
+	`, tenant, subject, currentRules)
+	if err != nil {
+		return fmt.Errorf("store: prune rule_state for %s: %w", subject, err)
+	}
+	return nil
+}
