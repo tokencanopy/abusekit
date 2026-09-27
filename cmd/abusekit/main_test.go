@@ -53,6 +53,9 @@ func TestParseServeFlags_Defaults(t *testing.T) {
 	if c.check {
 		t.Errorf("expected check=false by default")
 	}
+	if c.metricsListen != "127.0.0.1:9099" {
+		t.Errorf("metricsListen = %q, want the default 127.0.0.1:9099 (R8 round 2)", c.metricsListen)
+	}
 }
 
 func TestParseServeFlags_CheckFlag(t *testing.T) {

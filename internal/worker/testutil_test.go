@@ -127,6 +127,56 @@ rules:
 	return cfg
 }
 
+// newTwoFakeRuleConfig builds a *config.Config with two independent advise
+// rules ("fake_rule_a" scored by "fake_scorer_a", "fake_rule_b" scored by
+// "fake_scorer_b"), each backed by its OWN *fake.Scorer — used by R8 round
+// 2's per-call latency test, which needs two scorers with independently
+// controllable delays in the SAME scoreSubject round.
+func newTwoFakeRuleConfig(t *testing.T, a, b *fake.Scorer) *config.Config {
+	t.Helper()
+	a.NameValue = "fake_scorer_a"
+	b.NameValue = "fake_scorer_b"
+	reg := model.NewRegistry()
+	if err := reg.Register(a); err != nil {
+		t.Fatalf("register fake scorer a: %v", err)
+	}
+	if err := reg.Register(b); err != nil {
+		t.Fatalf("register fake scorer b: %v", err)
+	}
+
+	const rulesYAML = `
+tiers: {medium: 0.4, high: 0.8}
+min_scored_advise: 1
+rules:
+  - name: fake_rule_a
+    mode: advise
+    scorer: fake_scorer_a
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+  - name: fake_rule_b
+    mode: advise
+    scorer: fake_scorer_b
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`
+	cfg, err := config.Load([]byte(rulesYAML), config.Dependencies{
+		Registry: reg,
+		Features: config.NewFeatureSet(feature.Names...),
+		Vendors: map[string]config.VendorEntry{
+			"fake_scorer_a": {Name: "fake_scorer_a", TermsVersion: "n/a", DPARef: "n/a", Policy: a.Policy()},
+			"fake_scorer_b": {Name: "fake_scorer_b", TermsVersion: "n/a", DPARef: "n/a", Policy: b.Policy()},
+		},
+	})
+	if err != nil {
+		t.Fatalf("load two fake rule config: %v", err)
+	}
+	return cfg
+}
+
 // appendEvent validates, redacts and appends one event via the real
 // ingest path (mirroring what a producer's POST /v1/events would do),
 // failing the test on any error — every worker test builds its fixture

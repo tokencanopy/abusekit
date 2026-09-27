@@ -585,11 +585,23 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 				if w.deps.Metrics != nil {
 					w.deps.Metrics.IncBudgetDenials(r.Scorer)
 				}
+				// R8 round 2: a budget denial is an operationally
+				// significant event (a rule silently stopped scoring for a
+				// whole tenant/adapter combination) — must be visible in
+				// logs, not just an incrementing counter nobody's
+				// necessarily watching yet.
+				w.deps.logger().Warn("worker: budget denied", "tenant", d.Tenant, "subject", d.Subject, "rule", r.Name, "adapter", r.Scorer, "code", code)
 				continue
 			}
 		}
 
-		start := now
+		// R8 round 2: start is taken HERE, immediately before this
+		// specific scorer.Score call — not once for the whole subject
+		// (the old `start := now` reused the subject-level now for every
+		// rule) — so a subject scored by more than one rule doesn't have
+		// its LATER rules' recorded latency inflated by however long an
+		// EARLIER rule's own call took.
+		start := w.deps.now()
 		if w.deps.Metrics != nil {
 			w.deps.Metrics.IncAdapterCalls(r.Scorer)
 		}

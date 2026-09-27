@@ -4,22 +4,27 @@
 // S1 wired up the store and config layers behind two subcommands with
 // `serve --check` only. S2's fix round (S9) now also wires up and runs the
 // SCORING LOOP itself (internal/worker) under plain `serve` — it finds
-// dirty subjects, scores them, and commits verdicts, entirely without an
-// HTTP listener. The `/v1/*` HTTP surface is still S3's job; `serve`
-// without --check runs the worker standing, blocking on SIGINT/SIGTERM,
-// with nothing yet listening on a port. `serve --check` is unaffected: it
-// still only validates config and migrates the database, then exits 0.
+// dirty subjects, scores them, and commits verdicts. R8 (round 2) adds a
+// loopback HTTP listener serving worker.Metrics via expvar. The `/v1/*`
+// HTTP surface itself is still S3's job. `serve` without --check runs the
+// worker standing, blocking on SIGINT/SIGTERM. `serve --check` is
+// unaffected: it still only validates config and migrates the database,
+// then exits 0.
 package main
 
 import (
 	"context"
 	"errors"
+	"expvar"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -53,12 +58,13 @@ func run(args []string) error {
 }
 
 type serveConfig struct {
-	check       bool
-	databaseURL string
-	rulesPath   string
-	vendorsPath string
-	weightsPath string
-	brandsPath  string
+	check         bool
+	databaseURL   string
+	rulesPath     string
+	vendorsPath   string
+	weightsPath   string
+	brandsPath    string
+	metricsListen string
 }
 
 func parseServeFlags(args []string) (serveConfig, error) {
@@ -70,6 +76,7 @@ func parseServeFlags(args []string) (serveConfig, error) {
 	fs.StringVar(&c.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&c.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
 	fs.StringVar(&c.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
+	fs.StringVar(&c.metricsListen, "metrics-listen", envOr("ABUSEKIT_METRICS_LISTEN", "127.0.0.1:9099"), "loopback address to serve worker.Metrics on via expvar's /debug/vars (env ABUSEKIT_METRICS_LISTEN; empty disables it — R8 round 2)")
 	if err := fs.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
@@ -136,6 +143,32 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 		return fmt.Errorf("construct worker: %w", err)
 	}
 
+	// R8 round 2: publish worker.Metrics and serve it over a loopback HTTP
+	// listener (expvar's own /debug/vars) so S8's counters are observable
+	// from outside the process, not just via Snapshot() in a test. An
+	// idempotent-publish guard (rather than an unconditional Publish,
+	// which panics on a second call with the same name) is defensive
+	// against this func running more than once in the same process — a
+	// real `serve` invocation never does, but a test binary calling
+	// runServeWithContext more than once otherwise would panic on the
+	// process-wide expvar registry.
+	const metricsVarName = "abusekit"
+	if expvar.Get(metricsVarName) == nil {
+		deps.metrics.Publish(metricsVarName)
+	}
+	metricsSrv, metricsAddr, err := startMetricsServer(c.metricsListen)
+	if err != nil {
+		return fmt.Errorf("start metrics server: %w", err)
+	}
+	if metricsSrv != nil {
+		fmt.Println("abusekit: metrics available at http://" + metricsAddr + "/debug/vars")
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+	}
+
 	fmt.Println("abusekit: worker running (no HTTP surface yet — that's S3); press Ctrl-C to stop")
 	w.Start(ctx)
 	// Start returns once ctx is done; Stop is still safe (and a no-op
@@ -145,6 +178,37 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 	w.Stop()
 	fmt.Println("abusekit: worker stopped")
 	return nil
+}
+
+// startMetricsServer starts a loopback HTTP server on addr serving
+// http.DefaultServeMux (which expvar registers /debug/vars on
+// automatically, as soon as anything imports the expvar package —
+// internal/worker's metrics.go already does), returning it (for the
+// caller to Shutdown) and the listener's actual bound address. addr == ""
+// disables it entirely, returning (nil, "", nil) — R8 round 2's default
+// is "127.0.0.1:9099" (parseServeFlags), but any test constructing a
+// serveConfig by hand (leaving metricsListen at its zero value) gets no
+// listener at all, never a port collision.
+//
+// These endpoints are unauthenticated by design, matching the OSS
+// server's own E2A_METRICS_LISTEN_ADDR convention (AGENTS.md: "never
+// route them through Caddy/HAProxy") — loopback-only is the whole
+// safeguard, not an auth check.
+func startMetricsServer(addr string) (*http.Server, string, error) {
+	if addr == "" {
+		return nil, "", nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, "", fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	srv := &http.Server{Handler: http.DefaultServeMux}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Default().Error("abusekit: metrics server failed", "error", err)
+		}
+	}()
+	return srv, ln.Addr().String(), nil
 }
 
 // Placeholder daily budget defaults (S7 fix round; design §8 open question
