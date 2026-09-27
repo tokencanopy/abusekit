@@ -107,15 +107,24 @@ func minAt(events []event.Event, keep func(event.Event) bool) (at time.Time, ok 
 	return at, ok
 }
 
-// firstPaidUpgradeAt returns the At of the subject's earliest PAID
-// subscription.changed event (amount_minor > 0). B5 fix round: a
-// free-plan change or a cancellation (amount_minor absent, zero, or
-// negative) must never count as an "upgrade" — proven, the original
-// "any subscription.changed" rule let a benign free-to-free plan switch
-// look identical to a paid upgrade.
+// firstPaidUpgradeAt returns the At of the subject's earliest PAID AND
+// ACTIVE subscription.changed event (status == "active" AND
+// amount_minor > 0). B5 fix round: a free-plan change or a cancellation
+// (amount_minor absent, zero, or negative) must never count as an
+// "upgrade" — proven, the original "any subscription.changed" rule let a
+// benign free-to-free plan switch look identical to a paid upgrade. R5
+// round 2: a "trialing" subscription with a price on file is NOT yet an
+// upgrade either — proven, a trial that never converts would otherwise
+// read identically to an account that actually started paying; only
+// "active" (the status a producer's billing webhook sets once the charge
+// itself succeeds, not merely quoted) counts.
 func firstPaidUpgradeAt(events []event.Event) (at time.Time, ok bool) {
 	return minAt(events, func(e event.Event) bool {
 		if e.Type != "subscription.changed" {
+			return false
+		}
+		status, _ := dataString(e.Data, "status")
+		if status != "active" {
 			return false
 		}
 		amount, ok := dataNumber(e.Data, "amount_minor")

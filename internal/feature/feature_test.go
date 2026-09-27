@@ -213,11 +213,38 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	t.Run("paid upgrade recorded", func(t *testing.T) {
 		events := []event.Event{
 			ev("s1", "subject.created", 0, nil),
-			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "scale", "amount_minor": float64(2900)}),
+			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "scale", "status": "active", "amount_minor": float64(2900)}),
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 16 {
 			t.Errorf("upgrade_delay_min = %v, want 16", got)
+		}
+	})
+	t.Run("a trialing subscription with a price is NOT an upgrade (R5, round 2)", func(t *testing.T) {
+		events := []event.Event{
+			ev("s1", "subject.created", 0, nil),
+			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "scale", "status": "trialing", "amount_minor": float64(2900)}),
+		}
+		if u := upgraded(events); u != 0 {
+			t.Errorf("upgraded = %v, want 0 for a trialing subscription (a price on file is not the same as actually being charged)", u)
+		}
+		got := upgradeDelayMinutes(events, base, at(45*time.Minute))
+		if got != 45 {
+			t.Errorf("upgrade_delay_min = %v, want 45 (falls back to elapsed-so-far; the trialing event must not count as the upgrade)", got)
+		}
+	})
+	t.Run("active status with a price after a trialing one: only the active one counts", func(t *testing.T) {
+		events := []event.Event{
+			ev("s1", "subject.created", 0, nil),
+			ev("u1", "subscription.changed", 5*time.Minute, map[string]any{"plan": "scale", "status": "trialing", "amount_minor": float64(2900)}),
+			ev("u2", "subscription.changed", 20*time.Minute, map[string]any{"plan": "scale", "status": "active", "amount_minor": float64(2900)}),
+		}
+		if u := upgraded(events); u != 1 {
+			t.Errorf("upgraded = %v, want 1", u)
+		}
+		got := upgradeDelayMinutes(events, base, at(time.Hour))
+		if got != 20 {
+			t.Errorf("upgrade_delay_min = %v, want 20 (the active event, not the earlier trialing one)", got)
 		}
 	})
 	t.Run("a free-plan change is not an upgrade (B5, proven)", func(t *testing.T) {
@@ -255,8 +282,8 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	})
 	t.Run("out-of-order delivery: earliest PAID subscription.changed wins regardless of slice order", func(t *testing.T) {
 		events := []event.Event{
-			ev("u2", "subscription.changed", 30*time.Minute, map[string]any{"amount_minor": float64(1000)}),
-			ev("u1", "subscription.changed", 5*time.Minute, map[string]any{"amount_minor": float64(1000)}), // chronologically earlier, delivered second
+			ev("u2", "subscription.changed", 30*time.Minute, map[string]any{"status": "active", "amount_minor": float64(1000)}),
+			ev("u1", "subscription.changed", 5*time.Minute, map[string]any{"status": "active", "amount_minor": float64(1000)}), // chronologically earlier, delivered second
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 5 {
@@ -265,8 +292,8 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	})
 	t.Run("a free change before a later paid one: only the paid one counts", func(t *testing.T) {
 		events := []event.Event{
-			ev("u1", "subscription.changed", 2*time.Minute, map[string]any{"amount_minor": float64(0)}),
-			ev("u2", "subscription.changed", 10*time.Minute, map[string]any{"amount_minor": float64(2900)}),
+			ev("u1", "subscription.changed", 2*time.Minute, map[string]any{"status": "active", "amount_minor": float64(0)}),
+			ev("u2", "subscription.changed", 10*time.Minute, map[string]any{"status": "active", "amount_minor": float64(2900)}),
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 10 {
