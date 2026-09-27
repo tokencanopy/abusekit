@@ -1,0 +1,413 @@
+// Package core implements abusekit's pure scoring core (design §4.7):
+// Plan decides which (rule, scorer, request) calls to make, and Combine
+// reduces their results to a Verdict. Neither function performs I/O or
+// calls a Scorer — that split is what makes the harness (S4) and CI able
+// to drive the exact same logic the worker (S2) uses in production, just
+// fed recorded results instead of live ones.
+package core
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+
+	"github.com/tokencanopy/abusekit/internal/config"
+	"github.com/tokencanopy/abusekit/internal/model"
+)
+
+// capEpsilon keeps a capped text-only risk strictly below tiers.Medium
+// rather than exactly at it, so "cannot raise score above medium" (design
+// §5) is a strict, testable inequality rather than a boundary a floating
+// point comparison could accidentally cross.
+const capEpsilon = 1e-6
+
+// RuleState is one rule's static config plus whatever the caller already
+// knows about its most recent verdict — the minimum a pure function needs
+// to implement input-hash skipping and a rule-referencing stage condition
+// without reaching into a store itself.
+type RuleState struct {
+	Rule config.Rule
+	// LastInputHash is the InputHash recorded on the rule's most recent
+	// verdict, or "" if it has never been scored. When this round's
+	// computed hash matches, Plan marks the resulting Call to be skipped
+	// with reason "input_unchanged" (design §4.7: "unchanged inputs reuse
+	// the stored verdict").
+	LastInputHash string
+	// LastRisk is the calibrated risk recorded on the rule's most recent
+	// scored verdict, or nil if it has never been scored. Consulted by
+	// another rule's `stage: {min_local_risk: ...}` condition (design
+	// §4.5's example gates a shadow rule on the local rule's risk).
+	LastRisk *float64
+}
+
+// Call is one (rule, scorer, request) Plan has decided to make, or
+// explicitly decided to skip. InputHash is set either way, so a caller
+// that does make the call can record it on the resulting verdict for the
+// next round's skip check.
+type Call struct {
+	Rule      config.Rule
+	Request   model.ScoreRequest
+	InputHash string
+	// Skip, when true, means the caller should not invoke the scorer —
+	// SkipReason says why. A skipped rule that was previously scored
+	// keeps its prior verdict (the caller's job, e.g. the worker copying
+	// the stored risk forward into this round's RuleOutcome).
+	Skip       bool
+	SkipReason SkipReason
+}
+
+// SkipReason enumerates why Plan skipped a call.
+type SkipReason string
+
+const (
+	SkipNone           SkipReason = ""
+	SkipStageCondition SkipReason = "stage_condition"
+	SkipInputUnchanged SkipReason = "input_unchanged"
+)
+
+// Plan decides, purely, which calls to make for one subject's rule set
+// given its current feature vector and text inputs (design §4.7).
+//
+//   - features holds every feature name any rule might reference (from
+//     internal/feature, S2); a rule's own `inputs` selects a subset.
+//   - text maps a text-feature name (e.g. "subject_line_skeleton") to the
+//     list of values seen for it; a rule's `text` field selects which
+//     named entries to concatenate, in order, into ScoreRequest.Text.
+//   - rules carries each rule's config plus enough history
+//     (LastInputHash, LastRisk) to decide staging and skipping.
+//
+// Plan never mutates its inputs and never calls a Scorer.
+func Plan(features map[string]float64, text map[string][]string, rules []RuleState) []Call {
+	maxLocalRisk, haveLocalRisk := maxRiskByScorer(rules, "local")
+
+	calls := make([]Call, 0, len(rules))
+	for _, rs := range rules {
+		r := rs.Rule
+		req := model.ScoreRequest{Labels: r.Labels}
+		if len(r.Inputs) > 0 {
+			req.Features = subsetFeatures(features, r.Inputs)
+		}
+		if len(r.Text) > 0 {
+			req.Text = collectText(text, r.Text)
+		}
+
+		call := Call{
+			Rule:      r,
+			Request:   req,
+			InputHash: inputHash(r.Name, r.Scorer, req),
+		}
+
+		if skip := stageSkip(r, features, maxLocalRisk, haveLocalRisk); skip {
+			call.Skip = true
+			call.SkipReason = SkipStageCondition
+			calls = append(calls, call)
+			continue
+		}
+		if rs.LastInputHash != "" && rs.LastInputHash == call.InputHash {
+			call.Skip = true
+			call.SkipReason = SkipInputUnchanged
+			calls = append(calls, call)
+			continue
+		}
+
+		calls = append(calls, call)
+	}
+	return calls
+}
+
+func maxRiskByScorer(rules []RuleState, scorer string) (max float64, have bool) {
+	for _, rs := range rules {
+		if rs.Rule.Scorer != scorer || rs.LastRisk == nil {
+			continue
+		}
+		if !have || *rs.LastRisk > max {
+			max = *rs.LastRisk
+			have = true
+		}
+	}
+	return max, have
+}
+
+// stageSkip evaluates the `stage` conditions internal/config's loader
+// already validated are one of the known keys:
+//
+//   - min_local_risk: run only once the highest risk among rules scored
+//     by the "local" scorer has reached this value (design §4.5's
+//     example: `new_account_velocity_jev` only fires after
+//     `new_account_velocity` itself looks suspicious).
+//   - max_subject_age_h / min_subject_age_h: run only while
+//     features["subject_age_h"] is within the given bound (design's
+//     `lure_similarity` stops looking at accounts older than a week).
+//
+// A rule with no `stage` is never skipped by this function.
+func stageSkip(r config.Rule, features map[string]float64, maxLocalRisk float64, haveLocalRisk bool) bool {
+	if len(r.Stage) == 0 {
+		return false
+	}
+	if v, ok := r.Stage["min_local_risk"]; ok {
+		if !haveLocalRisk || maxLocalRisk < v {
+			return true
+		}
+	}
+	if v, ok := r.Stage["max_subject_age_h"]; ok {
+		if features["subject_age_h"] > v {
+			return true
+		}
+	}
+	if v, ok := r.Stage["min_subject_age_h"]; ok {
+		if features["subject_age_h"] < v {
+			return true
+		}
+	}
+	return false
+}
+
+func subsetFeatures(features map[string]float64, names []string) map[string]float64 {
+	out := make(map[string]float64, len(names))
+	for _, n := range names {
+		out[n] = features[n] // 0 if absent — see internal/model/local's doc comment on missing features
+	}
+	return out
+}
+
+func collectText(text map[string][]string, names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, text[n]...)
+	}
+	return out
+}
+
+// inputHash is a stable digest of everything that would change this
+// call's answer: the rule identity, its scorer, and the resolved request.
+// json.Marshal serializes map keys in sorted order, so the digest doesn't
+// depend on Go's randomized map iteration.
+func inputHash(ruleName, scorer string, req model.ScoreRequest) string {
+	payload := struct {
+		Rule     string
+		Scorer   string
+		Labels   []string
+		Features map[string]float64
+		Text     []string
+	}{ruleName, scorer, req.Labels, req.Features, req.Text}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		// Every field above is a plain string/float64/slice/map — this
+		// cannot fail in practice. Fall back to hashing the rule+scorer
+		// name alone rather than panicking (AGENTS.md: no panic in
+		// library code); worst case this makes skip-detection overly
+		// conservative (never matches), never incorrect.
+		b = []byte(ruleName + "/" + scorer)
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// RuleOutcome is one rule's resolved result for a scoring round: either a
+// ScoreResult (freshly computed, or carried forward from a skipped call
+// per design §4.7), or an explicit unscored status with a code. Combine
+// is pure — resolving a Call into a RuleOutcome (actually calling the
+// scorer, reusing a prior verdict on a skip, or recording why scoring
+// failed) is the caller's job (the worker, S2; a test, here).
+type RuleOutcome struct {
+	Rule config.Rule
+	// Result is non-nil exactly when the rule was scored, this round or a
+	// prior one (a skip that carries forward a stored verdict still
+	// produces a Result here — Combine cannot tell scored-now from
+	// reused-from-skip, by design: both contribute to score the same
+	// way).
+	Result *model.ScoreResult
+	// Unscored, when true, means Result is ignored (nil or not) and the
+	// rule contributes only a Status:"unscored" signal.
+	Unscored bool
+	// ErrorCode is set when Unscored: e.g. "cost_cap", "timeout",
+	// "backoff" (worker-assigned, S2).
+	ErrorCode string
+	// Reason is a pre-rendered explanation (internal/model's template
+	// explainer, S2/S4) — Combine only forwards it onto the signal.
+	Reason string
+	// Calibration is the calibration id applied when producing Result's
+	// risk, if any — forwarded onto the signal for the verdict record.
+	Calibration string
+}
+
+// Signal is one rule's contribution to a Verdict, matching the shape of
+// the `signals` array in the GET /v1/subjects/{subject} response (design
+// §4.4), minus HTTP-layer concerns (added in S3).
+type Signal struct {
+	Rule        string
+	Mode        config.Mode
+	Status      string // "scored" | "unscored"
+	Risk        float64
+	Flagged     bool
+	Model       string
+	Checkpoint  string
+	Calibration string
+	Reason      string
+	ErrorCode   string
+}
+
+// Verdict is Combine's pure output for one subject's scoring round.
+type Verdict struct {
+	// Score is the max risk over scored advise rules (shadow excluded),
+	// after the text_rules_need_feature_support cap. 0 when no advise
+	// rule scored.
+	Score float64
+	// Tier is "unknown" (fewer than MinScoredAdvise advise rules scored),
+	// "low", "medium", or "high" by Params.Tiers's cut points.
+	Tier string
+	// Degraded is true whenever any advise rule is unscored (design
+	// §4.4). Shadow rules being unscored does not set this.
+	Degraded bool
+	Signals  []Signal
+}
+
+// CombineParams are Combine's non-per-rule inputs: the pieces of a loaded
+// config.Config that determine scoring but aren't part of any one rule.
+// Kept as its own small struct (rather than taking a *config.Config
+// directly) so Combine stays trivially constructible in tests without a
+// full Load call.
+type CombineParams struct {
+	Tiers                       config.Tiers
+	MinScoredAdvise             int
+	TextRulesNeedFeatureSupport bool
+}
+
+// Calibrator adjusts a scorer's raw risk (1 - P(benign)) to a calibrated
+// one. See CalibrationSet.
+type Calibrator interface {
+	Calibrate(raw float64) float64
+}
+
+// CalibratorFunc adapts a plain function to a Calibrator.
+type CalibratorFunc func(raw float64) float64
+
+func (f CalibratorFunc) Calibrate(raw float64) float64 { return f(raw) }
+
+// CalibrationSet looks up a Calibrator by (rule, scorer). A pair with no
+// entry is passed through unchanged: internal/config's loader already
+// requires every uncalibrated scorer to have a calibration on record
+// before its rule can run at all, so by the time Combine runs, "no entry"
+// only ever means the scorer's own probabilities were already
+// vendor-calibrated (design §4.6's Capabilities.Calibrated).
+type CalibrationSet map[string]Calibrator
+
+// Key builds the CalibrationSet lookup key for (ruleName, scorer).
+// Exported so callers building a CalibrationSet don't have to guess the
+// separator.
+func Key(ruleName, scorer string) string { return ruleName + "/" + scorer }
+
+func (cs CalibrationSet) lookup(ruleName, scorer string) (Calibrator, bool) {
+	c, ok := cs[Key(ruleName, scorer)]
+	return c, ok
+}
+
+// Combine reduces a scoring round's outcomes to a Verdict (design §4.4 /
+// §4.7):
+//
+//   - Each scored rule's risk is `1 - P(benign_label)`, calibrated if a
+//     Calibrator is on record for (rule, scorer); `flagged` is that risk
+//     compared against the rule's own threshold (per-rule thresholds
+//     never affect tier, only `flagged`).
+//   - `score` is the max risk over scored **advise** rules; shadow rules
+//     are excluded from score entirely, though they still appear as
+//     signals.
+//   - A scored advise rule that is text-only (Text set, no Inputs) has
+//     its contribution to `score` (not to its own reported `risk` or
+//     `flagged`) capped just under Params.Tiers.Medium when
+//     Params.TextRulesNeedFeatureSupport is set and no feature-based
+//     advise rule has itself reached `Medium` this round (design §5:
+//     "a text rule alone cannot raise score above medium unless a
+//     feature rule is >= medium").
+//   - `tier` is "unknown" when fewer than Params.MinScoredAdvise advise
+//     rules were scored; otherwise it's "high"/"medium"/"low" by
+//     Params.Tiers.
+//   - `degraded` is true whenever any advise rule is unscored (shadow
+//     rules being unscored does not set it).
+//
+// Combine never calls a Scorer and never mutates outcomes.
+func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet) Verdict {
+	signals := make([]Signal, 0, len(outcomes))
+	degraded := false
+
+	type adviseRisk struct {
+		risk     float64
+		textOnly bool
+	}
+	var adviseScored []adviseRisk
+
+	for _, o := range outcomes {
+		sig := Signal{Rule: o.Rule.Name, Mode: o.Rule.Mode}
+
+		if o.Unscored || o.Result == nil {
+			sig.Status = "unscored"
+			sig.ErrorCode = o.ErrorCode
+			signals = append(signals, sig)
+			if o.Rule.Mode == config.ModeAdvise {
+				degraded = true
+			}
+			continue
+		}
+
+		risk := 1 - o.Result.Probs[o.Rule.BenignLabel]
+		if c, ok := calib.lookup(o.Rule.Name, o.Rule.Scorer); ok {
+			risk = c.Calibrate(risk)
+		}
+
+		sig.Status = "scored"
+		sig.Risk = risk
+		sig.Flagged = risk >= o.Rule.Threshold
+		sig.Model = o.Result.Model
+		sig.Checkpoint = o.Result.Checkpoint
+		sig.Calibration = o.Calibration
+		sig.Reason = o.Reason
+		signals = append(signals, sig)
+
+		if o.Rule.Mode == config.ModeAdvise {
+			adviseScored = append(adviseScored, adviseRisk{risk: risk, textOnly: o.Rule.IsTextOnly()})
+		}
+	}
+
+	scoredAdviseCount := len(adviseScored)
+
+	var featureAdviseMax float64
+	haveFeatureAdvise := false
+	for _, a := range adviseScored {
+		if a.textOnly {
+			continue
+		}
+		if !haveFeatureAdvise || a.risk > featureAdviseMax {
+			featureAdviseMax = a.risk
+			haveFeatureAdvise = true
+		}
+	}
+	featureSupport := haveFeatureAdvise && featureAdviseMax >= params.Tiers.Medium
+
+	var score float64
+	for _, a := range adviseScored {
+		contribution := a.risk
+		if a.textOnly && params.TextRulesNeedFeatureSupport && !featureSupport {
+			capped := params.Tiers.Medium - capEpsilon
+			if contribution > capped {
+				contribution = capped
+			}
+		}
+		if contribution > score {
+			score = contribution
+		}
+	}
+
+	tier := "unknown"
+	if scoredAdviseCount >= params.MinScoredAdvise {
+		switch {
+		case score >= params.Tiers.High:
+			tier = "high"
+		case score >= params.Tiers.Medium:
+			tier = "medium"
+		default:
+			tier = "low"
+		}
+	}
+
+	return Verdict{Score: score, Tier: tier, Degraded: degraded, Signals: signals}
+}
