@@ -4,15 +4,18 @@
 // rather than living on its own, because — per design §4.1 — it was
 // always just YAML parsing.
 //
-// Load performs every check design §4.5 lists at load time and rejects
-// the whole document on any single failure, collecting all of them into
-// one error rather than stopping at the first: "unknown scorer, unknown
-// feature, labels not accepted by the adapter's Capabilities, text inputs
-// to an adapter whose policy forbids text, vote(...) members with
-// differing label sets, a (rule, scorer) pair with no calibration record
-// ... -> the whole reload is rejected and the previous config stays
-// live". Keeping the previous config live on a reject is the caller's
-// job (S3's hot-reload loop); this package only decides accept/reject.
+// Load performs every check design §4.5 lists that's in S1's scope at
+// load time and rejects the whole document on any single failure,
+// collecting all of them into one error rather than stopping at the
+// first: "unknown scorer, unknown feature, labels not accepted by the
+// adapter's Capabilities, text inputs to an adapter whose policy forbids
+// text, a (rule, scorer) pair with no calibration record ... -> the whole
+// reload is rejected and the previous config stays live". (Design §4.5
+// also lists "vote(...) members with differing label sets" — that check
+// applies once vote(...) parsing is reintroduced in internal/core, per
+// the TODO on resolveScorer below; S1 doesn't parse vote(...) at all.)
+// Keeping the previous config live on a reject is the caller's job (S3's
+// hot-reload loop); this package only decides accept/reject.
 package config
 
 import (
@@ -50,10 +53,11 @@ const (
 type Rule struct {
 	Name string
 	Mode Mode
-	// Scorer is the resolved scorer name as it appears in the YAML —
-	// either a plain registry name ("local") or a "vote(a,b,...)"
-	// expression naming other registered scorers to combine. Use
-	// Config.ScorerFor(rule) to get the constructed model.Scorer.
+	// Scorer is the resolved scorer name as it appears in the YAML — a
+	// plain registry name ("local") in S1 (see resolveScorer's TODO: a
+	// future slice reintroduces a "vote(a,b,...)" expression naming other
+	// registered scorers to combine). Use Config.ScorerFor(rule) to get
+	// the constructed model.Scorer.
 	Scorer      string
 	Inputs      []string
 	Text        []string
@@ -107,7 +111,8 @@ type Config struct {
 }
 
 // ScorerFor returns the constructed model.Scorer for rule (already
-// resolved at Load time, including any vote(...) construction).
+// resolved at Load time; S1 resolves only a plain registered name — see
+// resolveScorer's TODO for vote(...) construction in a later slice).
 func (c *Config) ScorerFor(rule Rule) (model.Scorer, bool) {
 	s, ok := c.scorers[rule.Scorer]
 	return s, ok
@@ -137,7 +142,9 @@ func (s FeatureSet) Has(name string) bool {
 
 // VendorEntry is one row of config/vendors.yaml: the adapter allowlist
 // (design §4.6). The config loader refuses to use any scorer whose base
-// adapter name (a vote's members included) is not listed here.
+// adapter name is not listed here (in S1 that's always the rule's own
+// `scorer:` name directly; once vote(...) returns, each of its members'
+// names too).
 type VendorEntry struct {
 	Name         string
 	TermsVersion string
@@ -204,10 +211,6 @@ type rawRule struct {
 	Stage     map[string]float64 `yaml:"stage"`
 }
 
-type sameAsRef struct {
-	SameAs string `yaml:"same_as"`
-}
-
 // Load parses and validates rule configuration YAML against deps,
 // returning either a fully resolved Config or an error listing every
 // problem found (errors.Join — use errors.Is/As or just print it; the
@@ -255,7 +258,14 @@ func Load(data []byte, deps Dependencies) (*Config, error) {
 	}
 	if minScoredAdvise < 1 {
 		issues = append(issues, fmt.Errorf("config: min_scored_advise (%d) must be >= 1", minScoredAdvise))
-	} else if adviseCount > 0 && minScoredAdvise > adviseCount {
+	} else if adviseCount == 0 {
+		// R11 (round 2): zero advise rules at all means scoredAdviseCount
+		// can never reach minScoredAdvise (>= 1) — every subject would be
+		// tier=unknown forever. The previous check only compared
+		// minScoredAdvise against adviseCount when adviseCount > 0,
+		// silently accepting a config with no advise rules whatsoever.
+		issues = append(issues, fmt.Errorf("config: min_scored_advise (%d) requires at least one advise-mode rule, but none are configured — every subject would stay tier=unknown forever", minScoredAdvise))
+	} else if minScoredAdvise > adviseCount {
 		issues = append(issues, fmt.Errorf("config: min_scored_advise (%d) must be <= the number of advise rules (%d)", minScoredAdvise, adviseCount))
 	}
 
@@ -532,12 +542,18 @@ func resolveInputs(raw []rawRule) ([]Rule, []error) {
 			}
 			rules[i].Inputs = inputs
 		case yaml.MappingNode:
-			var ref sameAsRef
-			if err := rr.Inputs.Decode(&ref); err != nil || ref.SameAs == "" {
-				issues = append(issues, fmt.Errorf("config: rule %q has an `inputs` mapping that isn't {same_as: ...}", rr.Name))
+			// R11 (round 2): checked directly against the raw mapping
+			// Content (a flat [key0, value0, key1, value1, ...] slice)
+			// instead of decoding into the sameAsRef struct — yaml.Node.
+			// Decode does NOT go through the top-level Decoder's
+			// KnownFields(true), so an extra key alongside same_as was
+			// silently ignored despite the rest of Load being strict.
+			// Content length 2 means exactly one key-value pair.
+			if len(rr.Inputs.Content) != 2 || rr.Inputs.Content[0].Value != "same_as" || rr.Inputs.Content[1].Value == "" {
+				issues = append(issues, fmt.Errorf("config: rule %q has an `inputs` mapping that isn't exactly {same_as: ...}", rr.Name))
 				continue
 			}
-			sameAs[i] = ref.SameAs
+			sameAs[i] = rr.Inputs.Content[1].Value
 		default:
 			issues = append(issues, fmt.Errorf("config: rule %q has an `inputs` field that is neither a list nor {same_as: ...}", rr.Name))
 		}

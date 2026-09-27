@@ -274,6 +274,33 @@ rules:
 			wantErr: "unknown rule",
 		},
 		{
+			// R11 (round 2): the `inputs: {same_as: ...}` mapping is decoded
+			// via yaml.Node.Decode, which does NOT go through the top-level
+			// Decoder's KnownFields(true) — so an extra, unrecognized key
+			// alongside same_as was silently ignored despite the rest of
+			// Load being strict.
+			name: "same_as mapping with an extra unknown key",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: base
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+  - name: derived
+    mode: shadow
+    scorer: local
+    inputs: {same_as: base, totally_bogus_key: 1}
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "same_as",
+		},
+		{
 			name: "duplicate rule name",
 			yaml: `
 tiers: {medium: 0.4, high: 0.8}
@@ -494,6 +521,27 @@ min_scored_advise: 5
 rules:
   - name: r1
     mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "min_scored_advise",
+		},
+		{
+			// R11 (round 2): zero advise rules at all (only shadow) with
+			// min_scored_advise defaulting to 1 (or set explicitly) means
+			// scoredAdviseCount can never reach minScoredAdvise — every
+			// subject would be tier=unknown forever. The old check
+			// (`adviseCount > 0 && minScoredAdvise > adviseCount`) skipped
+			// entirely when adviseCount was 0, so this config loaded fine.
+			name: "zero advise rules with min_scored_advise >= 1",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: shadow
     scorer: local
     inputs: [subject_age_h]
     labels: [benign, abusive]

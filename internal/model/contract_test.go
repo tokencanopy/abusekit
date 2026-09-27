@@ -43,9 +43,9 @@ type ContractConfig struct {
 }
 
 // RunContractSuite runs the shared adapter contract assertions against
-// cfg.New(). Call it once per adapter (local, vote, fake) from a
-// TestXxxContract wrapper so `go test -run TestLocalContract` etc. still
-// works.
+// cfg.New(). Call it once per adapter (local, fake, and any future
+// vendor adapter) from a TestXxxContract wrapper so
+// `go test -run TestLocalContract` etc. still works.
 func RunContractSuite(t *testing.T, cfg ContractConfig) {
 	t.Helper()
 

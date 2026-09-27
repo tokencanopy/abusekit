@@ -45,7 +45,11 @@ type AppendResult struct {
 //   - updates subjects.class when the event is `subject.class` and
 //     e.Data["class"] is a string (design §4.3: "internal/synthetic
 //     subjects are stored but never scored" — the worker, S2, is what
-//     actually honours class; this method only records it);
+//     actually honours class; this method only records it), ordered by
+//     the event's `at` (class_set_at) rather than delivery/processing
+//     order (R11, round 2) — a chronologically older classification
+//     arriving after a newer one (a retry, a reordered delivery) must
+//     never overwrite it;
 //   - upserts one links row per present (kind, hash) on e.Links.
 //
 // The whole batch commits or rolls back together: a caller that wants
@@ -126,9 +130,15 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 		}
 		if e.Type == "subject.class" {
 			if class, ok := e.Data["class"].(string); ok && class != "" {
+				// R11 (round 2): only apply if this event's `at` is at
+				// least as new as whatever `at` last set class —
+				// class_set_at IS NULL covers a subject row that predates
+				// this column, or has never had a subject.class event at
+				// all, either of which must always accept the first one.
 				if _, err := tx.Exec(ctx,
-					`UPDATE subjects SET class = $1 WHERE tenant = $2 AND subject = $3`,
-					class, tenant, e.Subject,
+					`UPDATE subjects SET class = $1, class_set_at = $4
+					 WHERE tenant = $2 AND subject = $3 AND (class_set_at IS NULL OR $4 >= class_set_at)`,
+					class, tenant, e.Subject, e.At,
 				); err != nil {
 					return AppendResult{}, fmt.Errorf("store: update subject class for %s: %w", e.Subject, err)
 				}

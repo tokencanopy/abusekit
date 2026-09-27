@@ -347,6 +347,40 @@ func TestAppendEvents_SubjectClassUpdatesSubjectRow(t *testing.T) {
 	}
 }
 
+// TestAppendEvents_SubjectClassIsOrderedByAtNotDelivery is R11 (round 2):
+// subjects.class must reflect the LATEST subject.class event by `at`, not
+// whichever one was processed last. Proven scenario: a later
+// classification (at=now+10s, "synthetic") is delivered and processed
+// first, then an OLDER one (at=now+1s, "customer") arrives afterward
+// (e.g. a retried/reordered delivery) — the older one must not overwrite
+// the newer classification.
+func TestAppendEvents_SubjectClassIsOrderedByAtNotDelivery(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T12:00:00Z")
+
+	create := mkEvent(t, "evt_create_2", "mon-b", "subject.created", now, map[string]any{"channel": "api"})
+	newer := mkEvent(t, "evt_class_newer", "mon-b", "subject.class", now.Add(10*time.Second), map[string]any{"class": "synthetic"})
+	older := mkEvent(t, "evt_class_older", "mon-b", "subject.class", now.Add(1*time.Second), map[string]any{"class": "customer"})
+
+	// Deliver the NEWER classification FIRST, then the OLDER one — the
+	// older one arriving later (by delivery order) must not win.
+	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{create, newer}); err != nil {
+		t.Fatalf("AppendEvents (create+newer): %v", err)
+	}
+	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{older}); err != nil {
+		t.Fatalf("AppendEvents (older, delivered second): %v", err)
+	}
+
+	view, err := s.SubjectView(ctx, testTenant, "mon-b", nil)
+	if err != nil {
+		t.Fatalf("SubjectView: %v", err)
+	}
+	if view.Class != "synthetic" {
+		t.Fatalf("expected class to stay \"synthetic\" (the later-by-`at` classification), got %q", view.Class)
+	}
+}
+
 func TestAppendEvents_UpsertsLinks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

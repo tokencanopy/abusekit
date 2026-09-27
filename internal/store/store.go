@@ -20,11 +20,14 @@ import (
 
 // migrationLockKey is the bigint key ApplyMigrations passes to
 // pg_advisory_xact_lock (B4) to serialize concurrent migration runs.
-// Postgres advisory locks share one 64-bit keyspace per database
-// cluster-wide, so this is a fixed, arbitrary constant rather than
-// anything derived from abusekit's own data — any int64 works as long as
-// every abusekit instance agrees on it, which a literal constant
-// guarantees for free.
+// Postgres advisory locks are scoped PER-DATABASE (a lock held by a
+// session connected to one database never conflicts with the same key
+// held against a different database on the same cluster — S11's
+// per-test-run schemas notwithstanding, since a schema is not a
+// database), so this is a fixed, arbitrary constant rather than anything
+// derived from abusekit's own data — any int64 works as long as every
+// abusekit instance agrees on it, which a literal constant guarantees for
+// free.
 const migrationLockKey = 0x61627573656b6974 // "abusekit" in ASCII hex, truncated to fit int64
 
 // undefinedTable is the Postgres SQLSTATE for "undefined_table" (42P01):

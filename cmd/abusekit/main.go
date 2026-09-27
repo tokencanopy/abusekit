@@ -3,11 +3,11 @@
 //
 // S1 wires up the store and config layers behind two subcommands; the
 // HTTP surface (`serve`'s actual `/v1/*` handlers) is S3's job. Until
-// then, `serve` boots exactly what a real server would need at startup —
-// a migrated database and a validated rule config — and either exits 0
-// immediately (`--check`, for CI and deploy smoke tests) or blocks until
-// an OS signal, so the binary already has the shape (long-running,
-// signal-terminated) the eventual HTTP server will have.
+// then, `serve` only supports `--check` (S17): it boots exactly what a
+// real server would need at startup — a validated rule config, then a
+// migrated database — and exits 0. Without `--check` it returns an
+// explicit "not implemented yet" error rather than blocking on a signal
+// with nothing actually listening.
 package main
 
 import (

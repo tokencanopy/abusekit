@@ -240,12 +240,15 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 	}
 	v.ScoredAt = currentScoredAt
 	v.EventsSinceScore = dirtySeq - scoredSeq
-	// S4: Stale is purely dirty_seq > scored_seq — comparing wall-clock
-	// timestamps (last_event_at vs. current_scored_at) from two different
-	// clocks (the app server that stamped the event's `at`, and Postgres's
-	// own now()) is wrong even a few hundred milliseconds of drift away,
-	// and is *always* wrong for a fictional test timestamp far from the
-	// real clock.
+	// S4: Stale is purely dirty_seq > scored_seq. An earlier version of
+	// this method instead compared subjects.last_event_at (not selected
+	// above — see AppendEvents' touchSubjectTx, which still stamps it for
+	// other purposes) against current_scored_at; that was wrong, because
+	// the two timestamps come from two different clocks (the app server
+	// that stamped the event's `at`, and Postgres's own now()) — wrong
+	// even a few hundred milliseconds of drift away, and *always* wrong
+	// for a fictional test timestamp far from the real clock. Comparing
+	// the two sequence counters instead sidesteps clocks entirely.
 	v.Stale = dirtySeq > scoredSeq
 
 	query := `

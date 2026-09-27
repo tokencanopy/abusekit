@@ -410,13 +410,14 @@ func validateProbs(probs map[string]float64, labels []string, benignLabel string
 //   - `score` is the max risk over scored **advise** rules; shadow rules
 //     are excluded from score entirely, though they still appear as
 //     signals.
-//   - A scored advise rule that is text-only (Text set, no Inputs) has
-//     its contribution to `score` (not to its own reported `risk` or
+//   - A scored advise rule with `IsTextOnly()` true (Text set — S15,
+//     round 2: regardless of whether Inputs is ALSO set) has its
+//     contribution to `score` (not to its own reported `risk` or
 //     `flagged`) capped just under Params.Tiers.Medium when
 //     Params.TextRulesNeedFeatureSupport is set and no feature-based
-//     advise rule has itself reached `Medium` this round (design §5:
-//     "a text rule alone cannot raise score above medium unless a
-//     feature rule is >= medium").
+//     (IsTextOnly() false) advise rule has itself reached `Medium` this
+//     round (design §5: "a text rule alone cannot raise score above
+//     medium unless a feature rule is >= medium").
 //   - `tier` is "unknown" when fewer than Params.MinScoredAdvise advise
 //     rules were scored; otherwise it's "high"/"medium"/"low" by
 //     Params.Tiers.
