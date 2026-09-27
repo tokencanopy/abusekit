@@ -2,8 +2,8 @@
 # (internal/model/local, design §4.6).
 #
 # PLACEHOLDER WEIGHTS. Every sign and magnitude below is hand-set to a
-# plausible direction from the September 2026 incident narrative (design
-# §1), not fit against labelled data. They exist so the local scorer can
+# plausible direction from a synthetic reference scenario (design §1),
+# not fit against labelled data. They exist so the local scorer can
 # always answer something and so S2's replay fixtures (burst/fast/churn)
 # have a rule to score against; they are reviewed like code, and are
 # expected to be replaced by the first `abusekit calibrate`/gate run

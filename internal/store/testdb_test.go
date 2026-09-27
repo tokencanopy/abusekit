@@ -19,9 +19,9 @@ import (
 
 // defaultTestDBURL matches AGENTS.md/the task brief: "default
 // postgres://e2a:e2a@localhost:5433/abusekit_test?sslmode=disable" — the
-// same shared local Postgres e2a's own testutil uses (see
-// ~/Desktop/e2a/internal/testutil/db.go), just a different database name
-// so the two repos' test suites never collide on the same one.
+// same shared local Postgres convention e2a's own test suite uses, just a
+// different database name so the two repos' test suites never collide on
+// the same one.
 const defaultTestDBURL = "postgres://e2a:e2a@localhost:5433/abusekit_test?sslmode=disable"
 
 // testDBURL returns the configured test database URL: the

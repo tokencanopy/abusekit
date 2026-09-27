@@ -12,7 +12,6 @@ import (
 	"io/fs"
 	"sort"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -47,18 +46,21 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// Pool exposes the underlying pool for callers that need it directly
-// (transactions spanning multiple Store calls, health checks).
-func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+// Close releases the underlying pool's connections. Callers that
+// constructed a Store for a process's lifetime (cmd/abusekit's `serve`
+// and `migrate`) should defer this right after a successful New.
+//
+// N8: this replaces an earlier exported Pool() method — nothing outside
+// this package needed the raw *pgxpool.Pool for anything other than
+// closing it, so the narrower Close() is the whole surface a caller
+// actually needs, and it doesn't leak pgx's own types into callers that
+// otherwise have no reason to import pgx directly.
+func (s *Store) Close() { s.pool.Close() }
 
 // ErrNotFound is returned by read methods (SubjectView) when the
 // requested row does not exist. Callers use errors.Is against this rather
 // than a package-specific sentinel per method.
 var ErrNotFound = errors.New("store: not found")
-
-// IsNoRows reports whether err is pgx's no-rows sentinel — a convenience
-// so callers outside this package don't need to import pgx just to check.
-func IsNoRows(err error) bool { return errors.Is(err, pgx.ErrNoRows) }
 
 // ApplyMigrations runs every embedded .sql file (in filename order) that
 // isn't already recorded in schema_migrations_abusekit. Each file is

@@ -10,6 +10,19 @@ import (
 	"golang.org/x/text/unicode/norm"
 )
 
+// RedactionSchemaVersion identifies the version of the static redaction
+// schema (the `schema` table below) that produced a given event's stored
+// `data` (N6). The store stamps every accepted event's `redaction_version`
+// column with this constant at insert time (design §4.3: "versioned by
+// being part of this package's source — a schema change ships as a code
+// change and a new abusekit release"). Bump it whenever a change to
+// `schema` (a field added/removed/re-capped, an enum tightened, a new
+// event type) would change what an already-stored event's `data` means
+// relative to a freshly-redacted one — that's what lets an operator (or a
+// future migration) identify which rows were redacted under an older
+// rule set without guessing from `received_at` timestamps.
+const RedactionSchemaVersion = 1
+
 // fieldSpec describes how one `data` key of a known event type is handled.
 type fieldSpec struct {
 	// maxLen caps a string value's byte length; values over the cap are

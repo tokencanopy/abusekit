@@ -342,6 +342,14 @@ func TestSkeleton(t *testing.T) {
 		{"leetspeak digits", "supp0rt", "support"},
 		{"diacritics stripped", "café", "cafe"},
 		{"whitespace collapsed", "hello   world", "hello world"},
+		// N1: I/l/ı/1 must fold together, and folding must happen BEFORE
+		// lowercasing so a capital "I" (impersonating lowercase "l") and
+		// an unrelated lowercase "i" don't collapse into the same thing
+		// for the wrong reason.
+		{"capital I folds with lowercase l", "PayPaI", "PayPal"},
+		{"dotless i folds with lowercase l", "paypaı", "paypal"},
+		{"isolated digit 1 folds with lowercase l", "supp1y", "supply"},
+		{"I, l, ı, and isolated 1 are all the same skeleton", "I", "l"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -352,4 +360,31 @@ func TestSkeleton(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("all of I, l, ı, 1 collapse to the same skeleton", func(t *testing.T) {
+		want := Skeleton("l")
+		for _, s := range []string{"I", "ı", "1"} {
+			if got := Skeleton(s); got != want {
+				t.Errorf("Skeleton(%q) = %q, want %q (same as Skeleton(\"l\"))", s, got, want)
+			}
+		}
+	})
+
+	// N1: a digit is only leet-mapped to a letter when it's NOT part of a
+	// multi-digit run — a run of 2+ digits is almost always a genuine
+	// number (an order id, a count), not per-letter leetspeak, so
+	// "Order 12345" must not turn into "order l2eas".
+	t.Run("digits inside a multi-digit run are not leet-mapped", func(t *testing.T) {
+		got := Skeleton("Order 12345")
+		want := "order 12345"
+		if got != want {
+			t.Errorf("Skeleton(%q) = %q, want %q (digits in a run must stay literal)", "Order 12345", got, want)
+		}
+	})
+
+	t.Run("an isolated leet digit is still mapped inside a word", func(t *testing.T) {
+		if got, want := Skeleton("am4z0n"), Skeleton("amazon"); got != want {
+			t.Errorf("Skeleton(%q) = %q, want %q", "am4z0n", got, want)
+		}
+	})
 }

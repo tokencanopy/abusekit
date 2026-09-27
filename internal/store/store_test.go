@@ -176,7 +176,7 @@ func TestScopedPool_DoesNotInheritPublicSchemaTrackerState(t *testing.T) {
 func TestAppendEvents_AcceptsNewEvents(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	e1 := mkEvent(t, "evt_1", "acct_example_1", "subject.created", now, map[string]any{"channel": "api"})
 	e2 := mkEvent(t, "evt_2", "acct_example_1", "resource.created", now.Add(time.Minute), map[string]any{"kind": "agent", "name": "Widget"})
@@ -204,10 +204,38 @@ func TestAppendEvents_AcceptsNewEvents(t *testing.T) {
 	}
 }
 
+// TestAppendEvents_StampsRedactionVersion is N6: every stored event
+// records the redaction schema version (event.RedactionSchemaVersion) it
+// was redacted under, so a future schema change can identify which rows
+// were redacted by an older rule set without re-deriving it from
+// received_at timestamps.
+func TestAppendEvents_StampsRedactionVersion(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T12:00:00Z")
+
+	e := mkEvent(t, "evt_redaction_version", "acct_redaction_version", "subject.created", now, map[string]any{"channel": "api"})
+	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{e}); err != nil {
+		t.Fatalf("AppendEvents: %v", err)
+	}
+
+	pool := openScopedPool(t, ctx)
+	var version int
+	if err := pool.QueryRow(ctx,
+		`SELECT redaction_version FROM events WHERE tenant = $1 AND id = $2`,
+		testTenant, "evt_redaction_version",
+	).Scan(&version); err != nil {
+		t.Fatalf("query events.redaction_version: %v", err)
+	}
+	if version != event.RedactionSchemaVersion {
+		t.Fatalf("expected redaction_version=%d, got %d", event.RedactionSchemaVersion, version)
+	}
+}
+
 func TestAppendEvents_DuplicateVsConflict(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	e := mkEvent(t, "evt_dup", "acct_example_2", "subject.created", now, map[string]any{"channel": "api"})
 	res, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{e})
@@ -239,7 +267,7 @@ func TestAppendEvents_DuplicateVsConflict(t *testing.T) {
 func TestAppendEvents_BumpsSubjectDirtySeq(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	for i := 0; i < 3; i++ {
 		e := mkEvent(t, fmt.Sprintf("evt_%d", i), "acct_example_3", "resource.created", now.Add(time.Duration(i)*time.Second),
@@ -300,7 +328,7 @@ func TestAppendEvents_NeverReturnsAcceptedAlongsideError(t *testing.T) {
 func TestAppendEvents_SubjectClassUpdatesSubjectRow(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	create := mkEvent(t, "evt_create", "mon-a", "subject.created", now, map[string]any{"channel": "api"})
 	classify := mkEvent(t, "evt_class", "mon-a", "subject.class", now.Add(time.Second), map[string]any{"class": "synthetic"})
@@ -321,7 +349,7 @@ func TestAppendEvents_SubjectClassUpdatesSubjectRow(t *testing.T) {
 func TestAppendEvents_UpsertsLinks(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 	hash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" // 64 hex chars
 
 	e1 := event.Event{ID: "e1", Subject: "acct_a", Type: "subject.created", At: now, Links: event.Links{EmailHash: hash}}
@@ -358,7 +386,7 @@ func TestAppendEvents_UpsertsLinks(t *testing.T) {
 func TestNeighbors_TruncatesAtCapPerKey(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 	hash := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 	var events []event.Event
@@ -474,7 +502,7 @@ func TestUpsertVerdictsAndSubjectView(t *testing.T) {
 func TestSubjectView_DegradedWhenAdviseRuleUnscored(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 
 	e := mkEvent(t, "evt_1", "acct_degraded", "resource.created", now, map[string]any{"kind": "agent", "name": "a"})
 	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{e}); err != nil {

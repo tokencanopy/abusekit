@@ -116,7 +116,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	defer s.Pool().Close() // S17: close on every exit path, including this success one
+	defer s.Close() // S17: close on every exit path, including this success one
 
 	fmt.Println("abusekit: store migrated, config valid (S1 placeholder — HTTP surface arrives in S3)")
 	return nil

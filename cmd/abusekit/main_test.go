@@ -144,7 +144,7 @@ func TestBoot_ShippedConfigSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
-	defer s.Pool().Close()
+	defer s.Close()
 
 	if len(cfg.Rules) == 0 {
 		t.Fatalf("expected at least one loaded rule")

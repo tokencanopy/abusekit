@@ -89,11 +89,11 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 
 		var seq int64
 		err = tx.QueryRow(ctx, `
-			INSERT INTO events (tenant, producer, id, subject, type, at, links, data, body_hash)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			INSERT INTO events (tenant, producer, id, subject, type, at, links, data, body_hash, redaction_version)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			ON CONFLICT (tenant, producer, id) DO NOTHING
 			RETURNING seq
-		`, tenant, producer, e.ID, e.Subject, e.Type, e.At, linksJSON, dataJSON, bodyHash).Scan(&seq)
+		`, tenant, producer, e.ID, e.Subject, e.Type, e.At, linksJSON, dataJSON, bodyHash, event.RedactionSchemaVersion).Scan(&seq)
 
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {

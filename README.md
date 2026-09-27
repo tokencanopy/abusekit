@@ -7,12 +7,13 @@ read the score and decide what to do. It never enforces.
 - Two integration calls: `POST /v1/events`, `GET /v1/subjects/{id}`.
 - Rules are YAML; scorers are adapters (Jev, Laya, Gemini, ensembles); modes per rule (shadow, advise).
 - Pure `score()` core, JSONL corpus, `abusekit eval` harness, CI gate on precision/recall/calibration.
-- One binary (service) or importable package; Postgres or SQLite.
+- One binary (service) or importable package; Postgres only (v1 defers SQLite/embedded mode — see
+  the design's §4.13 alternatives).
 
 Design: `docs/design/2026-09-27-abusekit-design.md`. Status: S1 (core types, Postgres
 store, the model seam + local scorer, the pure Plan/Combine core, and the rules/vendors config
-loader) is implemented; see `docs/plans/2026-09-27-v0-plan.md` on `design/r2-review-fixes` for the
-full slice plan. The HTTP surface, feature extraction, and worker land in later slices.
+loader) is implemented; see `docs/plans/2026-09-27-v0-plan.md` (on `main`) for the full slice plan.
+The HTTP surface, feature extraction, and worker land in later slices.
 
 ## Development
 

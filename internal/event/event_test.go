@@ -16,7 +16,7 @@ func mustTime(t *testing.T, s string) time.Time {
 }
 
 func TestEvent_Validate(t *testing.T) {
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 	hash := strings.Repeat("a", LinkHashLen)
 
 	base := func() Event {
@@ -166,7 +166,7 @@ func TestEvent_Validate(t *testing.T) {
 }
 
 func TestEvent_BodyHash(t *testing.T) {
-	now := mustTime(t, "2026-09-27T12:00:00Z")
+	now := mustTime(t, "2031-09-27T12:00:00Z")
 	e1 := Event{Subject: "s1", Type: "subject.created", At: now, Data: map[string]any{"channel": "api"}}
 	e2 := Event{Subject: "s1", Type: "subject.created", At: now, Data: map[string]any{"channel": "api"}}
 	e3 := Event{Subject: "s1", Type: "subject.created", At: now, Data: map[string]any{"channel": "web"}}
