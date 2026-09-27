@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/tokencanopy/abusekit/internal/event"
 	"github.com/tokencanopy/abusekit/internal/store"
 )
@@ -43,6 +45,55 @@ func TestApplyMigrations_FreshDatabase(t *testing.T) {
 	ctx := context.Background()
 	if err := s.ApplyMigrations(ctx); err != nil {
 		t.Fatalf("re-applying migrations should be a no-op, got: %v", err)
+	}
+}
+
+// TestApplyMigrations_ConcurrentOnFreshDatabase is B4: two instances
+// racing to migrate the same brand-new database (the real startup
+// scenario — a multi-instance deploy, or `go test ./...` running two
+// packages' newTestStore concurrently) must all succeed. Proven: before
+// wrapping the migration loop in pg_advisory_xact_lock, ~35/40 concurrent
+// ApplyMigrations calls against a fresh database failed with a duplicate
+// pg_type key (two sessions both trying to CREATE TABLE at once).
+func TestApplyMigrations_ConcurrentOnFreshDatabase(t *testing.T) {
+	dbURL := newThrowawayDatabaseURL(t)
+	ctx := context.Background()
+
+	const n = 40
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			pool, err := pgxpool.New(ctx, dbURL)
+			if err != nil {
+				errs <- fmt.Errorf("open pool: %w", err)
+				return
+			}
+			defer pool.Close()
+			errs <- store.New(pool).ApplyMigrations(ctx)
+		}()
+	}
+
+	var failures int
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			failures++
+			t.Logf("concurrent ApplyMigrations call %d failed: %v", i, err)
+		}
+	}
+	if failures > 0 {
+		t.Fatalf("%d/%d concurrent ApplyMigrations calls against a fresh database failed", failures, n)
+	}
+
+	// The schema must actually be usable afterward, not just "no error
+	// returned" (e.g. a partially-applied migration that happened not to
+	// error on this particular interleaving).
+	verifyPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open verify pool: %v", err)
+	}
+	defer verifyPool.Close()
+	if err := store.New(verifyPool).ApplyMigrations(ctx); err != nil {
+		t.Fatalf("ApplyMigrations after the concurrent race: %v", err)
 	}
 }
 

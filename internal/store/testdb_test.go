@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -124,6 +125,68 @@ func createDatabase(ctx context.Context, dbURL string) error {
 		return fmt.Errorf("create database %s: %w", name, err)
 	}
 	return nil
+}
+
+// dropDatabase drops dbURL's database via the server's "postgres"
+// maintenance database, forcibly disconnecting any remaining sessions
+// first (WITH (FORCE), Postgres 13+) so a caller doesn't have to
+// carefully sequence pool.Close() before this runs. Best-effort: a
+// caller-side cleanup that fails to drop a throwaway database is a (rare)
+// leaked scratch database on the test server, not a test failure.
+func dropDatabase(ctx context.Context, dbURL string) error {
+	target, err := url.Parse(dbURL)
+	if err != nil {
+		return fmt.Errorf("parse test db url: %w", err)
+	}
+	name := strings.TrimPrefix(target.Path, "/")
+	if name == "" {
+		return fmt.Errorf("no database name in %s", dbURL)
+	}
+
+	admin := *target
+	admin.Path = "/postgres"
+	conn, err := pgx.Connect(ctx, admin.String())
+	if err != nil {
+		return fmt.Errorf("connect admin db to drop %s: %w", name, err)
+	}
+	defer conn.Close(ctx)
+
+	_, err = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	return err
+}
+
+// newThrowawayDatabaseURL creates a uniquely named, empty database on the
+// same Postgres server as testDBURL() and returns its connection URL plus
+// a cleanup func that drops it. Unlike newTestStore (which reuses one
+// shared database across a whole test run — see S11's per-run schema),
+// this is for tests that specifically need to observe behavior against a
+// database with NOTHING in it yet, such as a from-scratch migration race.
+//
+// Skips the test if the server itself is unreachable, same as
+// newTestStore.
+func newThrowawayDatabaseURL(t *testing.T) string {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping DB-backed test in -short mode")
+	}
+
+	base := testDBURL()
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse test db url: %v", err)
+	}
+	name := fmt.Sprintf("abusekit_throwaway_%d_%d", os.Getpid(), time.Now().UnixNano())
+	fresh := *u
+	fresh.Path = "/" + name
+	target := fresh.String()
+
+	if err := createDatabase(context.Background(), target); err != nil {
+		t.Skipf("test database not available: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = dropDatabase(context.Background(), target)
+	})
+	return target
 }
 
 // truncateAll resets every abusekit table between tests. All eight tables
