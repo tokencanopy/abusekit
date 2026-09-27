@@ -1,6 +1,7 @@
 package core_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/tokencanopy/abusekit/internal/config"
@@ -341,10 +342,152 @@ func TestCombine_AppliesCalibration(t *testing.T) {
 		{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5)}, // raw risk 0.5
 	}
 	calib := core.CalibrationSet{
-		core.Key("r", "local"): core.CalibratorFunc(func(raw float64) float64 { return raw * 0.5 }),
+		core.Key("r", "local", "v1"): core.CalibrationEntry{ID: "cal_test", Calibrator: core.CalibratorFunc(func(raw float64) float64 { return raw * 0.5 })},
 	}
 	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, calib)
 	if v.Signals[0].Risk != 0.25 {
 		t.Fatalf("expected calibrated risk 0.25, got %v", v.Signals[0].Risk)
+	}
+	// B2/S12: the recorded calibration id must come from the SAME lookup
+	// that produced the applied Calibrator, not from whatever the caller
+	// happened to pass on RuleOutcome.Calibration.
+	if v.Signals[0].Calibration != "cal_test" {
+		t.Fatalf("expected recorded calibration id %q from the applied lookup, got %q", "cal_test", v.Signals[0].Calibration)
+	}
+}
+
+func TestCombine_CalibrationFallsBackWhenNoEntryForCheckpoint(t *testing.T) {
+	// scoredResult's Checkpoint is "v1"; a calibration recorded for a
+	// different checkpoint must not be applied, and the caller-supplied
+	// fallback Calibration id (e.g. "none" for an already-calibrated
+	// scorer) is what gets recorded.
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5), Calibration: "none"},
+	}
+	calib := core.CalibrationSet{
+		core.Key("r", "local", "v2"): core.CalibrationEntry{ID: "cal_other", Calibrator: core.CalibratorFunc(func(raw float64) float64 { return raw * 0.5 })},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, calib)
+	if v.Signals[0].Risk != 0.5 {
+		t.Fatalf("expected uncalibrated raw risk 0.5 (no entry for checkpoint v1), got %v", v.Signals[0].Risk)
+	}
+	if v.Signals[0].Calibration != "none" {
+		t.Fatalf("expected fallback calibration id %q, got %q", "none", v.Signals[0].Calibration)
+	}
+}
+
+// --- B2: Combine must never fail open on a malformed scoring result -------
+
+func TestCombine_InvalidResult_NaNBenignProbability(t *testing.T) {
+	// Proven: {benign: NaN} currently produces tier=low, score=0,
+	// degraded=false — a NaN probability must instead be treated as
+	// unscored/invalid_result, excluded from tier, and must degrade an
+	// advise rule.
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("a", config.ModeAdvise), Result: &model.ScoreResult{
+			Probs: map[string]float64{"benign": math.NaN(), "abusive": 1},
+		}},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, nil)
+	if v.Tier != "unknown" {
+		t.Fatalf("expected tier=unknown for a NaN probability, got %s", v.Tier)
+	}
+	if v.Score != 0 {
+		t.Fatalf("expected score=0, got %v", v.Score)
+	}
+	if !v.Degraded {
+		t.Fatalf("expected degraded=true for an invalid advise-rule result")
+	}
+	if len(v.Signals) != 1 || v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+		t.Fatalf("expected an unscored signal with error_code=invalid_result, got %#v", v.Signals)
+	}
+}
+
+func TestCombine_InvalidResult_ProbabilityOutOfRange(t *testing.T) {
+	// Proven: P(benign) = 1.7 currently produces tier=low.
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("a", config.ModeAdvise), Result: &model.ScoreResult{
+			Probs: map[string]float64{"benign": 1.7, "abusive": -0.7},
+		}},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, nil)
+	if v.Tier != "unknown" {
+		t.Fatalf("expected tier=unknown for an out-of-range probability, got %s", v.Tier)
+	}
+	if v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+		t.Fatalf("expected unscored/invalid_result, got %#v", v.Signals[0])
+	}
+}
+
+func TestCombine_InvalidResult_ProbabilitiesDontSumToOne(t *testing.T) {
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("a", config.ModeAdvise), Result: &model.ScoreResult{
+			Probs: map[string]float64{"benign": 0.9, "abusive": 0.9}, // sums to 1.8
+		}},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, nil)
+	if v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+		t.Fatalf("expected unscored/invalid_result for probabilities not summing to 1, got %#v", v.Signals[0])
+	}
+}
+
+func TestCombine_InvalidResult_MissingBenignLabel(t *testing.T) {
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("a", config.ModeAdvise), Result: &model.ScoreResult{
+			Probs: map[string]float64{"abusive": 1}, // no "benign" key at all
+		}},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, nil)
+	if v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+		t.Fatalf("expected unscored/invalid_result for a missing benign label, got %#v", v.Signals[0])
+	}
+}
+
+func TestCombine_InvalidResult_CalibratorProducesNaN(t *testing.T) {
+	// Proven: a calibrator returning NaN currently produces tier=low.
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5)}, // valid raw risk 0.5
+	}
+	calib := core.CalibrationSet{
+		core.Key("r", "local", "v1"): core.CalibrationEntry{ID: "cal_broken", Calibrator: core.CalibratorFunc(func(raw float64) float64 { return math.NaN() })},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, calib)
+	if v.Tier != "unknown" {
+		t.Fatalf("expected tier=unknown when the calibrator produces NaN, got %s", v.Tier)
+	}
+	if v.Signals[0].Status != "unscored" || v.Signals[0].ErrorCode != "invalid_result" {
+		t.Fatalf("expected unscored/invalid_result, got %#v", v.Signals[0])
+	}
+}
+
+func TestCombine_CalibratorOutputIsClamped(t *testing.T) {
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("r", config.ModeAdvise), Result: scoredResult(1 - 0.5)},
+	}
+	calib := core.CalibrationSet{
+		core.Key("r", "local", "v1"): core.CalibrationEntry{ID: "cal_over", Calibrator: core.CalibratorFunc(func(raw float64) float64 { return 1.5 })},
+	}
+	v := core.Combine(outcomes, core.CombineParams{Tiers: config.Tiers{Medium: 0.4, High: 0.8}, MinScoredAdvise: 1}, calib)
+	if v.Signals[0].Risk != 1 {
+		t.Fatalf("expected calibrator output clamped to 1, got %v", v.Signals[0].Risk)
+	}
+}
+
+func TestCombine_ZeroOutcomesNeverScoresLowOrHigh(t *testing.T) {
+	// Proven: CombineParams{} (zero value, MinScoredAdvise=0) against zero
+	// outcomes currently returns tier=high.
+	v := core.Combine(nil, core.CombineParams{}, nil)
+	if v.Tier != "unknown" {
+		t.Fatalf("expected tier=unknown for zero outcomes and a zero-value CombineParams, got %s", v.Tier)
+	}
+}
+
+func TestCombine_ZeroAdviseRulesNeverScoresLowOrHigh(t *testing.T) {
+	outcomes := []core.RuleOutcome{
+		{Rule: rule("shadow_only", config.ModeShadow), Result: scoredResult(0.01)}, // risk 0.99, shadow only
+	}
+	v := core.Combine(outcomes, core.CombineParams{}, nil)
+	if v.Tier != "unknown" {
+		t.Fatalf("expected tier=unknown with zero advise rules scored, got %s", v.Tier)
 	}
 }

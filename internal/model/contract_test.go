@@ -2,6 +2,7 @@ package model_test
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -49,24 +50,31 @@ func RunContractSuite(t *testing.T, cfg ContractConfig) {
 	t.Helper()
 
 	t.Run("valid_probabilities_sum_to_one", func(t *testing.T) {
+		// A ContractConfig with a duplicate label in ValidRequest.Labels
+		// would double-count that label's probability below, spuriously
+		// passing (or failing) an otherwise well-behaved adapter — fail
+		// loudly on the suite's own configuration rather than silently
+		// producing a meaningless sum.
+		seen := make(map[string]bool, len(cfg.ValidRequest.Labels))
+		for _, label := range cfg.ValidRequest.Labels {
+			if seen[label] {
+				t.Fatalf("ValidRequest.Labels has duplicate label %q; the contract suite requires a label set with no duplicates", label)
+			}
+			seen[label] = true
+		}
+
 		s := cfg.New()
 		res, err := s.Score(context.Background(), cfg.ValidRequest)
 		if err != nil {
 			t.Fatalf("Score: %v", err)
 		}
-		var sum float64
 		for _, label := range cfg.ValidRequest.Labels {
-			p, ok := res.Probs[label]
-			if !ok {
+			if _, ok := res.Probs[label]; !ok {
 				t.Fatalf("Probs missing requested label %q: %#v", label, res.Probs)
 			}
-			if p < 0 || p > 1 {
-				t.Fatalf("Probs[%q] = %v, want in [0,1]", label, p)
-			}
-			sum += p
 		}
-		if math.Abs(sum-1) > 0.01 {
-			t.Fatalf("Probs sum to %v, want 1±0.01", sum)
+		if reason, ok := invalidProbsReason(res.Probs, cfg.ValidRequest.Labels); !ok {
+			t.Fatalf("invalid Probs %#v for labels %v: %s", res.Probs, cfg.ValidRequest.Labels, reason)
 		}
 	})
 
@@ -271,6 +279,55 @@ func TestVote_RequiresAtLeastTwoMembers(t *testing.T) {
 	a := fake.New()
 	if _, err := model.Vote("vote(a)", a); err == nil {
 		t.Fatalf("expected Vote to reject a single member")
+	}
+}
+
+// invalidProbsReason is the exact predicate the "valid_probabilities_sum_to_one"
+// subtest above checks; it is factored out to a plain function (returning
+// a reason instead of calling t.Fatalf) so a dedicated test can assert
+// directly that a malformed Probs map is rejected. This is deliberate,
+// not just a style choice: Go's testing package always propagates a
+// failing t.Run subtest's failure up through every ancestor Test,
+// regardless of what the calling code does with t.Run's returned bool —
+// there is no supported way to run RunContractSuite against a
+// known-broken adapter inside another test and observe "it correctly
+// failed" without that also failing the outer test. Testing the predicate
+// directly is what actually proves the suite's math (not just its
+// plumbing) rejects an invalid result.
+func invalidProbsReason(probs map[string]float64, labels []string) (reason string, ok bool) {
+	var sum float64
+	for _, label := range labels {
+		p, present := probs[label]
+		if !present {
+			return fmt.Sprintf("missing label %q", label), false
+		}
+		if math.IsNaN(p) || math.IsInf(p, 0) {
+			return fmt.Sprintf("Probs[%q] = %v is not finite", label, p), false
+		}
+		if p < 0 || p > 1 {
+			return fmt.Sprintf("Probs[%q] = %v is outside [0,1]", label, p), false
+		}
+		sum += p
+	}
+	if math.IsNaN(sum) || math.IsInf(sum, 0) {
+		return fmt.Sprintf("sum = %v is not finite", sum), false
+	}
+	if math.Abs(sum-1) > 0.01 {
+		return fmt.Sprintf("sum = %v, want 1±0.01", sum), false
+	}
+	return "", true
+}
+
+// TestContractSuite_AllNaNAdapterFailsValidation proves the contract
+// suite's own probability check (B2) rejects an all-NaN result — the
+// proven failure mode: before adding math.IsNaN/IsInf checks, comparing a
+// NaN sum against 1±0.01 (and NaN < 0 / NaN > 1) is always false, so an
+// all-NaN adapter would silently pass "valid_probabilities_sum_to_one".
+func TestContractSuite_AllNaNAdapterFailsValidation(t *testing.T) {
+	labels := []string{"benign", "abusive"}
+	probs := map[string]float64{"benign": math.NaN(), "abusive": math.NaN()}
+	if _, ok := invalidProbsReason(probs, labels); ok {
+		t.Fatalf("expected an all-NaN Probs map to fail validation")
 	}
 }
 

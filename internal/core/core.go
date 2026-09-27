@@ -10,10 +10,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 
 	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/model"
 )
+
+// ErrorCodeInvalidResult is the RuleOutcome/Signal error code Combine
+// assigns when a scorer's own result — or its calibrated risk — fails the
+// sanity checks in validateProbs/isValidRisk below (design §4.4: a
+// malformed result must be "unscored", never silently folded into a real
+// score). This is a Combine-assigned code, unlike "cost_cap"/"timeout"/
+// "backoff", which the worker assigns to RuleOutcome before Combine ever
+// sees it.
+const ErrorCodeInvalidResult = "invalid_result"
 
 // capEpsilon keeps a capped text-only risk strictly below tiers.Medium
 // rather than exactly at it, so "cannot raise score above medium" (design
@@ -284,22 +294,70 @@ type CalibratorFunc func(raw float64) float64
 
 func (f CalibratorFunc) Calibrate(raw float64) float64 { return f(raw) }
 
-// CalibrationSet looks up a Calibrator by (rule, scorer). A pair with no
-// entry is passed through unchanged: internal/config's loader already
-// requires every uncalibrated scorer to have a calibration on record
-// before its rule can run at all, so by the time Combine runs, "no entry"
-// only ever means the scorer's own probabilities were already
-// vendor-calibrated (design §4.6's Capabilities.Calibrated).
-type CalibrationSet map[string]Calibrator
+// CalibrationEntry pairs a Calibrator with the id design §4.4/§4.10
+// records on every verdict ("calibration":"cal_7f", or "none"). Combine
+// always records the id from the SAME lookup whose Calibrator it actually
+// applied (S12) — never a caller-supplied id that might not match — so a
+// verdict's recorded calibration can never point at a map that wasn't the
+// one used to produce its risk.
+type CalibrationEntry struct {
+	ID         string
+	Calibrator Calibrator
+}
 
-// Key builds the CalibrationSet lookup key for (ruleName, scorer).
-// Exported so callers building a CalibrationSet don't have to guess the
-// separator.
-func Key(ruleName, scorer string) string { return ruleName + "/" + scorer }
+// CalibrationSet looks up a CalibrationEntry by (rule, scorer, checkpoint)
+// — design §4.6: "a map per (rule, scorer, checkpoint)". A triple with no
+// entry falls back to the caller's own RuleOutcome.Calibration (typically
+// "none"): internal/config's loader already requires every uncalibrated
+// scorer to have a calibration on record before its rule can run at all,
+// so by the time Combine runs, "no entry for this exact checkpoint" only
+// ever means the scorer's own probabilities were already
+// vendor-calibrated (design §4.6's Capabilities.Calibrated) or that the
+// checkpoint just rolled and a new map hasn't been recorded yet.
+type CalibrationSet map[string]CalibrationEntry
 
-func (cs CalibrationSet) lookup(ruleName, scorer string) (Calibrator, bool) {
-	c, ok := cs[Key(ruleName, scorer)]
-	return c, ok
+// Key builds the CalibrationSet lookup key for (ruleName, scorer,
+// checkpoint). Exported so callers building a CalibrationSet don't have
+// to guess the separator.
+func Key(ruleName, scorer, checkpoint string) string {
+	return ruleName + "/" + scorer + "/" + checkpoint
+}
+
+func (cs CalibrationSet) lookup(ruleName, scorer, checkpoint string) (CalibrationEntry, bool) {
+	e, ok := cs[Key(ruleName, scorer, checkpoint)]
+	return e, ok
+}
+
+// validateProbs checks a scored result's raw probabilities against design
+// §4.6's contract (mirrored by internal/model/contract_test.go): every
+// requested label present, every value finite and in [0,1], the benign
+// label present, and the values summing to 1±0.01. It returns the raw
+// risk (1 - P(benign)) and ok=true only when every check passes — B2:
+// a NaN/Inf probability, one outside [0,1] (e.g. 1.7), a missing benign
+// label, or a bad sum must never reach Combine's scoring math silently.
+func validateProbs(probs map[string]float64, labels []string, benignLabel string) (raw float64, ok bool) {
+	if len(labels) == 0 || benignLabel == "" {
+		return 0, false
+	}
+	var sum float64
+	haveBenign := false
+	for _, l := range labels {
+		v, present := probs[l]
+		if !present || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1 {
+			return 0, false
+		}
+		sum += v
+		if l == benignLabel {
+			haveBenign = true
+		}
+	}
+	if !haveBenign {
+		return 0, false
+	}
+	if math.Abs(sum-1) > 0.01 {
+		return 0, false
+	}
+	return 1 - probs[benignLabel], true
 }
 
 // Combine reduces a scoring round's outcomes to a Verdict (design §4.4 /
@@ -349,9 +407,47 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 			continue
 		}
 
-		risk := 1 - o.Result.Probs[o.Rule.BenignLabel]
-		if c, ok := calib.lookup(o.Rule.Name, o.Rule.Scorer); ok {
-			risk = c.Calibrate(risk)
+		// B2: a malformed result (NaN/Inf, out-of-[0,1], missing benign
+		// label, or a bad sum) is never scored — it fails open into
+		// "unscored", the same as an adapter error or a budget cap, never
+		// into a silent "low"/"high".
+		raw, validResult := validateProbs(o.Result.Probs, o.Rule.Labels, o.Rule.BenignLabel)
+		if !validResult {
+			sig.Status = "unscored"
+			sig.ErrorCode = ErrorCodeInvalidResult
+			signals = append(signals, sig)
+			if o.Rule.Mode == config.ModeAdvise {
+				degraded = true
+			}
+			continue
+		}
+
+		risk := raw
+		calibrationID := o.Calibration
+		if entry, ok := calib.lookup(o.Rule.Name, o.Rule.Scorer, o.Result.Checkpoint); ok {
+			// S12: the id recorded on the signal always comes from this
+			// SAME lookup — never from a caller-supplied id that might not
+			// be the map actually applied here.
+			risk = entry.Calibrator.Calibrate(risk)
+			calibrationID = entry.ID
+		}
+		if math.IsNaN(risk) {
+			sig.Status = "unscored"
+			sig.ErrorCode = ErrorCodeInvalidResult
+			signals = append(signals, sig)
+			if o.Rule.Mode == config.ModeAdvise {
+				degraded = true
+			}
+			continue
+		}
+		// Clamp (rather than reject) an out-of-range but finite calibrated
+		// value — a calibrator overshooting slightly past [0,1] is a
+		// calibration-quality problem to fix at the next `calibrate` run,
+		// not a reason to drop the signal outright.
+		if risk < 0 {
+			risk = 0
+		} else if risk > 1 {
+			risk = 1
 		}
 
 		sig.Status = "scored"
@@ -359,7 +455,7 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 		sig.Flagged = risk >= o.Rule.Threshold
 		sig.Model = o.Result.Model
 		sig.Checkpoint = o.Result.Checkpoint
-		sig.Calibration = o.Calibration
+		sig.Calibration = calibrationID
 		sig.Reason = o.Reason
 		signals = append(signals, sig)
 
@@ -397,8 +493,17 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 		}
 	}
 
+	// B2: CombineParams{} (a zero-value MinScoredAdvise) must never let
+	// zero scored advise rules produce a real tier — MinScoredAdvise < 1
+	// is treated as 1, exactly like internal/config.Load's own default,
+	// so "no rule scored" can never satisfy "at least N scored".
+	minScoredAdvise := params.MinScoredAdvise
+	if minScoredAdvise < 1 {
+		minScoredAdvise = 1
+	}
+
 	tier := "unknown"
-	if scoredAdviseCount >= params.MinScoredAdvise {
+	if scoredAdviseCount >= minScoredAdvise {
 		switch {
 		case score >= params.Tiers.High:
 			tier = "high"
