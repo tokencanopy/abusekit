@@ -222,6 +222,23 @@ func TestEvent_Redact(t *testing.T) {
 			data:     map[string]any{"reason": "bad\x07value"},
 			wantCode: CodeRedactionFailed,
 		},
+		// R1 (round 2): invalid UTF-8 in a data string value must be
+		// rejected — ranging over it silently produces U+FFFD (not a
+		// control character), so hasControlChar alone doesn't catch it,
+		// and an invalid byte sequence reaching Postgres is the same class
+		// of INSERT-time failure as a raw NUL.
+		{
+			name:     "invalid UTF-8 in a listed field is rejected",
+			typ:      "payment.attempt",
+			data:     map[string]any{"reason": "bad\xff\xfevalue"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "invalid UTF-8 in an unknown-type field is rejected",
+			typ:      "some.custom_type",
+			data:     map[string]any{"anything": "bad\xff\xfevalue"},
+			wantCode: CodeRedactionFailed,
+		},
 		// S8: closed-set enum fields reject an out-of-set value rather
 		// than silently storing it — design §4.3's built-in vocabulary
 		// table.

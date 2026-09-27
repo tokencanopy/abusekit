@@ -132,6 +132,33 @@ func TestEvent_Validate(t *testing.T) {
 			mutate: func(e *Event) { e.At = now.Add(-time.Minute).In(time.FixedZone("", 0)) },
 			wantOK: true,
 		},
+		// R1 (round 2): links.asn with a NUL/control byte passed Validate
+		// (only length and whitespace were checked) and killed the whole
+		// batch at INSERT time (Postgres 22P05), the same class of bug B1
+		// already closed for id/subject/data.
+		{
+			name:     "ASN with NUL byte is rejected",
+			mutate:   func(e *Event) { e.Links.ASN = "AS\x00666" },
+			wantCode: CodeBadLinks,
+		},
+		{
+			name:     "ASN with DEL byte is rejected",
+			mutate:   func(e *Event) { e.Links.ASN = "AS\x7f666" },
+			wantCode: CodeBadLinks,
+		},
+		// R1: invalid UTF-8 in id/subject must be rejected — ranging over
+		// an invalid byte sequence silently produces U+FFFD (not a control
+		// character), so hasControlChar alone doesn't catch it.
+		{
+			name:     "invalid UTF-8 in id is rejected",
+			mutate:   func(e *Event) { e.ID = "evt_\xff\xfe" },
+			wantCode: CodeBadID,
+		},
+		{
+			name:     "invalid UTF-8 in subject is rejected",
+			mutate:   func(e *Event) { e.Subject = "acct_\xff\xfe" },
+			wantCode: CodeBadSubject,
+		},
 	}
 
 	for _, tc := range tests {

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Size and format limits from design §4.3. Exported so producers and tests
@@ -157,11 +158,11 @@ type ValidateOptions struct {
 //
 // Validate never mutates e and never panics.
 func (e *Event) Validate(opts ValidateOptions) error {
-	if e.ID == "" || len(e.ID) > MaxIDLen || hasControlChar(e.ID) {
-		return badErr(CodeBadID, "id must be 1..64 bytes with no control characters")
+	if e.ID == "" || len(e.ID) > MaxIDLen || hasControlChar(e.ID) || !utf8.ValidString(e.ID) {
+		return badErr(CodeBadID, "id must be 1..64 bytes of valid UTF-8 with no control characters")
 	}
-	if e.Subject == "" || len(e.Subject) > MaxSubjectLen || hasControlChar(e.Subject) {
-		return badErr(CodeBadSubject, "subject must be 1..256 bytes with no control characters")
+	if e.Subject == "" || len(e.Subject) > MaxSubjectLen || hasControlChar(e.Subject) || !utf8.ValidString(e.Subject) {
+		return badErr(CodeBadSubject, "subject must be 1..256 bytes of valid UTF-8 with no control characters")
 	}
 	if e.Type == "" || len(e.Type) > MaxTypeLen || !typeRe.MatchString(e.Type) {
 		return badErr(CodeBadType, "type must match ^[a-z_.]+$ and be 1..64 bytes")
@@ -247,8 +248,12 @@ func validateLinks(l Links) error {
 		}
 	}
 	if l.ASN != "" {
-		if len(l.ASN) > MaxASNLen || strings.ContainsAny(l.ASN, " \t\r\n") {
-			return badErr(CodeBadLinks, "links.asn must be non-empty, <=32 bytes, and contain no whitespace")
+		// R1 (round 2): a NUL/DEL byte in ASN passed here (only length and
+		// whitespace were checked) and killed the whole batch at INSERT
+		// time (Postgres 22P05) — the same class of leak B1 already closed
+		// for id/subject/data.
+		if len(l.ASN) > MaxASNLen || strings.ContainsAny(l.ASN, " \t\r\n") || hasControlChar(l.ASN) || !utf8.ValidString(l.ASN) {
+			return badErr(CodeBadLinks, "links.asn must be non-empty, <=32 bytes of valid UTF-8, and contain no whitespace or control characters")
 		}
 	}
 	return nil

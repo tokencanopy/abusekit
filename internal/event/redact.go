@@ -267,6 +267,13 @@ func scanForLeaks(v any, path string) error {
 }
 
 func checkLeakString(s, path string) error {
+	// R1 (round 2): ranging over invalid UTF-8 silently substitutes U+FFFD
+	// per bad byte — hasControlChar never sees the original bytes, so an
+	// invalid sequence would otherwise reach Postgres and fail the whole
+	// batch at INSERT (the same class of leak as an unrejected NUL byte).
+	if !utf8.ValidString(s) {
+		return badErr(CodeRedactionFailed, path+" is not valid UTF-8")
+	}
 	if hasControlChar(s) {
 		return badErr(CodeRedactionFailed, path+" contains a control character")
 	}
