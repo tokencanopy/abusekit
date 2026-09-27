@@ -423,7 +423,11 @@ func TestSkeleton(t *testing.T) {
 		{"capital I folds with lowercase l", "PayPaI", "PayPal"},
 		{"dotless i folds with lowercase l", "paypaı", "paypal"},
 		{"isolated digit 1 folds with lowercase l", "supp1y", "supply"},
-		{"I, l, ı, and isolated 1 are all the same skeleton", "I", "l"},
+		// R10 (round 2): g00gle -> google. The digit run "00" has letters
+		// adjacent on BOTH sides ("g" before, "gle" after), which is
+		// unambiguously letter-substitution inside a word, unlike a
+		// standalone number.
+		{"digits surrounded by letters on both sides fold", "g00gle", "google"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -435,24 +439,51 @@ func TestSkeleton(t *testing.T) {
 		})
 	}
 
-	t.Run("all of I, l, ı, 1 collapse to the same skeleton", func(t *testing.T) {
+	t.Run("I and ı collapse to the same skeleton as l", func(t *testing.T) {
 		want := Skeleton("l")
-		for _, s := range []string{"I", "ı", "1"} {
+		for _, s := range []string{"I", "ı"} {
 			if got := Skeleton(s); got != want {
 				t.Errorf("Skeleton(%q) = %q, want %q (same as Skeleton(\"l\"))", s, got, want)
 			}
 		}
 	})
 
-	// N1: a digit is only leet-mapped to a letter when it's NOT part of a
-	// multi-digit run — a run of 2+ digits is almost always a genuine
-	// number (an order id, a count), not per-letter leetspeak, so
-	// "Order 12345" must not turn into "order l2eas".
-	t.Run("digits inside a multi-digit run are not leet-mapped", func(t *testing.T) {
-		got := Skeleton("Order 12345")
-		want := "order 12345"
-		if got != want {
-			t.Errorf("Skeleton(%q) = %q, want %q (digits in a run must stay literal)", "Order 12345", got, want)
+	// N1/R10 (round 2 refined this): a digit run is only leet-mapped when
+	// it has an adjacent letter run substantial enough to look like
+	// letter substitution (sum of the immediately-adjacent letter run
+	// lengths on either side >= 2) — a completely isolated digit run
+	// (nothing but digits, punctuation, or whitespace touching it) is
+	// left as a literal number. A bare "1" with no letters anywhere near
+	// it therefore does NOT fold to "l" (unlike round 1's original rule,
+	// which folded any digit run of length exactly 1) — there is no
+	// letter context here suggesting impersonation.
+	t.Run("a completely isolated digit does not fold", func(t *testing.T) {
+		if got := Skeleton("1"); got != "1" {
+			t.Errorf(`Skeleton("1") = %q, want "1" (no adjacent letter context)`, got)
+		}
+	})
+
+	// R10 (round 2)'s four proven cases, decided as: a digit run maps
+	// only when the sum of its immediately-adjacent letter-run lengths
+	// (before + after) is >= 2 — see markLeetEligibleDigits.
+	t.Run("Order 12345 is unchanged (isolated multi-digit number)", func(t *testing.T) {
+		if got := Skeleton("Order 12345"); got != "order 12345" {
+			t.Errorf(`Skeleton("Order 12345") = %q, want "order 12345"`, got)
+		}
+	})
+	t.Run("ORDER #1 is unchanged (digit isolated by punctuation)", func(t *testing.T) {
+		if got := Skeleton("ORDER #1"); got != "order #1" {
+			t.Errorf(`Skeleton("ORDER #1") = %q, want "order #1"`, got)
+		}
+	})
+	t.Run("v1 is unchanged (single-letter prefix, not a word)", func(t *testing.T) {
+		if got := Skeleton("v1"); got != "v1" {
+			t.Errorf(`Skeleton("v1") = %q, want "v1"`, got)
+		}
+	})
+	t.Run("g00gle folds to google (digit run interior to a word)", func(t *testing.T) {
+		if got := Skeleton("g00gle"); got != "google" {
+			t.Errorf(`Skeleton("g00gle") = %q, want "google"`, got)
 		}
 	})
 

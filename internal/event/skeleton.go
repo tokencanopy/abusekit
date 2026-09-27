@@ -21,8 +21,8 @@ import (
 // fold the I/l/ı/1 confusable group (case-sensitively, before lowercasing
 // — see foldIAndDigitOne) -> lower-case -> map each remaining rune through
 // a small curated confusables table (Cyrillic/Greek Latin-lookalikes,
-// digit-for-letter leetspeak, skipping a digit that's part of a longer
-// digit run) -> collapse runs of whitespace.
+// digit-for-letter leetspeak, only for a digit run judged "leet-eligible"
+// — see markLeetEligibleDigits) -> collapse runs of whitespace.
 //
 // This is a v0 placeholder, not a UTS #39 confusables implementation: the
 // table below covers the lookalikes seen in real brand-impersonation
@@ -34,13 +34,13 @@ func Skeleton(s string) string {
 	folded = stripDiacritics(folded)
 
 	runes := []rune(folded)
-	digitRun := markDigitRuns(runes)
-	foldIAndDigitOne(runes, digitRun)
+	eligible := markLeetEligibleDigits(runes)
+	foldIAndDigitOne(runes, eligible)
 
 	lowered := strings.ToLower(string(runes))
-	// Lower-casing an ASCII/digit rune never changes its byte-for-rune
-	// position relative to this slice, so digitRun (computed above, before
-	// lowering) still lines up with runes below.
+	// Lower-casing an ASCII/digit/letter rune never changes its byte-for-
+	// rune position relative to this slice, so eligible (computed above,
+	// before lowering) still lines up with runes below.
 	runes = []rune(lowered)
 
 	var b strings.Builder
@@ -48,10 +48,11 @@ func Skeleton(s string) string {
 	lastWasSpace := false
 	for i, r := range runes {
 		if mapped, ok := confusablesTable[r]; ok {
-			if isLeetDigit(r) && digitRun[i] {
-				// Part of a genuine multi-digit number (an order id, a
-				// count) — leave it as a literal digit rather than
-				// leet-decoding it into a letter.
+			if isLeetDigit(r) && !eligible[i] {
+				// Not leet-eligible (no substantial adjacent letter run
+				// on either side) — leave it as a literal digit rather
+				// than leet-decoding a standalone number or identifier
+				// suffix ("Order 12345", "ORDER #1", "v1") into letters.
 			} else {
 				r = mapped
 			}
@@ -76,16 +77,17 @@ func Skeleton(s string) string {
 // lowercase "l", e.g. "PayPaI") turns it into a lowercase "i" — a
 // perfectly ordinary, unrelated letter — which would erase the very
 // look-alike this function exists to catch. A "1" is folded only when
-// digitRun says it is NOT part of a run of two or more digits: a lone "1"
-// standing in for "l" is leetspeak, but "12345" is almost always a
-// genuine number.
-func foldIAndDigitOne(runes []rune, digitRun []bool) {
+// eligible says its digit run is leet-eligible (see
+// markLeetEligibleDigits) — the same adjacency rule the second
+// (post-lowercase) confusables pass uses for 0/3/4/5/7, so "1" isn't a
+// special case: "supp1y" folds, but a bare "1" or "v1" does not.
+func foldIAndDigitOne(runes []rune, eligible []bool) {
 	for i, r := range runes {
 		switch r {
 		case 'I', 'ı':
 			runes[i] = 'l'
 		case '1':
-			if !digitRun[i] {
+			if eligible[i] {
 				runes[i] = 'l'
 			}
 		}
@@ -103,26 +105,55 @@ func isLeetDigit(r rune) bool {
 	return false
 }
 
-// markDigitRuns returns, for each index in runes, whether runes[i] is an
-// ASCII digit belonging to a run of two or more consecutive ASCII digits.
-// A lone digit (run length 1) is not marked, since that's exactly the
-// leetspeak case ("supp0rt") the confusables table exists to catch.
-func markDigitRuns(runes []rune) []bool {
+// markLeetEligibleDigits returns, for each index in runes, whether
+// runes[i] is an ASCII digit that is part of a leet-eligible digit run
+// (R10, round 2). A maximal run of consecutive digits is eligible when
+// the sum of the immediately-adjacent letter runs on either side (the
+// contiguous unicode.IsLetter characters right before the digit run, plus
+// the ones right after) is >= 2 — chosen, from the reviewer's four proven
+// cases, to separate genuine letter-substitution from a standalone
+// number or a short identifier prefix:
+//
+//   - "g00gle": before="g" (1) + after="gle" (3) = 4 >= 2 -> eligible
+//     (the digit run sits inside what is unambiguously a word).
+//   - "paypa1"/"supp1y"/"supp0rt": a substantial letter run on at least
+//     one side (>= 2 by itself) -> eligible.
+//   - "am4z0n": "4" has before="am" (2) + after="z" (1) = 3 >= 2;
+//     "0" has before="z" (1) + after="n" (1) = 2 >= 2 -> both eligible,
+//     even though each side alone is short — together they still read as
+//     one impersonated word.
+//   - "Order 12345": before/after are a space and end-of-string (0 + 0)
+//     -> not eligible: an isolated number.
+//   - "ORDER #1": before is "#" (0) and after is end-of-string (0) ->
+//     not eligible: punctuation-isolated, not letter-adjacent at all.
+//   - "v1": before="v" (1) + after="" (0) = 1 < 2 -> not eligible: a
+//     single-letter prefix (a version/identifier idiom) isn't enough
+//     letter context to call this letter substitution rather than a
+//     genuine "v1", "v2", ... label.
+func markLeetEligibleDigits(runes []rune) []bool {
 	out := make([]bool, len(runes))
 	isDigit := func(r rune) bool { return r >= '0' && r <= '9' }
-	for i := 0; i < len(runes); {
+	n := len(runes)
+	for i := 0; i < n; {
 		if !isDigit(runes[i]) {
 			i++
 			continue
 		}
 		j := i
-		for j < len(runes) && isDigit(runes[j]) {
+		for j < n && isDigit(runes[j]) {
 			j++
 		}
-		if j-i >= 2 {
-			for k := i; k < j; k++ {
-				out[k] = true
-			}
+		beforeLen := 0
+		for k := i - 1; k >= 0 && unicode.IsLetter(runes[k]); k-- {
+			beforeLen++
+		}
+		afterLen := 0
+		for k := j; k < n && unicode.IsLetter(runes[k]); k++ {
+			afterLen++
+		}
+		eligible := beforeLen+afterLen >= 2
+		for k := i; k < j; k++ {
+			out[k] = eligible
 		}
 		i = j
 	}
