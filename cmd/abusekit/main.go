@@ -95,39 +95,76 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// runServe implements the `serve` subcommand's S1 placeholder behavior:
-// connect, migrate, build the scorer registry, load and validate config,
-// then either exit 0 (--check) or block until SIGINT/SIGTERM.
+// runServe implements the `serve` subcommand (S1 scope: config
+// validation and a migrated database, nothing more — the real HTTP
+// surface arrives in S3). S17: `serve` without --check is no longer a
+// blocking placeholder loop that waits on SIGINT/SIGTERM for no reason;
+// there is nothing to serve yet, so it's an explicit error instead.
 func runServe(args []string) error {
 	c, err := parseServeFlags(args)
 	if err != nil {
 		return err
 	}
+	if !c.check {
+		return errors.New("abusekit: serve is not implemented yet without --check (the HTTP surface arrives in S3); pass --check to validate startup and exit")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if _, _, err := boot(ctx, c); err != nil {
+	s, _, err := boot(ctx, c)
+	if err != nil {
 		return err
 	}
+	defer s.Pool().Close() // S17: close on every exit path, including this success one
 
 	fmt.Println("abusekit: store migrated, config valid (S1 placeholder — HTTP surface arrives in S3)")
-	if c.check {
-		return nil
-	}
-
-	fmt.Println("abusekit: waiting for SIGINT/SIGTERM")
-	<-ctx.Done()
-	fmt.Println("abusekit: shutting down")
 	return nil
 }
 
 // boot performs the startup sequence real `serve` (S3) will also need:
-// connect + migrate the store, build the scorer registry (local only in
-// S1), and load + validate the rule config against it. Returns both so a
-// future `serve` can keep using them; S1's caller only needs to know
-// whether it succeeded.
+// build the scorer registry (local only in S1), load + validate the rule
+// config against it, and only THEN connect to and migrate the store
+// (S17) — a bad rules/vendors/weights file fails fast without ever
+// touching Postgres, rather than migrating a database it's about to
+// report as unusable anyway. Returns both so a future `serve` can keep
+// using them; S1's caller only needs to know whether it succeeded.
 func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, error) {
+	weights, err := local.LoadWeightsFile(c.weightsPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	localScorer, err := local.New(weights)
+	if err != nil {
+		return nil, nil, err
+	}
+	registry := model.NewRegistry()
+	if err := registry.Register(localScorer); err != nil {
+		return nil, nil, err
+	}
+
+	vendorsData, err := os.ReadFile(c.vendorsPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read vendors config: %w", err)
+	}
+	vendors, err := config.LoadVendors(vendorsData)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	rulesData, err := os.ReadFile(c.rulesPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read rules config: %w", err)
+	}
+	cfg, err := config.Load(rulesData, config.Dependencies{
+		Registry: registry,
+		Features: config.NewFeatureSet(v0FeatureNames...),
+		Vendors:  vendors,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("load rules config: %w", err)
+	}
+
 	pool, err := pgxpool.New(ctx, c.databaseURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to database: %w", err)
@@ -138,51 +175,12 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, err
 		return nil, nil, fmt.Errorf("apply migrations: %w", err)
 	}
 
-	weights, err := local.LoadWeightsFile(c.weightsPath)
-	if err != nil {
-		pool.Close()
-		return nil, nil, err
-	}
-	localScorer, err := local.New(weights)
-	if err != nil {
-		pool.Close()
-		return nil, nil, err
-	}
-	registry := model.NewRegistry()
-	if err := registry.Register(localScorer); err != nil {
-		pool.Close()
-		return nil, nil, err
-	}
-
-	vendorsData, err := os.ReadFile(c.vendorsPath)
-	if err != nil {
-		pool.Close()
-		return nil, nil, fmt.Errorf("read vendors config: %w", err)
-	}
-	vendors, err := config.LoadVendors(vendorsData)
-	if err != nil {
-		pool.Close()
-		return nil, nil, err
-	}
-
-	rulesData, err := os.ReadFile(c.rulesPath)
-	if err != nil {
-		pool.Close()
-		return nil, nil, fmt.Errorf("read rules config: %w", err)
-	}
-	cfg, err := config.Load(rulesData, config.Dependencies{
-		Registry: registry,
-		Features: config.NewFeatureSet(v0FeatureNames...),
-		Vendors:  vendors,
-	})
-	if err != nil {
-		pool.Close()
-		return nil, nil, fmt.Errorf("load rules config: %w", err)
-	}
-
 	return s, cfg, nil
 }
 
+// runMigrate handles SIGINT/SIGTERM (S17): a long-running migration
+// against a large database can now be interrupted cleanly instead of
+// running to completion regardless.
 func runMigrate(args []string) error {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	databaseURL := fs.String("database-url", os.Getenv("ABUSEKIT_DATABASE_URL"), "Postgres connection string (env ABUSEKIT_DATABASE_URL)")
@@ -193,8 +191,17 @@ func runMigrate(args []string) error {
 		return errors.New("a database URL is required: pass --database-url or set ABUSEKIT_DATABASE_URL")
 	}
 
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, *databaseURL)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return runMigrateWithContext(ctx, *databaseURL)
+}
+
+// runMigrateWithContext is runMigrate's body, factored out so a test can
+// drive it with an already-cancelled context and prove SIGINT/SIGTERM
+// actually reaches pgx rather than being silently dropped somewhere on
+// the way.
+func runMigrateWithContext(ctx context.Context, databaseURL string) error {
+	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		return fmt.Errorf("connect to database: %w", err)
 	}

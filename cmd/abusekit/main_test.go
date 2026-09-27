@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -64,18 +65,22 @@ func TestParseServeFlags_CheckFlag(t *testing.T) {
 	}
 }
 
+// TestBoot_RejectsMissingRulesFile deliberately leaves c.databaseURL empty
+// (S17: boot validates config BEFORE ever connecting to Postgres, so a
+// missing rules file fails without needing a database at all — this test
+// runs fine even under -short).
 func TestBoot_RejectsMissingRulesFile(t *testing.T) {
 	c := shippedConfig(t)
-	c.databaseURL = testDBURL(t)
 	c.rulesPath = filepath.Join(t.TempDir(), "does-not-exist.yaml")
 	if _, _, err := boot(context.Background(), c); err == nil {
 		t.Fatalf("expected boot to fail with a missing rules file")
 	}
 }
 
+// TestBoot_RejectsInvalidRules: same S17 point as above — no database
+// needed to reject a rules file referencing an unregistered scorer.
 func TestBoot_RejectsInvalidRules(t *testing.T) {
 	c := shippedConfig(t)
-	c.databaseURL = testDBURL(t)
 	bad := filepath.Join(t.TempDir(), "bad-rules.yaml")
 	if err := os.WriteFile(bad, []byte("tiers: {medium: 0.4, high: 0.8}\nrules:\n  - name: r\n    mode: advise\n    scorer: does_not_exist\n    inputs: [subject_age_h]\n    labels: [benign, abusive]\n    benign_label: benign\n    threshold: 0.5\n"), 0o644); err != nil {
 		t.Fatalf("write bad rules file: %v", err)
@@ -83,6 +88,47 @@ func TestBoot_RejectsInvalidRules(t *testing.T) {
 	c.rulesPath = bad
 	if _, _, err := boot(context.Background(), c); err == nil {
 		t.Fatalf("expected boot to fail on a rules file referencing an unregistered scorer")
+	}
+}
+
+// TestRunServe_RequiresCheckFlag is S17: `serve` without --check is no
+// longer a blocking placeholder loop — it's an explicit "not implemented
+// yet" error, before ever touching a database (the bogus --database-url
+// here is never dialed).
+func TestRunServe_RequiresCheckFlag(t *testing.T) {
+	c := shippedConfig(t)
+	args := []string{
+		"--database-url", "postgres://unused/should-never-be-dialed",
+		"--rules", c.rulesPath,
+		"--vendors", c.vendorsPath,
+		"--weights", c.weightsPath,
+	}
+	err := runServe(args)
+	if err == nil {
+		t.Fatalf("expected an error when --check is not passed")
+	}
+	if !strings.Contains(err.Error(), "--check") {
+		t.Fatalf("expected the error to mention --check, got: %v", err)
+	}
+}
+
+// TestRunServe_CheckSucceeds is S17's end-to-end path: connect, migrate,
+// validate the shipped config, and return with no error and no blocking —
+// including closing the store's pool on the way out (defer'd inside
+// runServe; a leaked pool would still let this test pass but would show
+// up as a lingering connection in a longer-running suite).
+func TestRunServe_CheckSucceeds(t *testing.T) {
+	c := shippedConfig(t)
+	dbURL := testDBURL(t)
+	args := []string{
+		"--check",
+		"--database-url", dbURL,
+		"--rules", c.rulesPath,
+		"--vendors", c.vendorsPath,
+		"--weights", c.weightsPath,
+	}
+	if err := runServe(args); err != nil {
+		t.Fatalf("runServe --check: %v", err)
 	}
 }
 
@@ -105,12 +151,26 @@ func TestBoot_ShippedConfigSucceeds(t *testing.T) {
 	}
 }
 
-// testDBURL skips the test under -short (boot() always applies
-// migrations before it can even reach a bad rules/vendors file, so every
-// test that calls this needs a real database, not just
-// TestBoot_ShippedConfigSucceeds) or when the configured Postgres server
-// (same ABUSEKIT_TEST_DATABASE_URL convention as internal/store's tests)
-// is not reachable, and returns its URL otherwise.
+// TestMigrate_RespectsCancelledContext is S17: `migrate` now threads a
+// signal.NotifyContext-derived ctx through to ApplyMigrations (instead of
+// a bare context.Background()) so SIGINT/SIGTERM actually abort a
+// long-running migration rather than being ignored until it finishes.
+// runMigrateWithContext is the same code runMigrate wraps with
+// signal.NotifyContext; passing an already-cancelled context directly
+// proves the wiring reaches pgx (which aborts a query started against a
+// done context) rather than being silently dropped somewhere on the way.
+func TestMigrate_RespectsCancelledContext(t *testing.T) {
+	dbURL := testDBURL(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := runMigrateWithContext(ctx, dbURL); err == nil {
+		t.Fatalf("expected migrate to fail when its context is already cancelled")
+	}
+}
+
+// testDBURL skips the test under -short, or when the configured Postgres
+// server (same ABUSEKIT_TEST_DATABASE_URL convention as internal/store's
+// tests) is not reachable, and returns its URL otherwise.
 func testDBURL(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
