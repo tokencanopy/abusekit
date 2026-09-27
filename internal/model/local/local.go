@@ -13,6 +13,9 @@ package local
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -83,6 +86,29 @@ func New(w Weights) (*Scorer, error) {
 }
 
 func (s *Scorer) Name() string { return "local" }
+
+// Version returns a content hash of s's weights (S2), so
+// internal/core's input-hash changes whenever the actual scoring math
+// changes — including a weight VALUE edit that the deploying human forgot
+// to reflect in local_weights.yaml's `version:` string. This is
+// deliberately separate from Checkpoint (Weights.Version, recorded
+// verbatim as ScoreResult.Checkpoint on every verdict): Checkpoint is the
+// human-readable identifier design §4.4 shows in the API; Version is
+// content-derived and exists purely to make a silent weights change
+// impossible to mask via skip-if-unchanged.
+func (s *Scorer) Version() string {
+	b, err := json.Marshal(s.weights)
+	if err != nil {
+		// s.weights is plain string/float64/map data — this cannot fail in
+		// practice. Fall back to the human checkpoint string rather than
+		// an empty Version(), which core.Plan's inputHash treats as "could
+		// not hash, never skip" if propagated — the safe direction either
+		// way.
+		return s.checkpoint
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 // Capabilities reports LabelMode as Open (design: "LabelMode: Open
 // restricted to label sets containing the benign label") — Score enforces

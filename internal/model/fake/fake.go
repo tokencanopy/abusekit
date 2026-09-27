@@ -25,6 +25,10 @@ type Scorer struct {
 	Caps model.Capabilities
 	// DataPolicyValue is returned by Policy().
 	DataPolicyValue model.DataPolicy
+	// VersionValue is returned by Version(). Defaults to "fake-v1" so a
+	// test that doesn't care about versioning still gets a non-empty,
+	// stable value.
+	VersionValue string
 
 	// ScoreFunc, if set, replaces the default scoring logic entirely.
 	ScoreFunc func(ctx context.Context, req model.ScoreRequest) (model.ScoreResult, error)
@@ -64,6 +68,13 @@ func (s *Scorer) Name() string {
 
 func (s *Scorer) Capabilities() model.Capabilities { return s.Caps }
 func (s *Scorer) Policy() model.DataPolicy         { return s.DataPolicyValue }
+
+func (s *Scorer) Version() string {
+	if s.VersionValue == "" {
+		return "fake-v1"
+	}
+	return s.VersionValue
+}
 
 // Score honours ctx first (covering the universal "cancelled context ->
 // error" contract check), then Delay (for a genuine deadline-timeout

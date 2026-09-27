@@ -184,6 +184,15 @@ type Scorer interface {
 	Name() string
 	Capabilities() Capabilities
 	Policy() DataPolicy
+	// Version identifies the scorer's current weights/checkpoint, queryable
+	// WITHOUT making a Score call (S2). internal/core's input-hash includes
+	// it so a scorer upgrade — new weights deployed, a vendor rotating its
+	// model — always forces a rescore, even when a subject's features
+	// haven't changed. local derives this from a hash of its weights'
+	// content (catching a weight edit even if the human-typed `version:`
+	// string in local_weights.yaml wasn't bumped); a vendor adapter reports
+	// whatever checkpoint identifier it is currently pinned to.
+	Version() string
 	// Score must respect ctx: returning promptly with ctx.Err() when ctx
 	// is done or already expired, rather than blocking past its deadline.
 	// It must never panic; any internal failure is returned as an error.

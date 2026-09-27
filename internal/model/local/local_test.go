@@ -109,6 +109,48 @@ func TestScore_NonBenignMassSplitEvenly(t *testing.T) {
 	}
 }
 
+// TestVersion_ChangesWithWeightsContent is S2: Version() must be derived
+// from the weights' actual content (a hash), not just the human-typed
+// `version:` string — so editing a weight VALUE without remembering to
+// bump `version:` in local_weights.yaml still changes Version(), which
+// internal/core's input-hash uses to force a rescore after any scorer
+// change (a Weights.Version string alone can't catch a forgotten bump).
+func TestVersion_ChangesWithWeightsContent(t *testing.T) {
+	base := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.0}}
+	edited := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.5}} // same version string, different weight
+
+	sBase, err := New(base)
+	if err != nil {
+		t.Fatalf("New(base): %v", err)
+	}
+	sEdited, err := New(edited)
+	if err != nil {
+		t.Fatalf("New(edited): %v", err)
+	}
+
+	if sBase.Version() == sEdited.Version() {
+		t.Fatalf("expected Version() to differ when weight content differs, even with an identical `version:` string")
+	}
+	if sBase.Version() == "" {
+		t.Fatalf("expected a non-empty Version()")
+	}
+}
+
+func TestVersion_DeterministicForIdenticalWeights(t *testing.T) {
+	w := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.0, "y": 2.0}}
+	s1, err := New(w)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	s2, err := New(w)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if s1.Version() != s2.Version() {
+		t.Fatalf("expected Version() to be deterministic for identical weights: %q != %q", s1.Version(), s2.Version())
+	}
+}
+
 func TestScore_RejectsTextInput(t *testing.T) {
 	s, err := New(Weights{BenignLabel: "benign", Weight: map[string]float64{"x": 1}})
 	if err != nil {

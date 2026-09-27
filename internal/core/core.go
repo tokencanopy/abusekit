@@ -48,6 +48,20 @@ type RuleState struct {
 	// another rule's `stage: {min_local_risk: ...}` condition (design
 	// §4.5's example gates a shadow rule on the local rule's risk).
 	LastRisk *float64
+	// ScorerVersion is model.Scorer.Version() for this rule's scorer at
+	// Plan time (S2). Folded into the input hash so a scorer upgrade
+	// (new weights, a vendor rotating its model) always forces a
+	// rescore, even when every feature value is unchanged. The caller
+	// (the worker, from S2 of the v0 plan onward) looks this up from the
+	// registry before building []RuleState; "" is fine for a caller that
+	// doesn't track it yet, and simply omits this from the hash.
+	ScorerVersion string
+	// CalibrationID is the id of the calibration map currently on record
+	// for (rule, scorer, checkpoint) — "none" for an already-calibrated
+	// scorer with no map. Folded into the input hash so a newly fitted
+	// calibration forces a rescore instead of reusing a pre-calibration
+	// verdict.
+	CalibrationID string
 }
 
 // Call is one (rule, scorer, request) Plan has decided to make, or
@@ -104,7 +118,7 @@ func Plan(features map[string]float64, text map[string][]string, rules []RuleSta
 		call := Call{
 			Rule:      r,
 			Request:   req,
-			InputHash: inputHash(r.Name, r.Scorer, req),
+			InputHash: inputHash(rs, req),
 		}
 
 		if skip := stageSkip(r, features, maxLocalRisk, haveLocalRisk); skip {
@@ -192,22 +206,44 @@ func collectText(text map[string][]string, names []string) []string {
 // call's answer: the rule identity, its scorer, and the resolved request.
 // json.Marshal serializes map keys in sorted order, so the digest doesn't
 // depend on Go's randomized map iteration.
-func inputHash(ruleName, scorer string, req model.ScoreRequest) string {
+// inputHash is a stable digest of everything that would change this
+// call's answer (S2): the rule identity, its scorer AND the scorer's own
+// current version/checkpoint (so a scorer upgrade is never masked by
+// identical features), the render template version, the calibration map
+// currently on record, the benign label (flipping which label counts as
+// "not abusive" changes risk polarity even with an unchanged label SET),
+// and the resolved request. json.Marshal serializes map keys in sorted
+// order, so the digest doesn't depend on Go's randomized map iteration.
+func inputHash(rs RuleState, req model.ScoreRequest) string {
 	payload := struct {
-		Rule     string
-		Scorer   string
-		Labels   []string
-		Features map[string]float64
-		Text     []string
-	}{ruleName, scorer, req.Labels, req.Features, req.Text}
+		Rule          string
+		Scorer        string
+		ScorerVersion string
+		RenderVersion string
+		CalibrationID string
+		BenignLabel   string
+		Labels        []string
+		Features      map[string]float64
+		Text          []string
+	}{
+		rs.Rule.Name, rs.Rule.Scorer, rs.ScorerVersion, req.RenderVersion, rs.CalibrationID, rs.Rule.BenignLabel,
+		req.Labels, req.Features, req.Text,
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		// Every field above is a plain string/float64/slice/map — this
-		// cannot fail in practice. Fall back to hashing the rule+scorer
-		// name alone rather than panicking (AGENTS.md: no panic in
-		// library code); worst case this makes skip-detection overly
-		// conservative (never matches), never incorrect.
-		b = []byte(ruleName + "/" + scorer)
+		// B2/S2: NEVER fall back to a constant hash on marshal failure — a
+		// constant fallback (e.g. hashing just the rule+scorer name) made
+		// every future round with the same broken feature (e.g. a NaN,
+		// which json.Marshal refuses to encode) look "unchanged" forever,
+		// silently freezing the verdict on "input_unchanged" skips.
+		// Instead: return the empty string, which Plan's skip check
+		// (`rs.LastInputHash != "" && ...`) can never match against a
+		// previously-recorded non-empty hash, and which two consecutive
+		// failed-to-hash rounds correctly never skip against each other
+		// either (a never-scored rule's LastInputHash is also "" and is
+		// excluded by that same guard) — the safe direction regardless of
+		// why marshaling failed.
+		return ""
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

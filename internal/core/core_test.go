@@ -142,6 +142,98 @@ func TestPlan_StageMinLocalRisk(t *testing.T) {
 	}
 }
 
+// --- S2: input hash must reflect everything that changes the answer -----
+
+// TestPlan_NaNFeatureNeverPermanentlySkips is S2. Proven: before this fix,
+// a NaN feature made json.Marshal fail inside inputHash, which fell back
+// to hashing just "ruleName/scorer" — a CONSTANT regardless of the actual
+// (broken) feature values, so a rule with a permanently-NaN feature would
+// compute the identical hash every round, get recorded as
+// LastInputHash, and then skip forever on "input_unchanged" even though
+// its input was never validly hashed at all.
+func TestPlan_NaNFeatureNeverPermanentlySkips(t *testing.T) {
+	r := rule("r", config.ModeAdvise, withInputs("x"))
+	features := map[string]float64{"x": math.NaN()}
+
+	first := core.Plan(features, nil, []core.RuleState{{Rule: r}})
+	if first[0].InputHash != "" {
+		t.Fatalf("expected a NaN feature to produce the empty sentinel hash, got %q", first[0].InputHash)
+	}
+	if first[0].Skip {
+		t.Fatalf("expected the first round not to skip")
+	}
+
+	// Simulate the caller recording round 1's (empty) hash, then Plan
+	// running again with the SAME NaN feature: it must still not skip.
+	second := core.Plan(features, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+	if second[0].Skip {
+		t.Fatalf("expected a NaN feature to never trigger input_unchanged skipping, even across rounds")
+	}
+}
+
+// TestPlan_BenignLabelChangeForcesRescore is S2. Proven: changing a
+// rule's benign_label (e.g. via a config edit) while its Labels list and
+// Features stay identical did not change the input hash at all, since
+// BenignLabel was never part of the hashed payload — Plan would skip
+// re-scoring a rule whose risk polarity just flipped.
+func TestPlan_BenignLabelChangeForcesRescore(t *testing.T) {
+	features := map[string]float64{"x": 1}
+	base := rule("r", config.ModeAdvise, withInputs("x"))
+	base.Labels = []string{"benign", "abusive"}
+	base.BenignLabel = "benign"
+
+	first := core.Plan(features, nil, []core.RuleState{{Rule: base}})
+
+	changed := base
+	changed.BenignLabel = "abusive" // same Labels list, different benign label
+	second := core.Plan(features, nil, []core.RuleState{{Rule: changed, LastInputHash: first[0].InputHash}})
+
+	if second[0].InputHash == first[0].InputHash {
+		t.Fatalf("expected a benign_label change to change the input hash")
+	}
+	if second[0].Skip {
+		t.Fatalf("expected a benign_label change to force a rescore, not skip as input_unchanged")
+	}
+}
+
+// TestPlan_ScorerVersionChangeForcesRescore is S2: a RuleState carrying a
+// different ScorerVersion (model.Scorer.Version(), e.g. after a weights
+// file edit) must change the input hash even when features/text/labels
+// are byte-identical, so a scorer upgrade can never be masked by
+// input-hash skipping.
+func TestPlan_ScorerVersionChangeForcesRescore(t *testing.T) {
+	features := map[string]float64{"x": 1}
+	r := rule("r", config.ModeAdvise, withInputs("x"))
+
+	v1 := core.Plan(features, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v1"}})
+	v2 := core.Plan(features, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v2", LastInputHash: v1[0].InputHash}})
+
+	if v2[0].InputHash == v1[0].InputHash {
+		t.Fatalf("expected a ScorerVersion change to change the input hash")
+	}
+	if v2[0].Skip {
+		t.Fatalf("expected a ScorerVersion change to force a rescore")
+	}
+}
+
+// TestPlan_CalibrationIDChangeForcesRescore is S2: a newly fitted
+// calibration map (a different CalibrationID for the same rule/scorer)
+// must force a rescore even with identical features.
+func TestPlan_CalibrationIDChangeForcesRescore(t *testing.T) {
+	features := map[string]float64{"x": 1}
+	r := rule("r", config.ModeAdvise, withInputs("x"))
+
+	c1 := core.Plan(features, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_1"}})
+	c2 := core.Plan(features, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_2", LastInputHash: c1[0].InputHash}})
+
+	if c2[0].InputHash == c1[0].InputHash {
+		t.Fatalf("expected a CalibrationID change to change the input hash")
+	}
+	if c2[0].Skip {
+		t.Fatalf("expected a CalibrationID change to force a rescore")
+	}
+}
+
 func TestPlan_StageSubjectAge(t *testing.T) {
 	old := rule("old_gate", config.ModeShadow, withText("t"), withStage(map[string]float64{"max_subject_age_h": 168}))
 
