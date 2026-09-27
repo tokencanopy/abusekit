@@ -1,0 +1,72 @@
+# abusekit CI: build, vet, and the fast (DB-independent) unit tests on
+# every push/PR, plus a second job that runs the full suite — including
+# internal/store's and cmd/abusekit's DB-backed tests — against a real
+# Postgres service container. Both self-migrate (store.ApplyMigrations)
+# and t.Skip cleanly when no database is reachable, which is exactly why
+# the second job needs a real one to actually exercise them.
+#
+# `make gate` (design's CI gate over the eval harness / eval/floors.yaml)
+# is a placeholder until S4; it is deliberately not wired into this
+# workflow yet so adding it later is a Makefile change, not a CI change.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-unit-test:
+    name: build, vet, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: build
+        run: make build
+      - name: lint (gofmt + go vet)
+        run: make lint
+      - name: unit tests (no DB)
+        run: make test
+
+  db-test:
+    name: DB-backed tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: e2a
+          POSTGRES_PASSWORD: e2a
+          POSTGRES_DB: abusekit_test
+        # Mapped to 5433 to match this repo's default
+        # ABUSEKIT_TEST_DATABASE_URL, the same port convention e2a and
+        # e2a-ops's own test suites use for their local Postgres.
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U e2a -d abusekit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: full test suite (with DB)
+        env:
+          ABUSEKIT_TEST_DATABASE_URL: postgres://e2a:e2a@localhost:5433/abusekit_test?sslmode=disable
+        run: make test-db

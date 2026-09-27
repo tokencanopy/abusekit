@@ -91,9 +91,6 @@ func TestBoot_RejectsInvalidRules(t *testing.T) {
 // register `local`, load the real config/*.yaml this repo ships. Skips
 // when no local Postgres is reachable, same as internal/store's tests.
 func TestBoot_ShippedConfigSucceeds(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping DB-backed test in -short mode")
-	}
 	c := shippedConfig(t)
 	c.databaseURL = testDBURL(t)
 
@@ -108,11 +105,17 @@ func TestBoot_ShippedConfigSucceeds(t *testing.T) {
 	}
 }
 
-// testDBURL skips the test if the configured Postgres server (same
-// ABUSEKIT_TEST_DATABASE_URL convention as internal/store's tests) is not
-// reachable, and returns its URL otherwise.
+// testDBURL skips the test under -short (boot() always applies
+// migrations before it can even reach a bad rules/vendors file, so every
+// test that calls this needs a real database, not just
+// TestBoot_ShippedConfigSucceeds) or when the configured Postgres server
+// (same ABUSEKIT_TEST_DATABASE_URL convention as internal/store's tests)
+// is not reachable, and returns its URL otherwise.
 func testDBURL(t *testing.T) string {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping DB-backed test in -short mode")
+	}
 	dbURL := os.Getenv("ABUSEKIT_TEST_DATABASE_URL")
 	if dbURL == "" {
 		dbURL = "postgres://e2a:e2a@localhost:5433/abusekit_test?sslmode=disable"
