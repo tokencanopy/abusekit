@@ -1,6 +1,10 @@
-# abusekit design — v1
+# abusekit design — revision 2
 
-Status: draft for review · 2026-09-27 · owner: Josh Zhang
+Status: revision 2 after dual review (correctness + adversarial), 2026-09-27 · owner: Josh Zhang.
+Revision 1 was reviewed and found structurally short in three places: per-subject features could not
+see account churn, tiers failed open when a scorer was unavailable, and request signing did not
+cover reads or replay. This revision fixes those and tightens every place an implementer would have
+had to guess. Changes from r1 are marked **[r2]**.
 
 ## 1. Problem statement
 
@@ -26,349 +30,458 @@ and products ask for the score and decide what to do. It never enforces.
 
 ### Success criteria (v1, measurable)
 
-1. A product integrates in under a day with two calls: emit an event, read a score. Measured by
-   e2a's integration diff being under 300 lines including tests.
-2. Replaying the reference scenario (`eval/fixtures/reference_operator.jsonl`, a synthetic event
-   sequence modelled on the incident: signup, several fraud-declined card attempts, a prepaid
-   success, a plan upgrade minutes later, a burst of keys and persona agents, then first sends an
-   hour after setup) yields a `high` tier before the first send, in shadow, with no rule tuned to
-   that sequence specifically.
-3. The redacted lure families from the incident score ≥0.9 phishing-or-impersonation on every
-   registered scorer against a benign transactional corpus with ≤2% false positive rate at the
-   same threshold. Reported by the harness, gated in CI.
-4. Switching the scorer for a rule from Jev to Laya or Gemini is a config change; every stored
-   verdict records which model produced it.
-5. abusekit being down or slow never blocks a product request: emit is fire-and-forget, score reads
-   have a served-from-cache fallback, and the product's own policy runs without it.
+1. A product integrates in under a day with two calls: emit an event, read a score. Measured by the
+   first consumer's integration diff being under 300 lines including tests.
+2. **[r2]** On the synthetic reference fixtures, with the default rules and the deterministic local
+   scorer (no vendor call): (a) the burst fixture (signup, fraud-declined attempts, prepaid success,
+   upgrade within minutes, a burst of keys and agents, first sends an hour later) reaches `high`
+   within 15 s of the last setup event and before the first `content.sent`; (b) the fast fixture
+   (same, with agents and first send inside one minute) reaches `high` on the synchronous
+   `evaluate` call the product makes before its first external send; (c) the churn fixture (twenty
+   subjects created and deleted in sequence, sharing a signup-email hash or a card fingerprint) has
+   every subject from the third onward at `high` on its first `resource.created`.
+3. **[r2]** For each registered scorer whose capabilities accept text, the synthetic lure corpus
+   scores ≥0.9 risk against a benign corpus of ≥300 examples with ≤2% false positives at the same
+   threshold, on a held-out lure family. Reported by the harness with confidence intervals; gated
+   in CI on recorded cassettes.
+4. Switching a rule's scorer is a config change plus a recorded calibration and gate run; every
+   stored verdict records model, checkpoint, render version and calibration id.
+5. abusekit being down, slow or over budget never blocks a product request and never reads as
+   "benign": emit is fire-and-forget through a durable outbox, reads serve the last verdict with
+   `stale:true`, and an unscored subject is `unknown`, never `low`.
 
 ## 2. Goals and non-goals
 
 **Goals**
 - Score-only: `{score, tier, signals, model}` per subject; the caller owns enforcement.
-- Push-based ingestion of typed events; no reading of any product's database.
-- Model-agnostic: `Scorer` and `Explainer` interfaces; Jev, Laya and Gemini adapters in v1;
-  selectable per rule; an ensemble is itself a scorer.
-- Rules as data (YAML): which events feed which features, thresholds, scorer, mode.
-- Modes per rule: `shadow` (compute, store, never surface in tier), `advise` (surface in tier).
-- Pure `score()` core so any evaluation framework can drive it; JSONL corpus; run manifests;
-  a harness CLI; a CI gate on precision/recall/calibration.
-- Labels: operator decisions flow back as labelled examples.
-- Runs as one binary (service) or as a Go package (embedded), Postgres or SQLite.
-- Privacy: content minimised and redacted before any model call; verdicts store no content;
-  per-adapter data-handling policy declared in config and enforced.
+- Push-based ingestion of typed events; abusekit never reads a product's database.
+- **[r2]** Same-product identity linking so churned accounts inherit their predecessors' evidence.
+- Model-agnostic: `Scorer` behind a real seam (four adapters), `Explainer` optional; a deterministic
+  local scorer that always answers.
+- Rules as data (YAML); modes per rule: `shadow` (computed, stored, excluded from tier) and
+  `advise` (included). **[r2]** A defined promotion path from shadow to advise.
+- Pure `Plan`/`Combine` core with an orchestrator between them, so any evaluation framework can
+  drive scoring with recorded results; JSONL corpus; run manifests; harness CLI; CI gate.
+- Labels from operator decisions flow back into the corpus under a separate credential.
+- One Go binary; Postgres. **[r2]** Importable `pkg/abusekit` client and the pure core; no
+  embedded ticker, no SQLite in v1.
+- Privacy by construction: static redaction per event type, vendor allowlist tied to terms,
+  template-generated reasons, bounded retention with a documented legal basis.
 
 **Non-goals (v1)**
-- Enforcement of any kind (pausing, holding, blocking). Not even optional.
-- Synchronous per-message scoring on a product's send path. Message-level scanning stays in the
-  product (e2a: piguard). abusekit consumes those verdicts as events.
-- A dashboard. Score endpoint + CLI; the operator UI lives in each product.
-- Cross-product identity resolution. One subject namespace per product.
-- Fine-tuning pipelines. The harness reports; training Laya is a separate job that consumes the
-  same corpus.
-- Fraud-payment decisions. Stripe Radar decides payments; abusekit consumes outcomes.
+- Enforcement of any kind. Not optional, not pluggable.
+- Synchronous scoring of message bodies on a product's send path. Message-level scanning stays in
+  the product (e2a: piguard); abusekit consumes its verdicts as events.
+- A dashboard. Score endpoint + CLI; operator UI lives in each product.
+- Cross-product identity linking. Linking is within one tenant in v1; the link table is designed
+  so cross-tenant linking is an additive change.
+- Fine-tuning pipelines and payment decisions (Stripe Radar decides payments; abusekit consumes
+  outcomes).
 
 ## 3. Context, constraints, assumptions
 
 **Existing patterns reused**
-- e2a's billing sidecar: private Go service in its own container beside the OSS server, HMAC-SHA256
-  over the request body with a shared secret, one Postgres, config via env. abusekit deploys the
-  same way in ops `docker-compose.prod.yaml` and is proxied by Caddy only for internal paths.
-- e2a's `piguard` engine: `Detector` interface with `Inspect(ctx, Request) (*Result, error)`,
-  `Result{Flagged, Score, Categories, Status, Provider}`, a Gemini adapter with structured JSON
-  output, timeouts, truncation reporting. abusekit's `Scorer` follows the same discipline
-  (timeouts fail closed to "unscored", never truncate silently) but returns per-label probabilities
-  rather than a single flag.
-- e2a's privacy policy commits screening to the paid Gemini tier. abusekit's Gemini adapter must
-  use the same key class; other adapters must declare their data-handling terms in config
-  (`retains_inputs: false`, `trains_on_inputs: false`) or be limited to redacted feature bags.
+- e2a's billing sidecar: private Go service in its own container, one Postgres, config via env.
+  abusekit deploys the same way in the hosted compose file. **[r2]** It is reachable only on the
+  compose network; nothing is routed through the public proxy.
+- e2a's `piguard` engine: `Detector` interface, structured JSON from Gemini, timeouts, explicit
+  `Degraded`/`MinOK` handling of missing detectors. abusekit copies the degraded semantics
+  (§4.4) rather than dropping failed rules.
+- e2a's privacy policy commits screening to the paid Gemini tier; the Gemini adapter is pinned to a
+  named billing project (config assertion `gemini.project`), not a key heuristic.
 
-**Assumptions (unconfirmed, tracked in §8)**
-- A1. TypeSafe's Jev early-access terms permit sending redacted account features and subject lines;
-  retention and training-on-input terms are acceptable or can be contracted.
-- A2. Laya's published checkpoint runs acceptably on CPU for asynchronous jobs (article: ~0.8 s
-  untuned CPU); GPU is not required for v1 volume (<10k subjects/day).
-- A3. e2a's OSS server can emit events via an internal HTTP hook without a release-coupled schema
-  (the event vocabulary is open; unknown types are stored).
-- A4. Products can tolerate eventual scores: the ticker recomputes within 60 s of the last event.
+**Assumptions (tracked in §8)**
+- A1. Vendor terms for Jev allow redacted numeric features; text fields are withheld from Jev until
+  terms covering retention and training are recorded in the adapter allowlist.
+- A2. Laya's checkpoint runs in <1 s on a 2-vCPU host for asynchronous jobs; measured before any
+  rule selects it.
+- A3. Products can emit through a durable outbox (e2a has River) so events survive an abusekit
+  outage.
+- A4. Eventual scores within 15 s of the last event for a dirty subject at v1 volumes; the
+  synchronous `evaluate` endpoint covers the cases where that is too slow.
 
 ## 4. Proposed design
 
-### 4.1 Shape
+### 4.1 Shape and modules
 
 ```
-product ──emit(event)──▶  abusekit  ──GET score──▶ product policy
-                            │
-                            ├─ store (Postgres|SQLite): events, features, verdicts, labels
-                            ├─ ticker: for dirty subjects → features → rules → score() → verdict
-                            └─ adapters: Scorer{jev, laya, gemini, vote}, Explainer{gemini}
+product ─emit(events, outbox)─▶ ingest ─▶ store ─▶ worker (ticker, priority queue)
+                                                     │  features (+ linked neighbours)
+                                                     │  Plan → orchestrator(adapters) → Combine
+                                                     ▼
+product ◀─GET score / POST evaluate──────── serve ◀── verdicts, subjects.current_tier
 ```
 
-Modules and their interfaces (deep where it matters):
-
-| Module | Interface | Notes |
+| Module | Interface | Deletion test |
 | --- | --- | --- |
-| `event` | `Event{Subject, Type, At, Data, Producer}`; `Store.Append`, `Store.Since` | Append-only. Unknown `Type` accepted. Idempotent on `(producer, id)`. |
-| `feature` | `Extract(events []Event, window) Features` | Pure. Named numeric/categorical features: velocities, fan-out, payment outcomes, name patterns, scan verdicts. Products get defaults; rules can add derived features. |
-| `rule` | `Rule{Name, Mode, Scorer, Explainer?, Inputs, Labels, Threshold}`; loaded from YAML | Data, hot-reloadable. |
-| `model` | `Scorer.Score(ctx, ScoreRequest) (ScoreResult, error)`; `Explainer.Explain(ctx, ExplainRequest) (string, error)` | The only seam that touches vendors. Registry by name. |
-| `score` | `Score(features, text, rules, scorers) Verdict` | **Pure.** No I/O beyond adapter calls passed in. This is what the harness drives. |
-| `serve` | HTTP handlers, HMAC auth, ticker | Thin. |
-| `eval` | `Run(dataset, rule, scorer) Manifest+Verdicts`; metrics | CLI `abusekit eval`. |
+| `ingest` | validate, redact per static schema, link-key extraction, idempotent append | every producer re-implements redaction and idempotency → keep |
+| `store` | Postgres repo; events, links, subjects, verdicts, rule_state, labels, corpus | keep |
+| `feature` | `Extract(ctx, subject, Neighbors, windows) Features` | every rule re-derives velocity, fan-out, onboarding facts → keep |
+| `model` | `Scorer`, `Explainer`, `Capabilities`, registry, calibration | the only vendor seam; 4 scorers → real |
+| `core` | `Plan(features, text, rules) []Call` · `Combine(rules, results, calib) Verdict` (both pure) | the test surface for harness and CI → keep |
+| `worker` | ticker, priority queue, backoff, budgets, rescore-at, webhooks | the deepest stateful part; **[r2]** its own module, not hidden in `serve` |
+| `config` | YAML rules + adapter allowlist, validation, hot reload | **[r2]** `rule` folded in here (it was YAML parsing) |
+| `serve` | HTTP handlers, auth, error envelope | shallow by design |
+| `eval` | `Run(dataset, rule, scorer) (Manifest, Verdicts)`, metrics, cassettes | keep |
 
-The deletion test: remove `feature` and every product re-derives velocity and fan-out from raw
-events; remove `model` and every rule re-implements vendor quirks and calibration. Both earn their
-keep. `serve` is deliberately shallow.
+### 4.2 Tenants, producers, subjects, links **[r2]**
 
-### 4.2 Event API
+- **Tenant** = a product (`e2a`). **Producer** = a component that emits (`e2a-server`,
+  `e2a-billing`). Credentials are per producer; subjects are scoped per tenant; idempotency is on
+  `(tenant, producer, event_id)`.
+- **Subject** = an opaque account id chosen by the tenant. A subject is never deleted by a product's
+  own account deletion; the product emits `subject.deleted`.
+- **Links** are keyed hashes the tenant sends with events: `email_hash` (normalised: lower-case,
+  dots and plus-tags collapsed for gmail-class domains, IDNA), `card_fingerprint_hash`,
+  `ip24_hash`, `asn`, `ua_hash`, `device_hash`. Hashes are HMAC-SHA256 under a per-tenant key from
+  Secret Manager (rotated by re-hashing links; the raw value is never stored). `links(tenant,
+  kind, hash, subject, first_seen, last_seen)` with an index on `(tenant, kind, hash)`.
+- **Neighbors(subject)** returns the set of subjects sharing any link key, with a fan-in cap of
+  50 per key and a total cap of 200; capped results set `neighbors_truncated=true` (a feature).
+- Linked features (all per tenant): `linked_subjects_n`, `linked_deleted_n`,
+  `linked_labelled_abusive_n`, `linked_max_risk`, `fingerprint_seen_on_other_subjects`,
+  `email_hash_seen_on_deleted_subject`. These make the churn fixture reachable.
+- Cross-tenant linking is an additive change: drop the tenant column from the index key.
 
-`POST /v1/events` (batch, ≤100 per call). Auth: `X-Abusekit-Key: <product key>` +
-`X-Abusekit-Signature: hex(hmac-sha256(secret, body))`. One key per product; the key names the
-producer and scopes subjects.
+### 4.3 Event API
+
+`POST /v1/events`, batch of 1–100, body ≤1 MiB.
+
+**Auth [r2]:** `X-Abusekit-Key: <producer key id>`, `X-Abusekit-Timestamp: <RFC3339>`,
+`X-Abusekit-Signature: hex(hmac-sha256(secret, method \n path?query \n timestamp \n key_id \n
+sha256(body)))`. Timestamp within ±5 min; constant-time compare; the same scheme covers every
+endpoint including GET (body hash of the empty string). Key scopes: `events`, `labels`, `read`,
+`backfill`. A producer key has `events` only; label keys are issued to the operator UI; `backfill`
+skips the clock-skew check and never fires webhooks.
+
+Event: `{id (required, ≤64), subject (≤256), type ([a-z_.]+ ≤64), at (RFC3339 UTC, ±24 h unless
+backfill scope), links? {email_hash?, card_fingerprint_hash?, ip24_hash?, asn?, ua_hash?,
+device_hash?}, data (object ≤8 KiB post-redaction)}`. `id` is required **[r2]**; a replay with the
+same id and identical body is `duplicate`, with a different body `conflict`.
+
+Response `202` `{accepted, duplicates, rejected: [{index, code, message}]}`; codes enumerated
+**[r2]**: `bad_id`, `bad_subject`, `bad_type`, `bad_timestamp`, `bad_links`, `too_large`,
+`conflict`, `redaction_failed`. Whole-request errors use the envelope
+`{error:{code,message,details?}}` with `400 bad_request`, `401 unauthenticated`, `403 forbidden`,
+`413 payload_too_large`, `415 unsupported_media_type`, `429 rate_limited` + `Retry-After`.
+
+**Built-in vocabulary** (unknown types stored, available to Go-registered features only):
+
+| Type | data | Notes |
+| --- | --- | --- |
+| `subject.created` | `channel`, `email_domain_class` (`webmail`\|`corporate`\|`disposable`\|`unknown`), `identity_kind` | **[r2]** email is carried only as `links.email_hash` |
+| `subject.deleted` | `mode` (`trash`\|`permanent`) | **[r2]** replaces any DELETE call by products |
+| `payment.attempt` | `outcome` (`succeeded`\|`declined`\|`blocked`), `reason`, `funding` (`prepaid`\|`debit`\|`credit`\|`unknown`), `amount_minor`, `currency` | fingerprint travels in `links` |
+| `subscription.changed` | `plan`, `status`, `amount_minor` | |
+| `resource.created` / `resource.deleted` | `kind`, `name` (≤200, NFKC + confusables skeleton stored alongside), `address_domain` | |
+| `content.sent` | `subject_line` (≤200), `recipient_domain`, `recipient_count`, `recipient_hash` (keyed), `recipient_is_own_identity` (bool, product-computed), `first_link_host` | **[r2]** `recipient_hash` + own-identity flag capture rehearsal-to-self |
+| `content.verdict` | `source`, `category`, `score` | product-side scanners |
+| `subject.class` | `class` (`customer`\|`internal`\|`synthetic`) | **[r2]** internal/synthetic subjects are stored but never scored |
+
+**Redaction [r2]** is a static, versioned schema per event type in code (`ingest/redact.go`):
+listed keys pass with their caps; unlisted keys are dropped (not hashed); any value matching an
+email address in a field that is not a hash is rejected with `redaction_failed`. Ingest never
+consults rules.
+
+### 4.4 Score API
+
+`GET /v1/subjects/{subject}` → `200` (a seen-but-unscored subject is `200` with `tier:"unknown"`;
+`404 not_found` only for a subject never seen in this tenant).
 
 ```json
-[{"id":"evt_01J...","subject":"acct_example_1","type":"resource.created","at":"2026-10-01T12:00:00Z",
-  "data":{"kind":"agent","name":"Alex Example","address_domain":"agents.example.test"}}]
+{"subject":"acct_example_1","score":0.93,"tier":"high","degraded":false,"stale":false,
+ "events_since_score":0,"scored_at":"2026-10-01T12:01:30Z",
+ "signals":[{"rule":"new_account_velocity","risk":0.97,"flagged":true,"mode":"advise",
+             "model":"local@1","calibration":"none","reason":"6 resources in 74s; 4 keys in 45s; upgrade 16m after signup; 3 fraud-declined attempts before first success"},
+            {"rule":"lure_similarity","risk":0.88,"flagged":true,"mode":"shadow","model":"laya@ck-3","calibration":"cal_7f",
+             "reason":"subject lines cluster with a known lure family"},
+            {"rule":"llm_review","status":"unscored","error_code":"cost_cap"}]}
 ```
 
-Rules for the body: `id` optional (server mints one; supplying it makes the call idempotent);
-`subject` opaque string ≤256; `type` `[a-z_.]+` ≤64; `at` RFC3339 UTC; `data` object ≤8 KiB after
-redaction. Responses: `202` `{accepted, duplicates, rejected:[{index, code}]}`; a partial batch is
-accepted (per-item codes), never all-or-nothing, so a producer's retry loop stays simple. `400` for
-an unparseable body, `401`/`403` for auth, `413` over size, `429` with `Retry-After`.
+**Semantics [r2]:**
+- Each rule declares `benign_label`; a signal's `risk = 1 − P(benign)` after calibration;
+  `flagged = risk ≥ rule.threshold`.
+- `score = max(risk)` over scored `advise` rules. `tier` from `score` by global cut points
+  (`medium ≥ 0.4`, `high ≥ 0.8`, placeholders until the first gate run). Per-rule thresholds do not
+  affect tier; they only set `flagged`.
+- `tier = "unknown"` when fewer than `min_scored_advise` (default 1) advise rules are scored, and
+  `degraded = true` whenever any advise rule is unscored. Callers must treat `unknown` as
+  "no evidence".
+- `stale = last_event_at > scored_at`; `events_since_score` counts them. A caller that needs
+  freshness calls `evaluate`.
+- `Cache-Control: no-store`; `ETag` = hash of the verdict ids in the response.
 
-Built-in vocabulary (all optional; unknown types are stored and available to custom features):
+**`POST /v1/subjects/{subject}/evaluate` [r2]** `{deadline_ms ≤ 3000}` → scores the subject now
+using rules whose scorer can answer within the deadline (the local scorer always can; vendor
+scorers only if their p99 fits), returns the same shape with `evaluated_now:true`. This is what a
+product calls before its first external send or a capacity upgrade. Idempotent; rate-limited per
+subject (1/s).
 
-| Type | data (subset) | Feeds |
-| --- | --- | --- |
-| `subject.created` | `channel`, `email_domain`, `identity_kind` | age, email-domain class |
-| `payment.attempt` | `outcome` (`succeeded`\|`declined`\|`blocked`), `reason`, `funding` (`prepaid`\|`debit`\|`credit`), `fingerprint_hash` | declined streak, prepaid-first, fingerprint reuse |
-| `subscription.changed` | `plan`, `status`, `amount_minor` | upgrade-within-N-minutes |
-| `resource.created` | `kind`, `name`, `address_domain` | creation velocity, name patterns (brand list, `@` in name) |
-| `content.sent` | `subject_line`, `recipient_domain`, `recipient_count`, `first_link_host?` | fan-out, distinct domains, subject clusters |
-| `content.verdict` | `source`, `category`, `score` | product-side scan results |
-| `label` | see §4.6 | operator ground truth |
+**`GET /v1/subjects?tier=&class=&cursor=&limit≤100`** — keyset on `(current_scored_at, subject)`,
+at-least-once paging documented; `subjects.current_tier`, `current_score`, `current_verdict_id`,
+`current_scored_at` are materialised columns.
 
-Redaction happens at ingest, per type: recipient addresses are never accepted (domain only);
-`name` and `subject_line` are kept (they are the signal) but capped at 200 chars; free-text
-`data` keys not in the vocabulary are hashed unless a rule declares them `text`.
+**Webhook [r2]:** per-tenant target URL and secret in config; event `subject.tier_changed`
+`{tenant, subject, from, to, verdict_id, scored_at}`; same signing scheme; retries 1m, 5m, 30m,
+2h, 12h; consumers dedupe on `verdict_id`.
 
-### 4.3 Score API
+**`DELETE /v1/subjects/{subject}` [r2]** is a legal erasure request, key scope `erase` (operator
+only). It destroys event `data` text, verdict reasons and corpus text for the subject, keeps
+numeric features and link hashes for subjects with an `abusive` label under a fraud-prevention
+legitimate-interest basis for 24 months, and purges everything for other subjects. Products never
+call it on account deletion; they emit `subject.deleted`.
 
-`GET /v1/subjects/{subject}` → `200`
-
-```json
-{"subject":"acct_example_1","score":0.93,"tier":"high",
- "signals":[{"rule":"new_account_velocity","score":0.97,"mode":"advise","model":"jev@2026-09-26",
-             "reason":"6 resources in 74s, 4 keys in 45s, upgrade 16m after signup"},
-            {"rule":"lure_similarity","score":0.88,"mode":"shadow","model":"laya@ck-3"}],
- "scored_at":"2026-10-01T12:01:30Z","stale":false}
-```
-
-`tier` is derived from the max `advise` signal by configured cut points (`low <0.4 ≤ medium <0.8 ≤ high`);
-`shadow` signals are returned but excluded from `tier`. `stale:true` when the ticker has not
-recomputed since the last event (caller may still act on the last score). `404` only for a subject
-never seen; `Cache-Control: no-store`; `ETag` on the verdict id. Never `500` for a scorer failure:
-a failed rule is reported as `{"rule":..., "status":"unscored", "error_code":...}` and excluded
-from `tier`.
-
-`GET /v1/subjects?tier=high&since=…&cursor=…&limit=100` — paginated, stable sort by `scored_at desc`.
-
-Optional webhook (`subject.tier_changed`) with the same HMAC scheme; at-least-once; consumers
-dedupe on `verdict_id`.
-
-### 4.4 Rules (YAML)
+### 4.5 Rules (YAML)
 
 ```yaml
+tiers: {medium: 0.4, high: 0.8}
+min_scored_advise: 1
 rules:
   - name: new_account_velocity
     mode: advise
-    scorer: jev
-    explainer: gemini
-    window: 72h
-    inputs: [subject_age, resource_velocity_1h, key_velocity_1h, upgrade_delay, declined_streak,
-             prepaid_first, name_brand_match, name_has_at, first_day_distinct_domains]
+    scorer: local            # deterministic; always answers
+    inputs: [subject_age_h, resource_velocity_1h, resource_total, key_velocity_1h, key_total,
+             upgrade_delay_min, declines_before_first_success, first_funding_prepaid,
+             name_brand_match, name_has_at, first_day_distinct_domains, self_send_before_external,
+             linked_deleted_n, linked_labelled_abusive_n, fingerprint_seen_on_other_subjects,
+             burst_ratio_24h_vs_lifetime]
     labels: [benign, suspicious, abusive]
-    threshold: {suspicious: 0.6, abusive: 0.8}
+    benign_label: benign
+    threshold: 0.6
+  - name: new_account_velocity_jev
+    mode: shadow
+    scorer: jev
+    inputs: same_as: new_account_velocity
+    labels: [benign, suspicious, abusive]
+    benign_label: benign
+    threshold: 0.6
+    stage: {min_local_risk: 0.3}      # only runs when the local rule is at least 0.3
   - name: lure_similarity
     mode: shadow
     scorer: laya
-    text: [subject_line, first_link_host]
+    text: [subject_line_skeleton, first_link_host]
     labels: [benign, phishing, brand_impersonation, scam]
-    threshold: {phishing: 0.85, brand_impersonation: 0.85, scam: 0.85}
-  - name: consensus
-    mode: shadow
-    scorer: vote(jev, laya)
-    ...
-tiers: {medium: 0.4, high: 0.8}
+    benign_label: benign
+    threshold: 0.85
+    stage: {max_subject_age_h: 168}
 ```
 
-Validation at load: unknown scorer, unknown feature, labels >255 (Jev limit), text inputs for an
-adapter whose policy forbids text → the rule is rejected and the previous config stays live.
+**Features [r2]:** Go functions registered by name; YAML only references them (no scripting, no
+derived features in YAML). Windows are per feature, not per rule: `*_1h`, `*_24h`, `*_total`
+(lifetime), and **permanent onboarding facts** (`declines_before_first_success`,
+`first_funding_prepaid`, `upgrade_delay_min`, `email_domain_class`) that never age out.
+`burst_ratio_24h_vs_lifetime` catches dormant-then-blast.
 
-### 4.5 Model layer
+**Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
+`Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
+differing label sets, a (rule, scorer) pair with no calibration record and no passing gate run →
+the whole reload is rejected and the previous config stays live; `/healthz` reports
+`config_error`.
+
+**Promotion shadow → advise [r2]:** a rule may be set to `advise` only if the latest gate run for
+its (rule, scorer) meets the floors and the rule has ≥7 days of shadow verdicts with agreement
+≥90% against labelled outcomes; `abusekit promote <rule>` checks and records this.
+
+### 4.6 Model layer
 
 ```go
-type ScoreRequest struct {
-    Labels   []string          // closed set for this call
-    Features map[string]any    // numeric/categorical, already redacted
-    Text     []string          // optional; empty if the adapter policy forbids text
-    Context  string            // ≤2k tokens of program state, e.g. rule intent
+type Capabilities struct {
+    LabelMode    LabelMode   // Open (any label set) | Fixed(set)
+    AcceptsText  bool
+    AcceptsFeatures bool
+    MaxTokens    int
+    Calibrated   bool        // vendor-calibrated; otherwise a calibration map is required
 }
-type ScoreResult struct {
-    Probs      map[string]float64 // sums to ~1 over Labels
-    Model      string             // "jev@2026-09-26", "laya@ck-3", "gemini-2.5-flash@paid"
-    LatencyMS  int
-    CostMicro  int64              // micro-USD, 0 for local
-    Truncated  bool               // input exceeded adapter window; fail closed upstream
-}
-type Scorer interface{ Name() string; Policy() DataPolicy; Score(context.Context, ScoreRequest) (ScoreResult, error) }
-type Explainer interface{ Name() string; Explain(context.Context, ScoreRequest, ScoreResult) (string, error) }
+type DataPolicy struct{ TermsVersion string; RetainsInputs, TrainsOnInputs bool; AllowsText bool }
+type ScoreRequest struct{ Labels []string; Features map[string]float64; Text []string; Context string; RenderVersion string }
+type ScoreResult  struct{ Probs map[string]float64; Model, Checkpoint, Render string; LatencyMS int; CostMicro int64; Truncated bool }
+type Scorer    interface{ Name() string; Capabilities() Capabilities; Policy() DataPolicy; Score(context.Context, ScoreRequest) (ScoreResult, error) }
+type Explainer interface{ Name() string; Policy() DataPolicy; Explain(context.Context, ScoreRequest, ScoreResult) (string, error) }
 ```
 
-Adapters in v1:
-- **jev** — hosted, typed decisions with calibrated probabilities; passes `Labels` as choices,
-  `Features`+`Text`+`Context` as unstructured state. Enforces 255 labels / 64k tokens; sets
-  `Truncated` rather than cutting.
-- **laya** — local weights (Apache-2.0), encoder; 512-token window; temperature-fitted on the
-  corpus (`abusekit calibrate laya`), fit stored with the checkpoint id. CPU by default.
-- **gemini** — structured-output JSON; `Scorer` and `Explainer`; paid-tier key required, the
-  adapter refuses to start on a free-tier key (mirrors e2a's policy).
-- **vote(a,b,…)** — mean of member probabilities; records members in `Model`.
+Adapters in v1 **[r2]**:
+- **local** — deterministic logistic model over registered features with hand-set weights in
+  `config/local_weights.yaml`; no network, no cost; always registered; the advise rule of last
+  resort. Its weights are reviewed like code and gated by the harness like any scorer.
+- **jev** — hosted typed decisions; `LabelMode: Open`, `Calibrated: true` (verified by the harness,
+  not assumed); features are rendered to text by a versioned template (`Render`); text inputs are
+  refused until `Policy().AllowsText` is set from recorded terms.
+- **laya** — local weights; `LabelMode: Fixed(checkpoint set)`; `AcceptsFeatures: false` (text
+  only); 512-token window with `Truncated` reported; requires a calibration map.
+- **gemini** — structured JSON; `Scorer` and `Explainer`; `Calibrated: false` (map required);
+  pinned to a named paid billing project.
+- **vote(a,b,…)** — mean of member risks after calibration; loader requires identical label sets.
 
-Every adapter passes the contract test: probabilities valid and sum ≈1; deterministic on repeated
-input (or variance reported); unknown label rejected; timeout → error (never a guess);
-`Truncated` set when window exceeded; `Policy()` honoured by the rule loader.
+**Calibration [r2]:** a map per (rule, scorer, checkpoint) fitted by
+`abusekit calibrate --rule R --scorer S` (Platt or isotonic on the labelled corpus), identified by
+`cal_<hash>` in every verdict and manifest. Rules refuse to run a scorer without a current map
+unless `Calibrated: true`.
 
-### 4.6 Labels and corpus
+**Explainer [r2]:** `reason` on every signal is generated from a deterministic template over
+feature values (never from text). An LLM explanation is opt-in per rule, stored separately as
+`llm_reason` with `untrusted: true`, receives features and probabilities only (never raw text),
+and is documented as plain text that products must not render as HTML. Text from events shown to
+operators is labelled as quoted untrusted input in the product UI.
 
-`POST /v1/labels` `{subject, rule?, label, source:"operator"|"outcome", note?, evidence_ref?}` from
-the product's review UI. A label snapshots the subject's features and text at that moment into
-`corpus_examples` as a JSONL-shaped row `{id, input:{features,text,context}, label, split, source,
-meta}`. `abusekit corpus export --split all > corpus.jsonl` produces the file the harness and any
-external evaluation framework read. Splits are assigned by hash of `id` (80/20) so they are stable.
+**Adapter allowlist [r2]:** `config/vendors.yaml` lists each adapter with `terms_version`,
+`dpa_ref` and the `DataPolicy`; the loader refuses an adapter absent from the list.
 
-### 4.7 Evaluation harness and CI gate
+**Contract test:** every adapter, every CI run, against fakes; nightly against live endpoints with
+recorded cassettes refreshed. Asserts: valid probabilities summing to 1±0.01; determinism or
+reported variance; unknown label rejected; timeout → error; `Truncated` on overflow;
+`Capabilities` honoured; `Policy` honoured by the loader.
 
-`abusekit eval --dataset corpus.jsonl --rule lure_similarity --scorer jev --out run.json`
-→ `run.json = {manifest:{dataset_sha, rule_sha, scorer, model, prompt_version, at}, verdicts:[…],
-metrics:{precision, recall, f1, ece, latency_p50, cost_total}}`. `--scorer all` runs every registered
-adapter and prints a side-by-side table. `abusekit eval` is also importable (`eval.Run`) and the
-`score()` function is exported, so Inspect/promptfoo/Braintrust can drive it without the service.
+### 4.7 Core: Plan / orchestrate / Combine **[r2]**
 
-CI: `make gate` runs the committed corpus through each rule's configured scorer and fails when
-precision or recall drops below the floor in `eval/floors.yaml` or ECE exceeds its bound. Prompt
-and feature changes are therefore reviewed like code. Shadow verdicts from production are appended
-to the corpus only when a label arrives (never unlabelled), so the corpus stays ground truth.
+`core.Plan(features, text, rules) []Call` decides, purely, which (rule, scorer, request) calls to
+make, applying `stage` conditions and `input_hash` skipping (unchanged inputs reuse the stored
+verdict). The worker or the harness executes calls through adapters (or replays recorded results).
+`core.Combine(rules, results, calibration) Verdict` reduces, purely, to risks, flags, score, tier,
+`degraded`. The harness and CI drive `Plan` and `Combine` with recorded results; only the nightly
+job touches vendors.
 
-### 4.8 Storage
+### 4.8 Worker **[r2]**
 
-Tables: `events` (append-only, `(producer,id)` unique, `subject` index, `at` index),
-`subjects` (last event, dirty flag), `verdicts` (subject, rule, model, probs jsonb, reason, mode,
-scored_at, input_hash), `labels`, `corpus_examples`. Retention: events 90 days, verdicts 1 year,
-labels and corpus forever. Same schema on Postgres and SQLite (no jsonb-specific queries in the
-hot path). Migrations embedded, applied on start, expand-only.
+- **Queue:** `subjects.dirty_seq` (monotonic, set on every event) and `scored_seq`; the worker
+  selects `dirty_seq > scored_seq OR next_rescore_at <= now`, ordered by priority: new subjects
+  (age < 24 h) first, then rising `current_score`, then oldest dirty; `FOR UPDATE SKIP LOCKED`;
+  batch 200 per 10 s tick; multi-instance safe.
+- **Compare-and-clear:** after scoring, set `scored_seq = the dirty_seq read at start`; a later
+  event keeps the subject dirty.
+- **Rescore-at:** `next_rescore_at` = earliest feature-window expiry, so decayed velocities are
+  recomputed without a new event.
+- **Rule state:** `rule_state(subject, rule, attempts, retry_at, last_error)`; backoff 30 s, 2 m,
+  5 m, capped at 15 m; a subject with any advise rule in backoff serves `degraded:true`.
+- **Budgets:** per adapter daily cap, per subject daily cap (default 20 calls), per producer daily
+  cap; 25% of each adapter cap is reserved for subjects at `medium` or above; hitting a cap pages
+  the operator and sets `error_code: cost_cap` on the affected rules while the local rule keeps
+  answering.
+- **Class skip:** `internal` and `synthetic` subjects are stored but never queued.
+- **Metrics:** queue depth, oldest dirty age, per-adapter latency/cost/errors, `emit_dropped_total`
+  reported by producers, verdicts by tier.
 
-### 4.9 Ticker
+### 4.9 Labels and corpus **[r2]**
 
-Every 10 s: select dirty subjects (limit 500), extract features over each rule's window, call
-`score()`, store verdicts, clear dirty, fire webhook on tier change. Per-adapter concurrency and a
-daily cost cap (`cost_cap_usd`) after which that adapter's rules report `unscored:cost_cap`.
-Adapter timeouts: 2 s Jev, 5 s Laya (CPU), 15 s Gemini; on timeout the rule is `unscored` this tick
-and retried next tick with backoff up to 15 min.
+`POST /v1/labels` (key scope `labels`, operator identity required):
+`{subject, rule?, label, source: "operator"|"outcome", actor, note? (≤500, retained like events),
+evidence_ref?}` → `201`. Label vocabulary per rule is the rule's `labels`; with `rule` omitted the
+label applies to the subject-level `benign|abusive`.
 
-### 4.10 e2a integration (first consumer)
+A label writes a **corpus example** that stores the redacted event slice up to `decision_at`
+(default: the first `content.sent` after signup, else the label time) plus the features as
+extracted at that time. Features are re-extracted at eval time from the slice, so feature-code
+changes are testable; the stored features serve external tools. Splits are by link cluster (fallback
+subject) hashed 80/20, and the harness can hold out a whole lure family. A label enters the
+**gate** corpus only after a second source (a second operator, or an `outcome` label) agrees.
 
-- OSS server: an `abusekit` emitter behind a config block (inert by default, self-host unaffected)
-  that emits `subject.created`, `resource.created` (agents, keys), `content.sent` (subject line,
-  recipient domain, count, first link host), `content.verdict` (piguard outcome). Emission is a
-  buffered goroutine with drop-on-full; never on the request path.
-- Billing sidecar: emits `payment.attempt` (from Stripe webhooks and checkout outcomes, with the
-  card fingerprint hashed under an abusekit-specific salt) and `subscription.changed`.
-- Dashboard/operator: reads the score for the account inspect view; the pause button posts a
-  `label`. e2a's policy on the score is e2a's (initially: `high` → operator alert only).
-- Backfill: a one-off, operator-run script (kept out of this repo) reads the product's database
-  read-only to seed events for a chosen window; abusekit itself never reads a product database.
+`abusekit corpus export --split all|train|test --schema corpus-v1.json > corpus.jsonl` with a
+published JSON Schema.
 
-### 4.11 Alternatives considered
+### 4.10 Evaluation harness and CI gate **[r2]**
 
-- **Read products' databases instead of push.** Fastest to ship, but couples abusekit to each
-  schema, breaks silently on migrations, and cannot serve a second product without a second
-  reader. Rejected; kept only as the one-off backfill.
-- **Embed scoring in e2a's piguard.** No new service, but the account-level judgement then lives
-  in one product, the Gemini key and privacy boundary spread, and the hub/AgentDrive get nothing.
-  Rejected. Message-level scoring stays in piguard by design.
-- **Let abusekit enforce (hold/pause) directly.** Simpler for e2a today, wrong for every other
-  product, and makes the service a policy engine with product-specific semantics. Rejected;
-  score-only is the contract.
-- **Single scorer (Gemini only).** Fewer adapters, but generative output has uncalibrated
-  confidence and no consistency guarantee, and vendor lock. Rejected; the harness exists to make
-  the model a measured choice.
+- `abusekit eval --dataset corpus.jsonl --rule R --scorer S|all --cassettes dir --out run.json`.
+  Manifest: abusekit version and git sha, dataset sha, split, rule sha, scorer, model, checkpoint,
+  render version, calibration id, adapter parameters, label set and thresholds, counts of unscored
+  and truncated, timestamp. Metrics: per-label precision/recall/F1 at the rule threshold, binary
+  precision/recall on `flagged`, ECE with 10 bins, latency p50/p95, cost; unscored counts as a
+  miss. Wilson intervals on every rate.
+- External frameworks: `abusekit score --jsonl` (stdin→stdout, no persistence),
+  `POST /v1/score:dryrun` (same, over HTTP), the JSON Schema for corpus rows, and the exported Go
+  `core.Plan`/`core.Combine`.
+- PR CI (`make gate`): recorded cassettes keyed by `(model, checkpoint, render, input_hash)`; no
+  secrets, no spend; fails below `eval/floors.yaml` (floor = lower interval bound of the reference
+  run) or above the ECE bound. Nightly: live adapters with tolerance bands, cassette refresh.
+- The committed corpus is synthetic (lures written in the style of the incident families, `.test`
+  domains, shifted timelines, fictional ids). The real incident corpus lives in private storage
+  and feeds only the nightly job via a secret.
+
+### 4.11 Storage
+
+Postgres only in v1. Tables: `events` (append-only; unique `(tenant, producer, id)`; indexes
+`(tenant, subject, at)`), `links`, `subjects` (dirty_seq, scored_seq, next_rescore_at, class,
+current_* columns), `verdicts` (subject, rule, model, checkpoint, render, calibration, probs
+JSON text, risk, flagged, mode, reason, llm_reason, input_hash, scored_at), `rule_state`,
+`labels`, `corpus_examples`, `calibrations`. Retention: events 90 d (text fields), 24 months
+(numeric + links) for abusive-labelled subjects, verdicts 12 months, labels/corpus per §4.4
+erasure rules. Migrations embedded, expand-only.
+
+### 4.12 First consumer: e2a
+
+- OSS server: an inert-by-default `abusekit` emitter behind a config block, writing events to
+  River (durable outbox) and draining to abusekit with retries; emits `subject.created` (with
+  `email_hash` and `email_domain_class`), `subject.deleted`, `resource.created/deleted` (agents,
+  keys), `content.sent` (subject line skeleton, recipient domain, hash, own-identity flag, first
+  link host), `content.verdict`, `subject.class` for prober/monitor accounts. Counter
+  `abusekit_emit_dropped_total` alerts on any drop.
+- Billing sidecar: `payment.attempt` (outcome, reason, funding, `card_fingerprint_hash` under the
+  tenant key) and `subscription.changed`.
+- Dashboard: the account inspect view reads the score; the pause action posts a label under an
+  operator key. e2a's initial policy: `high` → operator alert; `evaluate` before first external
+  send and before capacity upgrade, with `unknown` treated as "wait for the score".
+- Backfill: an operator-run script outside this repo, using a `backfill`-scope key.
+- Privacy page: subprocessor list updated before any vendor scorer leaves shadow.
+
+### 4.13 Alternatives considered
+
+- Read products' databases: fastest, couples to schemas, one product only. Rejected.
+- Embed in piguard: no service, but one product only and the privacy boundary spreads. Rejected;
+  message-level scanning stays in piguard.
+- Let abusekit enforce: simpler for e2a today, wrong for every other product. Rejected.
+- Single vendor scorer: uncalibrated confidence and lock-in; the harness exists to make the model a
+  measured choice. Rejected.
+- **[r2]** SQLite and embedded mode in v1: doubled the test matrix for no consumer. Deferred; the
+  pure core and the client package are what a library user needs.
 
 ## 5. Edge cases and failure handling
 
-- **Adapter down / slow / over cost cap** → rule `unscored`, excluded from tier, retried with
-  backoff; the last good verdict is served with `stale:true`. Never a 500, never a guessed score.
-- **Malformed or hostile event data** (prompt-injection text in a subject line) → text is passed
-  to models only as data inside a structured request; adapters use structured output; Jev cannot
-  emit free text at all; the Gemini explainer's output is length-capped and stored as a string,
-  never executed or rendered as HTML by abusekit.
-- **Duplicate / out-of-order events** → idempotent on `(producer,id)`; features are computed over
-  `at`, not arrival order; late events mark the subject dirty again.
-- **Subject deleted in the product** → no special handling; events and verdicts persist under the
-  opaque subject id (that persistence is the point — see the delete-and-resignup loop). Products
-  that need erasure call `DELETE /v1/subjects/{id}` which tombstones events and keeps labelled
-  corpus rows with the subject id hashed.
-- **Rule config invalid** → reload rejected, previous config stays live, error surfaced on
-  `/healthz` and in logs.
-- **Batch partially invalid** → per-item codes, valid items accepted.
-- **Clock skew** → `at` accepted within ±24 h of server time; otherwise rejected `bad_timestamp`.
-- **Label contradicts a verdict** → both stored; the harness reports it; nothing auto-tunes.
-- **SQLite deployment under concurrent writes** → single-writer; the ticker and HTTP writes go
-  through one serialized writer; documented as laptop/dev only.
+- Adapter down / slow / capped → rule `unscored` with a code; `degraded:true`; local rule still
+  answers; tier never becomes `low` by absence.
+- Flood of cheap events from many subjects → per-producer and per-subject budgets, reserved
+  headroom for elevated subjects, staged vendor rules; the local rule is unaffected.
+- Hostile text in names or subject lines → never reaches the explainer; scorers receive it only as
+  data in structured requests; a text rule alone cannot raise `score` above `medium` unless a
+  feature rule is ≥ `medium` (config `text_rules_need_feature_support: true`).
+- Duplicate / out-of-order / late events → idempotent ids; features over `at`; late events bump
+  `dirty_seq`.
+- Account churn → links carry evidence across subjects; `subject.deleted` is a feature, not an
+  erasure.
+- Homoglyph names → NFKC + confusables skeleton before brand matching.
+- Invalid config → reload rejected, previous config live, `/healthz` reports it.
+- Lost update in the worker → `dirty_seq` compare-and-clear.
+- Clock skew → ±24 h on events (except `backfill` scope), ±5 min on request signatures.
+- Label contradicting a verdict → both stored, reported by the harness, nothing auto-tunes.
 
 ## 6. Scalability and extensibility
 
-- Volumes: e2a today is thousands of events/day; the design targets 1M events/day and 100k
-  subjects on one Postgres without partitioning; `events` by `(subject, at)` and a `dirty`
-  partial index keep the ticker O(dirty).
-- Adding a product: a key and, optionally, a features YAML; no code.
-- Adding a model: one adapter file + contract test; no changes elsewhere.
-- Adding a feature: a function in `feature` registered by name; rules reference it.
-- Likely follow-ons made easier: cross-product subject linking (a `links` table keyed by hashed
-  identifiers, out of scope now but the opaque-subject design leaves room); a per-message advisory
-  endpoint (the pure `score()` already supports single-input scoring); fine-tuning Laya (corpus
-  export is the input).
-- Deliberately narrow: no plugin loading, no scripting in rules, no per-tenant rule sets in v1.
+- Targets 1M events/day, 100k subjects, one Postgres; the queue is O(dirty); `links` lookups are
+  index hits with fan-in caps.
+- Add a product: keys, `subject.class` tagging, an outbox. No code.
+- Add a model: one adapter + contract test + allowlist entry + calibration run.
+- Add a feature: one Go function; rules reference it.
+- Made easier later: cross-tenant links (drop a column from an index), per-message advisory
+  scoring (`score --jsonl` already exists), Laya fine-tuning (corpus export is the input),
+  SQLite/embedded (core is pure).
 
 ## 7. Verification strategy
 
-Seams tested (few, at the surfaces callers cross):
-1. **HTTP contract**: events (happy path, per-item rejection, HMAC denial, idempotent replay,
-   size limit), subject score (shape pinned, `stale`, `unscored` rule), labels, list pagination.
-2. **`score()` pure function**: table tests with fixed features and fake scorers; determinism;
-   tier derivation; shadow exclusion.
-3. **Adapter contract test**: one suite, every adapter, run against fakes in CI and against live
-   endpoints in a nightly job with recorded fixtures.
-4. **Harness gate**: the incident corpus (redacted) committed; floors set from the first run;
-   `make gate` in CI.
-5. **Replay test**: the synthetic reference-operator fixture must reach `high` before the first
-   `content.sent`, with the default rules and a fake scorer that returns recorded probabilities —
-   proves the features and thresholds, independent of a live model.
-
-Manual validation: run the operator backfill against staging, compare the top subjects by score
-with the operator's known-abuse list; confirm zero benign synthetic-monitor accounts in `high`.
-
-Likely regressions: feature window arithmetic at day boundaries; calibration drift after a model
-update (caught by the gate); a producer sending recipient addresses (caught by ingest redaction
-tests).
+1. HTTP contract tests: events (happy, per-item codes, conflict vs duplicate, signature on GET,
+   replay rejection, skew, size), score shape pinned including `unknown`/`degraded`/`stale`,
+   evaluate deadline behaviour, labels (scope denial), list paging, erasure semantics.
+2. `core.Plan`/`Combine` table tests: staging, input-hash skipping, reduction, tier, degraded.
+3. Adapter contract suite against fakes in CI, live nightly.
+4. Feature tests: windows at day boundaries, permanent facts, burst ratio, neighbours with
+   truncation.
+5. Replay fixtures (synthetic): burst, fast, churn (§1 criterion 2) with the local scorer and with
+   recorded vendor results.
+6. Gate: synthetic corpus, held-out family, cassettes, floors with intervals.
+7. Manual: staging backfill; top subjects vs the operator's known-abuse list; zero `internal` or
+   `synthetic` subjects scored.
 
 ## 8. Open questions
 
-1. Jev data-handling terms (A1) — needed before any text field goes to Jev; until then Jev rules
-   receive features only.
-2. Laya CPU latency on the prod VM (A2) — measure on a 2-vCPU box before choosing it for any rule.
-3. Cost cap defaults — proposal $5/day per adapter for e2a; confirm.
-4. Whether `content.sent` should carry the first 200 chars of body text (better lure recall, more
-   sensitive) or only subject line and link host (v1 proposal).
-5. Tier cut points (0.4 / 0.8) — placeholders until the first harness run.
-6. Licence: Apache-2.0 (decided 2026-09-27); the repo is public.
+1. Jev terms (A1): text stays withheld until recorded in `vendors.yaml`.
+2. Laya CPU latency on the hosted VM (A2): measure before any rule selects it.
+3. Budget defaults: $5/day per vendor adapter, 20 calls/subject/day, 2,000/producer/day. Confirm.
+4. Whether `content.sent` should carry the first 200 chars of body text. v1 proposal: no.
+5. Tier cut points and the local scorer's initial weights: placeholders until the first gate run.
+6. Legal review of the 24-month retention basis and the privacy-page subprocessor update.
