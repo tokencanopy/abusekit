@@ -23,11 +23,43 @@ import (
 // rule set without guessing from `received_at` timestamps.
 const RedactionSchemaVersion = 1
 
+// fieldKind is a listed field's declared value type (R2 round-2 review:
+// "listed fields typed only as 'some scalar'"). Before this, a switch on
+// the Go dynamic type accepted ANY of string/float64/bool for every
+// listed field, so a number field silently took a giant string, a bool
+// field took a number, and — worse — an enum (text) field given a number
+// or a null skipped the enum check entirely (that branch of the switch
+// never ran isEnumValue). The zero value is kindText, so most schema
+// entries (nearly all fields are text) don't need to set this explicitly.
+type fieldKind int
+
+const (
+	kindText fieldKind = iota
+	kindNumber
+	kindBool
+)
+
+func (k fieldKind) String() string {
+	switch k {
+	case kindNumber:
+		return "a number"
+	case kindBool:
+		return "a bool"
+	default:
+		return "a string"
+	}
+}
+
 // fieldSpec describes how one `data` key of a known event type is handled.
 type fieldSpec struct {
-	// maxLen caps a string value's byte length; values over the cap are
-	// truncated (at a rune boundary), not rejected. Zero means "no cap"
-	// (used for non-string fields such as counts and amounts).
+	// kind is the field's declared value type; a value of a different
+	// dynamic type (including JSON null, for any listed field) is
+	// rejected with CodeRedactionFailed rather than silently stored,
+	// stringified, or coerced.
+	kind fieldKind
+	// maxLen caps a string value's byte length (kindText only); values
+	// over the cap are truncated (at a rune boundary), not rejected. Zero
+	// means "no cap".
 	maxLen int
 	// skeleton, when true, also stores a `<key>_skeleton` companion
 	// computed by Skeleton (see skeleton.go) — used for the two fields
@@ -38,7 +70,8 @@ type fieldSpec struct {
 	// built-in vocabulary table allows for this field (S8); a string
 	// value outside it is rejected with CodeRedactionFailed rather than
 	// silently stored. nil means no enum restriction (a free-form
-	// string field, still capped/skeletoned as configured above).
+	// string field, still capped/skeletoned as configured above). Only
+	// meaningful on a kindText field.
 	enum []string
 }
 
@@ -82,13 +115,13 @@ var schema = map[string]map[string]fieldSpec{
 		"outcome":      {maxLen: 32, enum: []string{"succeeded", "declined", "blocked"}},
 		"reason":       {maxLen: 128},
 		"funding":      {maxLen: 16, enum: []string{"prepaid", "debit", "credit", "unknown"}},
-		"amount_minor": {},
+		"amount_minor": {kind: kindNumber},
 		"currency":     {maxLen: 8},
 	},
 	"subscription.changed": {
 		"plan":         {maxLen: 64},
 		"status":       {maxLen: 32},
-		"amount_minor": {},
+		"amount_minor": {kind: kindNumber},
 	},
 	"resource.created": {
 		"kind":           {maxLen: 32},
@@ -103,15 +136,15 @@ var schema = map[string]map[string]fieldSpec{
 	"content.sent": {
 		"subject_line":              {maxLen: 200, skeleton: true},
 		"recipient_domain":          {maxLen: 253},
-		"recipient_count":           {},
+		"recipient_count":           {kind: kindNumber},
 		"recipient_hash":            {maxLen: 128},
-		"recipient_is_own_identity": {},
+		"recipient_is_own_identity": {kind: kindBool},
 		"first_link_host":           {maxLen: 253},
 	},
 	"content.verdict": {
 		"source":   {maxLen: 64},
 		"category": {maxLen: 64},
-		"score":    {},
+		"score":    {kind: kindNumber},
 	},
 	"subject.class": {
 		"class": {maxLen: 32, enum: []string{"customer", "internal", "synthetic"}},
@@ -202,8 +235,22 @@ func (e *Event) Redact() error {
 		if !listed {
 			continue // unlisted keys dropped, not an error
 		}
+		// R3 (round 2): a listed field must match its DECLARED kind, not
+		// just be "some scalar" — a null is rejected for every listed
+		// field (a producer that doesn't want to set one should omit the
+		// key, not send null), and a value of the wrong dynamic type
+		// (a number for a text/enum field, a string for a number field, a
+		// bool where a number is expected, ...) is rejected rather than
+		// silently stored, coerced, or — for an enum field given a
+		// non-string — let past the enum check entirely.
+		if v == nil {
+			return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got null", k, spec.kind))
+		}
 		switch val := v.(type) {
 		case string:
+			if spec.kind != kindText {
+				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got a string", k, spec.kind))
+			}
 			s := val
 			if !spec.isEnumValue(s) {
 				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q is not one of %v", k, s, spec.enum))
@@ -215,8 +262,16 @@ func (e *Event) Redact() error {
 			if spec.skeleton {
 				out[k+"_skeleton"] = Skeleton(s)
 			}
-		case float64, bool, nil:
-			out[k] = v
+		case float64:
+			if spec.kind != kindNumber {
+				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got a number", k, spec.kind))
+			}
+			out[k] = val
+		case bool:
+			if spec.kind != kindBool {
+				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got a bool", k, spec.kind))
+			}
+			out[k] = val
 		default:
 			return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be a string, number, or bool, got %T", k, v))
 		}

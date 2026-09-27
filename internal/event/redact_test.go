@@ -239,6 +239,63 @@ func TestEvent_Redact(t *testing.T) {
 			data:     map[string]any{"anything": "bad\xff\xfevalue"},
 			wantCode: CodeRedactionFailed,
 		},
+		// R3 (round 2): listed fields must be type-checked against their
+		// DECLARED kind (text|number|bool), not just "any scalar" — a
+		// number-typed field accepting a huge string, a bool-typed field
+		// accepting a number, an enum (text) field accepting a number that
+		// entirely skips the enum check, and null for any listed field are
+		// all real gaps the old "any of string/float64/bool/nil" switch let
+		// through silently.
+		{
+			name:     "number field rejects a long string",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_count": strings.Repeat("7", 7000)},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "number field rejects a bool",
+			typ:      "payment.attempt",
+			data:     map[string]any{"amount_minor": true},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "enum text field rejects a number (bypassing the enum check)",
+			typ:      "payment.attempt",
+			data:     map[string]any{"outcome": 5.0},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "enum text field rejects null",
+			typ:      "subject.class",
+			data:     map[string]any{"class": nil},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "bool field rejects a string",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_is_own_identity": "true"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "number field accepts a number",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_count": 3.0},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_count"] != 3.0 {
+					t.Fatalf("expected recipient_count to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name: "bool field accepts a bool",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_is_own_identity": true},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_is_own_identity"] != true {
+					t.Fatalf("expected recipient_is_own_identity to pass through, got %#v", out)
+				}
+			},
+		},
 		// S8: closed-set enum fields reject an out-of-set value rather
 		// than silently storing it — design §4.3's built-in vocabulary
 		// table.
