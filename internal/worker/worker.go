@@ -331,6 +331,12 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 // adapter-budget reservation.
 func elevated(tier string) bool { return tier == "medium" || tier == "high" }
 
+// scoreOutcome carries safeScore's goroutine result back to its caller.
+type scoreOutcome struct {
+	result model.ScoreResult
+	err    error
+}
+
 // safeScore calls scorer.Score with a per-call timeout (B2 fix round:
 // DefaultScoreTimeout/Deps.ScoreTimeout — local never needs it, but
 // nothing bounds a future network-bound vendor adapter otherwise) and
@@ -338,15 +344,46 @@ func elevated(tier string) bool { return tier == "medium" || tier == "high" }
 // panic must never escape Tick or take down Start's whole loop) so every
 // caller sees exactly one failure mode — a returned error — regardless of
 // why the scorer didn't answer.
-func safeScore(ctx context.Context, scorer model.Scorer, req model.ScoreRequest, timeout time.Duration) (result model.ScoreResult, err error) {
+//
+// R3 round 2: Score runs in its own goroutine, and safeScore selects on
+// EITHER that goroutine finishing OR callCtx.Done() — a context.WithTimeout
+// alone only cancels the CONTEXT, it can't force an uncooperative callee to
+// return, so a scorer that ignores ctx entirely (blocks on a channel, a
+// mutex, a slow syscall) previously hung safeScore, and through it Tick,
+// and through it Start's whole loop, indefinitely; Stop() would then block
+// on <-done for the same reason. The spawned goroutine may still leak
+// (blocked inside Score forever, if the scorer truly never returns), but it
+// can no longer block the CALLER — the buffered channel absorbs its result
+// whenever/if it eventually arrives, with nobody left listening.
+func safeScore(ctx context.Context, scorer model.Scorer, req model.ScoreRequest, timeout time.Duration) (model.ScoreResult, error) {
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan scoreOutcome, 1)
+	go func() {
+		res, err := safeScoreCall(callCtx, scorer, req)
+		done <- scoreOutcome{res, err}
+	}()
+
+	select {
+	case o := <-done:
+		return o.result, o.err
+	case <-callCtx.Done():
+		return model.ScoreResult{}, fmt.Errorf("scorer %s: %w", scorer.Name(), callCtx.Err())
+	}
+}
+
+// safeScoreCall runs scorer.Score itself, recovering a panic into a plain
+// error (B2 fix round) — split out from safeScore so the recover() runs
+// inside the SAME goroutine that calls Score (a deferred recover in a
+// different goroutine than the panic can never catch it).
+func safeScoreCall(ctx context.Context, scorer model.Scorer, req model.ScoreRequest) (result model.ScoreResult, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("scorer %s panicked: %v", scorer.Name(), r)
 		}
 	}()
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	return scorer.Score(callCtx, req)
+	return scorer.Score(ctx, req)
 }
 
 // scoreSubject runs one full scoring round for d: load events, extract

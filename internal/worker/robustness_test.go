@@ -121,18 +121,27 @@ func (s scorerFunc) Score(ctx context.Context, req model.ScoreRequest) (model.Sc
 	return s.fn(ctx, req)
 }
 
-func TestStop_BlocksUntilInFlightTickCompletes(t *testing.T) {
-	// B2 fix round: Stop must cancel AND WAIT — a caller past Stop() should
-	// be able to rely on the worker having actually stopped touching the
-	// store, not just having been asked to.
+func TestStop_ReturnsPromptlyEvenWithACtxIgnoringScorerBlocked(t *testing.T) {
+	// B2 fix round established "Stop must cancel AND WAIT". R3 round 2
+	// refines what WAIT means: Stop now waits for safeScore's own bounded,
+	// cancellation-driven unwind (near-instant once cancel() propagates
+	// into safeScore's callCtx), not unconditionally for the underlying
+	// scorer call to return on its own — a scorer that never checks ctx at
+	// all (blocks on a channel/mutex/syscall forever) must never be able
+	// to hang Stop(), which is exactly what round 1's original version of
+	// this test (asserting Stop blocked until a manually-closed `release`
+	// channel unblocked the very same kind of ctx-ignoring scorer) was
+	// unknowingly relying on as if it were a virtue.
 	s := newTestStore(t)
 	ctx := context.Background()
 
 	appendEvent(t, ctx, s, "acct_worker_stop_blocks", "subject.created", replayBase, event.Links{}, nil)
 
-	release := make(chan struct{})
+	release := make(chan struct{}) // deliberately never closed: this scorer never returns on its own
+	scorerReturned := make(chan struct{})
 	scorer := scorerFunc{name: "fake_test_scorer", fn: func(ctx context.Context, req model.ScoreRequest) (model.ScoreResult, error) {
 		<-release
+		close(scorerReturned)
 		return model.ScoreResult{Probs: map[string]float64{"benign": 1, "abusive": 0}}, nil
 	}}
 	cfg := newFakeRuleConfigWithScorer(t, scorer)
@@ -158,19 +167,19 @@ func TestStop_BlocksUntilInFlightTickCompletes(t *testing.T) {
 
 	select {
 	case <-stopped:
-		t.Fatalf("Stop returned before the in-flight tick (blocked on the scorer) completed")
-	case <-time.After(150 * time.Millisecond):
-		// expected: Stop is still waiting.
+		// expected: Stop does not wait for the scorer's own channel.
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Stop did not return promptly — a ctx-ignoring scorer hung it")
 	}
-
-	close(release)
 
 	select {
-	case <-stopped:
-		// expected.
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Stop did not return after the in-flight tick was unblocked")
+	case <-scorerReturned:
+		t.Fatalf("the scorer's own call returned before Stop did — this test no longer exercises the ctx-ignoring case it's named for")
+	default:
+		// expected: the orphaned goroutine is still blocked on release: Stop
+		// returned via safeScore's cancellation path, not by waiting for it.
 	}
+	close(release) // let the orphaned goroutine exit rather than leaking past the test.
 }
 
 func TestStop_NoopWithoutStart(t *testing.T) {
