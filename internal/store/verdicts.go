@@ -39,6 +39,14 @@ type VerdictRecord struct {
 type SubjectSummary struct {
 	Tier  string
 	Score float64
+	// NextRescoreAt schedules the worker's next visit to this subject even
+	// without a new event (design §4.8: "next_rescore_at = earliest
+	// feature-window expiry" — e.g. a decayed *_1h/*_24h velocity feature
+	// that will change on its own once its window empties, with no new
+	// event to bump dirty_seq). Zero means "nothing scheduled" (stored as
+	// SQL NULL): dirty_seq is what will pick the subject up again, the
+	// next time it has a real event.
+	NextRescoreAt time.Time
 }
 
 // ErrStaleRound is returned by UpsertVerdicts when a newer round already
@@ -110,6 +118,10 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 	}
 
 	lastID := ids[len(ids)-1]
+	var nextRescoreAt *time.Time
+	if !summary.NextRescoreAt.IsZero() {
+		nextRescoreAt = &summary.NextRescoreAt
+	}
 	// S5: only materialize this round's summary if it is at least as new
 	// as whatever scored_seq the subject already has recorded. Without the
 	// "AND scored_seq <= $4" guard, a round that started reading dirty_seq
@@ -126,9 +138,10 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 			current_score      = $2,
 			current_verdict_id = $3,
 			current_scored_at  = now(),
-			scored_seq         = GREATEST(scored_seq, $4)
+			scored_seq         = GREATEST(scored_seq, $4),
+			next_rescore_at    = $7
 		WHERE tenant = $5 AND subject = $6 AND scored_seq <= $4
-	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject)
+	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject, nextRescoreAt)
 	if err != nil {
 		return nil, fmt.Errorf("store: update subject summary for %s: %w", subject, err)
 	}
@@ -202,6 +215,59 @@ type SubjectView struct {
 	ScoredAt *time.Time
 	// Signals holds each rule's most recent verdict, one per rule name.
 	Signals []SubjectSignal
+}
+
+// LatestVerdict is one rule's most-recently-recorded verdict — the minimum
+// internal/core.RuleState needs to implement input-hash skipping and a
+// `stage: {min_local_risk: ...}` condition (design §4.7) without reaching
+// into the store itself. This is deliberately narrower than SubjectSignal/
+// SubjectView (S3's HTTP-facing read model): the worker's Plan-building
+// step needs InputHash (which SubjectView never selects, having no reason
+// to expose it over the API) and doesn't need SubjectView's Degraded/Stale
+// bookkeeping, so this is its own small purpose-built query rather than a
+// reuse of SubjectView's.
+type LatestVerdict struct {
+	InputHash string
+	// Risk is nil when the rule's most recent round left it unscored.
+	Risk *float64
+}
+
+// LatestVerdicts returns each rule's most recent verdict for (tenant,
+// subject), keyed by rule name. A rule never scored for this subject is
+// simply absent from the returned map — the caller's own zero
+// core.RuleState (LastInputHash "", LastRisk nil) is already the correct
+// "never scored" state, so there's nothing useful to return for it.
+func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map[string]LatestVerdict, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (rule) rule, input_hash, risk, status
+		FROM verdicts
+		WHERE tenant = $1 AND subject = $2
+		ORDER BY rule, scored_at DESC, id DESC
+	`, tenant, subject)
+	if err != nil {
+		return nil, fmt.Errorf("store: query latest verdicts for subject %s: %w", subject, err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]LatestVerdict)
+	for rows.Next() {
+		var (
+			rule, status, inputHash string
+			risk                    *float64
+		)
+		if err := rows.Scan(&rule, &inputHash, &risk, &status); err != nil {
+			return nil, fmt.Errorf("store: scan latest verdict row: %w", err)
+		}
+		lv := LatestVerdict{InputHash: inputHash}
+		if status == "scored" {
+			lv.Risk = risk
+		}
+		out[rule] = lv
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate latest verdicts for subject %s: %w", subject, err)
+	}
+	return out, nil
 }
 
 // SubjectView returns the read model for (tenant, subject), or

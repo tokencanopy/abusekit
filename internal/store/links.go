@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"fmt"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // DefaultNeighborCapPerKey and DefaultNeighborCapTotal are the fan-in caps
@@ -23,6 +25,32 @@ const (
 // capPerKey <= 0 uses DefaultNeighborCapPerKey; capTotal <= 0 uses
 // DefaultNeighborCapTotal.
 func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey, capTotal int) (subjects []string, truncated bool, err error) {
+	return s.neighbors(ctx, tenant, subject, capPerKey, capTotal, nil)
+}
+
+// NeighborsByKinds is Neighbors restricted to a specific set of link kinds
+// (e.g. []string{"card_fingerprint_hash"}), rather than every kind the
+// subject happens to have a link row under. internal/feature (S2) uses
+// this twice: once with every kind except "asn" for the general linked_*
+// evidence (design §4.2's linked_deleted_n/linked_labelled_abusive_n —
+// see feature.Config.IncludeASN for why ASN is excluded by default), and
+// once with only "card_fingerprint_hash" for
+// fingerprint_seen_on_other_subjects, which is specifically about a
+// reused payment fingerprint, not general same-tenant link-sharing.
+//
+// kinds must be non-empty (use Neighbors for "every kind").
+func (s *Store) NeighborsByKinds(ctx context.Context, tenant, subject string, kinds []string, capPerKey, capTotal int) (subjects []string, truncated bool, err error) {
+	if len(kinds) == 0 {
+		return nil, false, fmt.Errorf("store: NeighborsByKinds requires at least one kind (use Neighbors for \"every kind\")")
+	}
+	return s.neighbors(ctx, tenant, subject, capPerKey, capTotal, kinds)
+}
+
+// neighbors is Neighbors/NeighborsByKinds' shared implementation. kinds ==
+// nil means "every kind this subject has a link row under" (Neighbors'
+// original, unfiltered behavior); a non-nil kinds restricts the key
+// listing to exactly those link kinds.
+func (s *Store) neighbors(ctx context.Context, tenant, subject string, capPerKey, capTotal int, kinds []string) (subjects []string, truncated bool, err error) {
 	if capPerKey <= 0 {
 		capPerKey = DefaultNeighborCapPerKey
 	}
@@ -34,11 +62,24 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 	// has no defined row order, so which keys get processed first (and
 	// therefore which of them fill up capTotal before the rest are simply
 	// skipped) was not deterministic call to call against unchanged data.
-	keyRows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT kind, hash FROM links WHERE tenant = $1 AND subject = $2 ORDER BY kind, hash`, tenant, subject)
-	if err != nil {
-		return nil, false, fmt.Errorf("store: query link keys for subject %s: %w", subject, err)
+	var keyRows pgx.Rows
+	if kinds == nil {
+		rows, err := s.pool.Query(ctx,
+			`SELECT DISTINCT kind, hash FROM links WHERE tenant = $1 AND subject = $2 ORDER BY kind, hash`, tenant, subject)
+		if err != nil {
+			return nil, false, fmt.Errorf("store: query link keys for subject %s: %w", subject, err)
+		}
+		keyRows = rows
+	} else {
+		rows, err := s.pool.Query(ctx,
+			`SELECT DISTINCT kind, hash FROM links WHERE tenant = $1 AND subject = $2 AND kind = ANY($3) ORDER BY kind, hash`,
+			tenant, subject, kinds)
+		if err != nil {
+			return nil, false, fmt.Errorf("store: query link keys for subject %s: %w", subject, err)
+		}
+		keyRows = rows
 	}
+
 	type kindHash struct{ kind, hash string }
 	var keys []kindHash
 	for keyRows.Next() {
@@ -116,4 +157,36 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 	}
 
 	return out, truncated, nil
+}
+
+// NeighborOutcomes reports, among the given same-tenant subjects (typically
+// a Neighbors/NeighborsByKinds result), how many have ever emitted a
+// subject.deleted event and how many carry at least one "abusive" label —
+// the two counts internal/feature's linked_deleted_n and
+// linked_labelled_abusive_n features need (design §4.2). Both are computed
+// with one query each rather than round-tripping once per neighbor.
+//
+// A label row's rule is deliberately not restricted here: a per-rule
+// "abusive" verdict from a rule whose own label vocabulary includes it is
+// just as much evidence of a labelled-abusive neighbor as a subject-level
+// one (rule == "").
+//
+// subjects empty returns (0, 0, nil) without querying.
+func (s *Store) NeighborOutcomes(ctx context.Context, tenant string, subjects []string) (deletedCount, labelledAbusiveCount int, err error) {
+	if len(subjects) == 0 {
+		return 0, 0, nil
+	}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT subject) FROM events
+		WHERE tenant = $1 AND subject = ANY($2) AND type = 'subject.deleted'
+	`, tenant, subjects).Scan(&deletedCount); err != nil {
+		return 0, 0, fmt.Errorf("store: count deleted neighbors: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT subject) FROM labels
+		WHERE tenant = $1 AND subject = ANY($2) AND label = 'abusive'
+	`, tenant, subjects).Scan(&labelledAbusiveCount); err != nil {
+		return 0, 0, fmt.Errorf("store: count labelled-abusive neighbors: %w", err)
+	}
+	return deletedCount, labelledAbusiveCount, nil
 }
