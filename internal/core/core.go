@@ -203,17 +203,15 @@ func collectText(text map[string][]string, names []string) []string {
 }
 
 // inputHash is a stable digest of everything that would change this
-// call's answer: the rule identity, its scorer, and the resolved request.
-// json.Marshal serializes map keys in sorted order, so the digest doesn't
-// depend on Go's randomized map iteration.
-// inputHash is a stable digest of everything that would change this
 // call's answer (S2): the rule identity, its scorer AND the scorer's own
 // current version/checkpoint (so a scorer upgrade is never masked by
 // identical features), the render template version, the calibration map
 // currently on record, the benign label (flipping which label counts as
 // "not abusive" changes risk polarity even with an unchanged label SET),
-// and the resolved request. json.Marshal serializes map keys in sorted
-// order, so the digest doesn't depend on Go's randomized map iteration.
+// and the resolved request — with its Features quantized first (R7 round
+// 2, see quantizeAgeFeaturesForHash). json.Marshal serializes map keys in
+// sorted order, so the digest doesn't depend on Go's randomized map
+// iteration.
 func inputHash(rs RuleState, req model.ScoreRequest) string {
 	payload := struct {
 		Rule          string
@@ -227,7 +225,7 @@ func inputHash(rs RuleState, req model.ScoreRequest) string {
 		Text          []string
 	}{
 		rs.Rule.Name, rs.Rule.Scorer, rs.ScorerVersion, req.RenderVersion, rs.CalibrationID, rs.Rule.BenignLabel,
-		req.Labels, req.Features, req.Text,
+		req.Labels, quantizeAgeFeaturesForHash(req.Features), req.Text,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -247,6 +245,41 @@ func inputHash(rs RuleState, req model.ScoreRequest) string {
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])
+}
+
+// quantizeAgeFeaturesForHash returns a copy of features with
+// subject_age_h floored to a 1-hour bucket and upgrade_delay_min floored
+// to a 60-minute bucket before hashing (R7 round 2). Proven necessary:
+// both are continuously-drifting elapsed-time features for any subject
+// not yet at internal/feature's clamp ceiling (B5 fix round) — they
+// change on literally every tick even with no new event at all — so
+// hashing them at full precision meant a rule that reads either one
+// (design's shipped new_account_velocity does) never repeated its input
+// hash across two consecutive rounds, permanently defeating
+// SkipInputUnchanged (S6/S7) for exactly new, still-under-clamp accounts,
+// the population this system most needs to score efficiently. A value
+// already AT its clamp ceiling is already a whole-bucket multiple (24 and
+// 1440 both divide evenly), so clamped values are untouched by the floor.
+//
+// Every other feature passes through unchanged: only these two specific,
+// known-continuously-drifting names get bucketed — a feature genuinely
+// changing in value (e.g. resource_total incrementing) must still change
+// the hash exactly as before.
+func quantizeAgeFeaturesForHash(features map[string]float64) map[string]float64 {
+	if len(features) == 0 {
+		return features
+	}
+	out := make(map[string]float64, len(features))
+	for k, v := range features {
+		switch k {
+		case "subject_age_h":
+			v = math.Floor(v)
+		case "upgrade_delay_min":
+			v = math.Floor(v/60) * 60
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // RuleOutcome is one rule's resolved result for a scoring round: either a

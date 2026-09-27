@@ -387,7 +387,20 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 			rs.ScorerVersion = scorer.Version()
 		}
 		if lv, ok := latest[r.Name]; ok {
-			rs.LastInputHash = lv.InputHash
+			// R7 round 2, proven: LatestVerdict.InputHash reflects the
+			// literal latest row regardless of status. Feeding an ERRORED
+			// round's hash to Plan as LastInputHash meant that once
+			// quantization (below) made subject_age_h/upgrade_delay_min
+			// repeat across rounds, a rule already PAST its backoff window
+			// would match that stale error hash and skip re-invoking the
+			// scorer at all — silently freezing on the SAME error forever
+			// instead of actually retrying. Only a SCORED round's hash
+			// means "the answer we already have is still valid, no need to
+			// call again" — an errored round has no valid answer to reuse,
+			// so it must never suppress a retry once backoff clears.
+			if lv.Status == "scored" {
+				rs.LastInputHash = lv.InputHash
+			}
 			rs.LastRisk = lv.Risk
 		}
 		ruleStates[i] = rs
