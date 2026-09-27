@@ -85,6 +85,39 @@ const claimCandidateOrder = `
 // let two instances issue 40 scorer calls for 20 subjects; claimed_until
 // now excludes a subject from re-selection for the WHOLE scoring pass
 // that follows, not just this one transaction.
+// DirtyArmQuery and RescoreArmQuery are ClaimDirtySubjects' two claim-
+// selection arms, exported as named constants (R10 round 2) so a test
+// asserting they hit their partial indexes (EXPLAIN) runs the EXACT
+// query string this method does — not a hand-copied literal that could
+// silently drift out of sync with it. Each takes $1=now, $2=newSubjectCutoff
+// (used only inside claimCandidateOrder), $3=limit, matching
+// queryClaimCandidates' own documented parameter contract.
+const (
+	DirtyArmQuery = `
+		SELECT ` + claimCandidateColumns + `
+		FROM subjects
+		WHERE class NOT IN ('internal', 'synthetic')
+		  AND (claimed_until IS NULL OR claimed_until < $1)
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+		  AND dirty_seq > scored_seq
+		ORDER BY ` + claimCandidateOrder + `
+		LIMIT $3
+		FOR UPDATE SKIP LOCKED
+	`
+	RescoreArmQuery = `
+		SELECT ` + claimCandidateColumns + `
+		FROM subjects
+		WHERE class NOT IN ('internal', 'synthetic')
+		  AND (claimed_until IS NULL OR claimed_until < $1)
+		  AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+		  AND dirty_seq <= scored_seq
+		  AND next_rescore_at IS NOT NULL AND next_rescore_at <= $1
+		ORDER BY ` + claimCandidateOrder + `
+		LIMIT $3
+		FOR UPDATE SKIP LOCKED
+	`
+)
+
 func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int) ([]DirtySubject, error) {
 	if limit <= 0 {
 		limit = DefaultClaimBatchSize
@@ -98,35 +131,14 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
-	dirty, err := queryClaimCandidates(ctx, tx, `
-		SELECT `+claimCandidateColumns+`
-		FROM subjects
-		WHERE class NOT IN ('internal', 'synthetic')
-		  AND (claimed_until IS NULL OR claimed_until < $1)
-		  AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
-		  AND dirty_seq > scored_seq
-		ORDER BY `+claimCandidateOrder+`
-		LIMIT $3
-		FOR UPDATE SKIP LOCKED
-	`, now, newSubjectCutoff, limit)
+	dirty, err := queryClaimCandidates(ctx, tx, DirtyArmQuery, now, newSubjectCutoff, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: query dirty claim candidates: %w", err)
 	}
 
 	out := dirty
 	if len(out) < limit {
-		rescoreOnly, err := queryClaimCandidates(ctx, tx, `
-			SELECT `+claimCandidateColumns+`
-			FROM subjects
-			WHERE class NOT IN ('internal', 'synthetic')
-			  AND (claimed_until IS NULL OR claimed_until < $1)
-			  AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
-			  AND dirty_seq <= scored_seq
-			  AND next_rescore_at IS NOT NULL AND next_rescore_at <= $1
-			ORDER BY `+claimCandidateOrder+`
-			LIMIT $3
-			FOR UPDATE SKIP LOCKED
-		`, now, newSubjectCutoff, limit-len(out))
+		rescoreOnly, err := queryClaimCandidates(ctx, tx, RescoreArmQuery, now, newSubjectCutoff, limit-len(out))
 		if err != nil {
 			return nil, fmt.Errorf("store: query rescore-only claim candidates: %w", err)
 		}

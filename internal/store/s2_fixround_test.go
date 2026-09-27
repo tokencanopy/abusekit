@@ -585,26 +585,15 @@ func TestClaimDirtySubjects_UsesIndexesNotSequentialScans(t *testing.T) {
 		t.Fatalf("set next_rescore_at: %v", err)
 	}
 
-	for _, q := range []string{
-		`EXPLAIN SELECT tenant, subject, dirty_seq, scored_seq, current_tier, fail_count
-		 FROM subjects
-		 WHERE class NOT IN ('internal','synthetic')
-		   AND (claimed_until IS NULL OR claimed_until < now())
-		   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-		   AND dirty_seq > scored_seq
-		 ORDER BY (first_seen_at > now() - interval '24 hours') DESC, current_score DESC NULLS FIRST, last_event_at ASC, tenant, subject
-		 LIMIT 200`,
-		`EXPLAIN SELECT tenant, subject, dirty_seq, scored_seq, current_tier, fail_count
-		 FROM subjects
-		 WHERE class NOT IN ('internal','synthetic')
-		   AND (claimed_until IS NULL OR claimed_until < now())
-		   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-		   AND dirty_seq <= scored_seq
-		   AND next_rescore_at IS NOT NULL AND next_rescore_at <= now()
-		 ORDER BY (first_seen_at > now() - interval '24 hours') DESC, current_score DESC NULLS FIRST, last_event_at ASC, tenant, subject
-		 LIMIT 200`,
-	} {
-		rows, err := pool.Query(ctx, q)
+	// R10 round 2: run the EXACT query text ClaimDirtySubjects itself uses
+	// (store.DirtyArmQuery / store.RescoreArmQuery), parameterized exactly
+	// as production does — not a hand-copied literal (with now()/interval
+	// substituted for $1/$2) that could silently drift out of sync with
+	// the real query if it ever changes.
+	explainNow := now.Add(time.Minute)
+	newSubjectCutoff := explainNow.Add(-24 * time.Hour)
+	for _, q := range []string{store.DirtyArmQuery, store.RescoreArmQuery} {
+		rows, err := pool.Query(ctx, "EXPLAIN "+q, explainNow, newSubjectCutoff, 200)
 		if err != nil {
 			t.Fatalf("EXPLAIN: %v", err)
 		}
