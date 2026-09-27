@@ -33,12 +33,143 @@ func testDBURL() string {
 	return defaultTestDBURL
 }
 
+// requireDB is S11: CI sets ABUSEKIT_REQUIRE_DB=1 so a DB-backed test
+// FAILS (t.Fatalf) instead of silently SKIPPING when the configured
+// Postgres server is unreachable — a skip is the right default for a
+// laptop with no local Postgres running, but is exactly the wrong
+// behavior in CI, where "no database reachable" should fail the build
+// loudly rather than quietly report a smaller, green suite.
+func requireDB() bool {
+	return os.Getenv("ABUSEKIT_REQUIRE_DB") == "1"
+}
+
+// unavailable reports (via t.Fatalf under requireDB(), t.Skipf
+// otherwise) that the test database could not be reached, and returns —
+// the caller should return immediately after calling this.
+func unavailable(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if requireDB() {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// runSchema is a unique Postgres schema name generated once per test
+// binary process (S11), shared by every newTestStore call in this run:
+// each parallel/concurrent test run (a CI job, a worktree, another
+// agent's session) against the SAME shared Postgres server gets its own
+// isolated set of tables, so one run's TRUNCATE (see newTestStore) can
+// never race another run's INSERTs on the literal same table. A single
+// process's own tests still safely share this one schema and truncate it
+// between each other, same as before S11.
+var runSchema = fmt.Sprintf("abusekit_run_%d_%d", os.Getpid(), time.Now().UnixNano())
+
+// TestMain creates runSchema once before any test in this package runs
+// (best-effort: if the database isn't reachable, individual tests report
+// that themselves via newTestStore/newThrowawayDatabaseURL) and drops it
+// once after every test has finished, so a long-lived shared Postgres
+// instance doesn't accumulate one abandoned schema per test run.
+func TestMain(m *testing.M) {
+	ctx := context.Background()
+	haveSchema := createSchema(ctx, testDBURL(), runSchema) == nil
+
+	// os.Exit does not run deferred functions, so the drop must happen
+	// BEFORE calling it, not via a defer here.
+	code := m.Run()
+	if haveSchema {
+		_ = dropSchema(context.Background(), testDBURL(), runSchema)
+	}
+	os.Exit(code)
+}
+
+func createSchema(ctx context.Context, dbURL, schema string) error {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+	_, err = conn.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{schema}.Sanitize())
+	return err
+}
+
+func dropSchema(ctx context.Context, dbURL, schema string) error {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(ctx)
+	_, err = conn.Exec(ctx, "DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+	return err
+}
+
+// scopedPoolConfig returns a pgxpool.Config for dbURL whose every
+// connection sets search_path to ONLY runSchema — deliberately with NO
+// fallback to public. Every pool this test package opens against
+// testDBURL() — newTestStore's own, and any verification pool a test
+// opens to check what landed in the database — must go through this, not
+// a bare pgxpool.New: a pool without it defaults to Postgres's own
+// "$user", public search_path and would (depending on what's left over
+// in `public` from past runs, before this repo had schema isolation, or
+// from another concurrent run) either fail to find the tables at all or,
+// worse, silently read/verify against the WRONG schema instead of loudly
+// failing.
+//
+// The no-fallback part is load-bearing, not a simplification: a
+// "runSchema, public" search_path would resolve an unqualified table
+// reference against runSchema first, but SILENTLY FALL THROUGH to
+// public for any table runSchema doesn't (yet) have — which is exactly
+// ApplyMigrations' own tracker-existence check on
+// schema_migrations_abusekit. A pre-existing public.schema_migrations_abusekit
+// (there always is one, from before this schema-isolation existed, or
+// from any test run that predates it) would then make a brand-new
+// runSchema's tracker check see "001_core.sql already applied" via that
+// fallback and skip creating any table in runSchema at all — the schema
+// stays completely empty while every query silently keeps hitting
+// public's tables, defeating isolation entirely without ever erroring.
+// Postgres's built-in types/functions live in pg_catalog, which is
+// always implicitly searched regardless of search_path, so dropping the
+// "public" fallback costs nothing this schema needs.
+func scopedPoolConfig(dbURL string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SET search_path TO "+pgx.Identifier{runSchema}.Sanitize())
+		return err
+	}
+	return cfg, nil
+}
+
+// openScopedPool opens a pool against testDBURL(), scoped to runSchema
+// (see scopedPoolConfig), for a test that needs to verify what a
+// newTestStore-backed Store actually wrote — e.g. a column SubjectView
+// doesn't expose. Fails the test on any connection error (this is a
+// verification pool for a test that has presumably already confirmed the
+// database is reachable via newTestStore).
+func openScopedPool(t *testing.T, ctx context.Context) *pgxpool.Pool {
+	t.Helper()
+	cfg, err := scopedPoolConfig(testDBURL())
+	if err != nil {
+		t.Fatalf("parse test db url: %v", err)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open verification pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 // newTestStore opens (self-provisioning the database if it doesn't exist
 // yet, mirroring e2a's testutil), migrates, and truncates a Store for one
-// test. Skips the test — rather than failing it — when the configured
-// Postgres server itself is unreachable, so `go test ./...` stays green
-// on a machine with no local Postgres; a database that IS reachable but
-// fails to migrate or truncate is a real failure, not a skip.
+// test, scoped to this process's runSchema (S11) so concurrent test runs
+// against the same shared database never see each other's tables. Skips
+// the test — or fails it under ABUSEKIT_REQUIRE_DB=1 (S11) — when the
+// configured Postgres server itself is unreachable, so `go test ./...`
+// stays green on a machine with no local Postgres by default, while CI
+// can demand a real one; a database that IS reachable but fails to
+// migrate or truncate is always a real failure, never a skip.
 //
 // The local Postgres at localhost:5433 is shared with other repos' (and
 // other agents') test runs — a flake here should be baselined against a
@@ -52,9 +183,15 @@ func newTestStore(t *testing.T) *store.Store {
 	ctx := context.Background()
 	dbURL := testDBURL()
 
-	pool, err := pgxpool.New(ctx, dbURL)
+	poolCfg, err := scopedPoolConfig(dbURL)
 	if err != nil {
-		t.Skipf("test database not available: %v", err)
+		t.Fatalf("parse test db url: %v", err)
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		unavailable(t, "test database not available: %v", err)
+		return nil
 	}
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
@@ -63,7 +200,7 @@ func newTestStore(t *testing.T) *store.Store {
 			if cerr := createDatabase(ctx, dbURL); cerr != nil {
 				t.Fatalf("failed to create test database: %v", cerr)
 			}
-			pool, err = pgxpool.New(ctx, dbURL)
+			pool, err = pgxpool.NewWithConfig(ctx, poolCfg)
 			if err != nil {
 				t.Fatalf("reopen pool after creating database: %v", err)
 			}
@@ -72,8 +209,17 @@ func newTestStore(t *testing.T) *store.Store {
 				t.Fatalf("ping after creating database: %v", err)
 			}
 		} else {
-			t.Skipf("test database not available: %v", err)
+			unavailable(t, "test database not available: %v", err)
+			return nil
 		}
+	}
+	// The schema itself may not exist yet if TestMain's own createSchema
+	// couldn't reach the database at process start but it's reachable
+	// now (e.g. a slow-starting CI service container) — ensure it here
+	// too, cheaply (IF NOT EXISTS), before anything sets search_path to it.
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{runSchema}.Sanitize()); err != nil {
+		pool.Close()
+		t.Fatalf("create run schema: %v", err)
 	}
 
 	s := store.New(pool)
@@ -162,8 +308,8 @@ func dropDatabase(ctx context.Context, dbURL string) error {
 // this is for tests that specifically need to observe behavior against a
 // database with NOTHING in it yet, such as a from-scratch migration race.
 //
-// Skips the test if the server itself is unreachable, same as
-// newTestStore.
+// Skips the test if the server itself is unreachable — or fails it under
+// ABUSEKIT_REQUIRE_DB=1 (S11) — same as newTestStore.
 func newThrowawayDatabaseURL(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
@@ -181,7 +327,8 @@ func newThrowawayDatabaseURL(t *testing.T) string {
 	target := fresh.String()
 
 	if err := createDatabase(context.Background(), target); err != nil {
-		t.Skipf("test database not available: %v", err)
+		unavailable(t, "test database not available: %v", err)
+		return ""
 	}
 	t.Cleanup(func() {
 		_ = dropDatabase(context.Background(), target)

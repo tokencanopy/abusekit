@@ -168,9 +168,10 @@ func TestMigrate_RespectsCancelledContext(t *testing.T) {
 	}
 }
 
-// testDBURL skips the test under -short, or when the configured Postgres
-// server (same ABUSEKIT_TEST_DATABASE_URL convention as internal/store's
-// tests) is not reachable, and returns its URL otherwise.
+// testDBURL skips the test under -short — or fails it under
+// ABUSEKIT_REQUIRE_DB=1 (S11, same convention as internal/store's tests)
+// — when the configured Postgres server (ABUSEKIT_TEST_DATABASE_URL) is
+// not reachable, and returns its URL otherwise.
 func testDBURL(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
@@ -182,11 +183,24 @@ func testDBURL(t *testing.T) string {
 	}
 	pool, err := pgxpool.New(context.Background(), dbURL)
 	if err != nil {
-		t.Skipf("test database not available: %v", err)
+		reportDBUnavailable(t, "test database not available: %v", err)
+		return ""
 	}
 	defer pool.Close()
 	if err := pool.Ping(context.Background()); err != nil {
-		t.Skipf("test database not available: %v", err)
+		reportDBUnavailable(t, "test database not available: %v", err)
+		return ""
 	}
 	return dbURL
+}
+
+// reportDBUnavailable is S11: CI sets ABUSEKIT_REQUIRE_DB=1 so this fails
+// the test instead of skipping it when the configured Postgres server is
+// unreachable — the same convention as internal/store's tests.
+func reportDBUnavailable(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("ABUSEKIT_REQUIRE_DB") == "1" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
 }

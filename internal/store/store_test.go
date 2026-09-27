@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tokencanopy/abusekit/internal/event"
@@ -36,13 +37,25 @@ func mkEvent(t *testing.T, id, subject, typ string, at time.Time, data map[strin
 }
 
 // TestApplyMigrations_FreshDatabase is the "migration applies on a fresh
-// DB" acceptance criterion from plan.md's S1 row: newTestStore already
-// calls ApplyMigrations as part of setup, so a passing test here means a
-// completely empty database reaches a working schema, and running it
-// again (idempotent) doesn't error either.
+// DB" acceptance criterion from plan.md's S1 row (S11: this must be a
+// database this test creates and drops itself, not the shared per-run
+// schema newTestStore's other callers already migrated earlier in the
+// same test binary run — otherwise "fresh" is only true the first time
+// any test in the package happens to run).
 func TestApplyMigrations_FreshDatabase(t *testing.T) {
-	s := newTestStore(t)
+	dbURL := newThrowawayDatabaseURL(t)
 	ctx := context.Background()
+
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+
+	s := store.New(pool)
+	if err := s.ApplyMigrations(ctx); err != nil {
+		t.Fatalf("ApplyMigrations on a genuinely fresh database: %v", err)
+	}
 	if err := s.ApplyMigrations(ctx); err != nil {
 		t.Fatalf("re-applying migrations should be a no-op, got: %v", err)
 	}
@@ -94,6 +107,69 @@ func TestApplyMigrations_ConcurrentOnFreshDatabase(t *testing.T) {
 	defer verifyPool.Close()
 	if err := store.New(verifyPool).ApplyMigrations(ctx); err != nil {
 		t.Fatalf("ApplyMigrations after the concurrent race: %v", err)
+	}
+}
+
+// TestScopedPool_DoesNotInheritPublicSchemaTrackerState is S11's schema
+// isolation, proven against the exact failure mode found while building
+// it: a `search_path` of "runSchema, public" (WITH a public fallback)
+// resolves ApplyMigrations' own unqualified `schema_migrations_abusekit`
+// tracker check against public whenever runSchema doesn't have it yet —
+// and a pre-existing public.schema_migrations_abusekit (there always is
+// one on any Postgres server this repo's tests have run against before
+// S11) makes that check see "001_core.sql already applied" and skip
+// creating any table in runSchema at all, leaving it completely empty
+// while every subsequent query keeps silently hitting public's tables.
+// This test manufactures exactly that pre-existing state on a fresh
+// throwaway database, then confirms a scoped pool with its own run
+// schema still gets its OWN, independently populated tables.
+func TestScopedPool_DoesNotInheritPublicSchemaTrackerState(t *testing.T) {
+	dbURL := newThrowawayDatabaseURL(t)
+	ctx := context.Background()
+
+	// Simulate an older (pre-S11) or unscoped run that already applied
+	// migrations directly to `public`.
+	plainPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("open plain pool: %v", err)
+	}
+	defer plainPool.Close()
+	if err := store.New(plainPool).ApplyMigrations(ctx); err != nil {
+		t.Fatalf("ApplyMigrations against public: %v", err)
+	}
+
+	// A scoped pool against the SAME database, with its own run schema,
+	// must still create and use its own tables.
+	scopedCfg, err := scopedPoolConfig(dbURL)
+	if err != nil {
+		t.Fatalf("scopedPoolConfig: %v", err)
+	}
+	scopedPool, err := pgxpool.NewWithConfig(ctx, scopedCfg)
+	if err != nil {
+		t.Fatalf("open scoped pool: %v", err)
+	}
+	defer scopedPool.Close()
+
+	if _, err := scopedPool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+pgx.Identifier{runSchema}.Sanitize()); err != nil {
+		t.Fatalf("create run schema: %v", err)
+	}
+	if err := store.New(scopedPool).ApplyMigrations(ctx); err != nil {
+		t.Fatalf("ApplyMigrations in the scoped run schema: %v", err)
+	}
+
+	// Check information_schema directly, scoped to runSchema by name —
+	// an ambient unqualified `SELECT ... FROM subjects` would succeed via
+	// search_path fallback even when the table only exists in public,
+	// which is exactly the bug this test exists to catch.
+	var exists bool
+	if err := scopedPool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'subjects')`,
+		runSchema,
+	).Scan(&exists); err != nil {
+		t.Fatalf("query information_schema.tables: %v", err)
+	}
+	if !exists {
+		t.Fatalf("expected the scoped run schema to have created its OWN subjects table, not silently reused public's via search_path fallback")
 	}
 }
 
@@ -559,11 +635,7 @@ func TestUpsertVerdicts_MissingSubjectIsAnError(t *testing.T) {
 
 func subjectFirstSeen(t *testing.T, ctx context.Context, tenant, subject string) time.Time {
 	t.Helper()
-	pool, err := pgxpool.New(ctx, testDBURL())
-	if err != nil {
-		t.Fatalf("open verification pool: %v", err)
-	}
-	defer pool.Close()
+	pool := openScopedPool(t, ctx)
 	var firstSeen time.Time
 	if err := pool.QueryRow(ctx, `SELECT first_seen_at FROM subjects WHERE tenant = $1 AND subject = $2`, tenant, subject).Scan(&firstSeen); err != nil {
 		t.Fatalf("query subjects.first_seen_at: %v", err)
@@ -573,11 +645,7 @@ func subjectFirstSeen(t *testing.T, ctx context.Context, tenant, subject string)
 
 func linkFirstSeen(t *testing.T, ctx context.Context, tenant, kind, hash, subject string) time.Time {
 	t.Helper()
-	pool, err := pgxpool.New(ctx, testDBURL())
-	if err != nil {
-		t.Fatalf("open verification pool: %v", err)
-	}
-	defer pool.Close()
+	pool := openScopedPool(t, ctx)
 	var firstSeen time.Time
 	if err := pool.QueryRow(ctx,
 		`SELECT first_seen FROM links WHERE tenant = $1 AND kind = $2 AND hash = $3 AND subject = $4`,
@@ -701,15 +769,17 @@ func mustLinkEvent(t *testing.T, id, subject string, at time.Time, hash string) 
 func TestNeighbors_TenantSubjectIndexExists(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	_ = s // ensure migrations have run
-	pool, err := pgxpool.New(ctx, testDBURL())
-	if err != nil {
-		t.Fatalf("open verification pool: %v", err)
-	}
-	defer pool.Close()
+	_ = s // ensure migrations have run in THIS run's schema
+	pool := openScopedPool(t, ctx)
+	// pg_indexes has a schemaname column and isn't itself affected by
+	// search_path, so this must filter to our own run's schema
+	// explicitly — otherwise a leftover schema from an earlier,
+	// imperfectly-cleaned-up run would make this pass regardless of
+	// whether THIS run's migrations actually created the index.
 	var exists bool
 	if err := pool.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE tablename = 'links' AND indexdef LIKE '%(tenant, subject)%')`,
+		`SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname = $1 AND tablename = 'links' AND indexdef LIKE '%(tenant, subject)%')`,
+		runSchema,
 	).Scan(&exists); err != nil {
 		t.Fatalf("query pg_indexes: %v", err)
 	}
