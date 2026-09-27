@@ -83,6 +83,11 @@ func (v *voteScorer) Name() string               { return v.name }
 func (v *voteScorer) Capabilities() Capabilities { return v.caps }
 func (v *voteScorer) Policy() DataPolicy         { return v.policy }
 
+// Score calls every member with req, in order, stopping at the first
+// error (which it wraps with the failing member's name) or the first
+// context cancellation. On success it returns the per-label mean of the
+// members' Probs, defensively renormalized to sum to 1, with CostMicro
+// summed and Truncated set if any member truncated.
 func (v *voteScorer) Score(ctx context.Context, req ScoreRequest) (ScoreResult, error) {
 	if !v.caps.LabelMode.Accepts(req.Labels) {
 		return ScoreResult{}, ErrUnknownLabel
