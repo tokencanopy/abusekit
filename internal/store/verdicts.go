@@ -41,6 +41,16 @@ type SubjectSummary struct {
 	Score float64
 }
 
+// ErrStaleRound is returned by UpsertVerdicts when a newer round already
+// recorded a higher scored_seq for the subject (R2, round 2): the whole
+// transaction — verdict inserts included — is rolled back rather than
+// partially committed, so a stale round can never leave rows that
+// SubjectView would show as "the latest signal per rule" beside a
+// current_tier the stale round didn't actually win. Not a failure the
+// caller needs to report anywhere; it means exactly what it says, "this
+// round is obsolete, someone else already scored a newer one."
+var ErrStaleRound = errors.New("store: stale round: a newer round already scored this subject")
+
 // UpsertVerdicts inserts one verdicts row per record (verdicts are
 // append-only history — nothing is actually updated in place, despite the
 // name; "Upsert" here matches design §4.1's naming for "record this
@@ -127,8 +137,14 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 		// exist at all — a real error, not a silent no-op, since the
 		// caller believes it just recorded a scoring round for a real
 		// subject — or (b) the subject exists but a newer round already
-		// recorded a higher scored_seq, in which case this round's
-		// summary is correctly, intentionally not applied (see above).
+		// recorded a higher scored_seq. R2 (round 2): case (b) used to
+		// fall through and commit anyway, which left this round's verdict
+		// INSERTs visible even though its summary was correctly rejected —
+		// SubjectView's "latest signal per rule" could then show a stale
+		// round's risk/flagged right beside a current_tier that round
+		// never actually won. Both cases now roll back the whole
+		// transaction (the deferred tx.Rollback below) instead of
+		// committing a partial result.
 		var exists bool
 		if err := tx.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM subjects WHERE tenant = $1 AND subject = $2)`,
@@ -139,6 +155,7 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 		if !exists {
 			return nil, fmt.Errorf("store: cannot record verdicts for %s/%s: subject row does not exist", tenant, subject)
 		}
+		return nil, ErrStaleRound
 	}
 
 	if err := tx.Commit(ctx); err != nil {

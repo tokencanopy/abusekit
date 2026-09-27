@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -595,12 +596,20 @@ func TestSubjectView_StaleIsSequenceBasedNotClockBased(t *testing.T) {
 
 // --- S5: UpsertVerdicts must not let a stale round regress the summary --
 
-// TestUpsertVerdicts_OutOfOrderRoundDoesNotRegressSummary is S5. Proven:
-// a round for dirty_seq=3 recording tier=high, followed by a round for
-// dirty_seq=1 (an out-of-order/slow worker instance that read the
-// subject's dirty_seq before the first round even started) recording
-// tier=low, used to leave the subject at tier=low — the later-committing
-// but logically-older round silently regressed the summary.
+// TestUpsertVerdicts_OutOfOrderRoundDoesNotRegressSummary is S5/R2
+// (round 2 tightened this further). Proven (S5): a round for
+// dirty_seq=3 recording tier=high, followed by a round for dirty_seq=1
+// (an out-of-order/slow worker instance that read the subject's
+// dirty_seq before the first round even started) recording tier=low,
+// used to leave the subject at tier=low. Proven (R2, round 2): even
+// after S5's fix, the stale round's own verdict ROWS still committed and
+// became SubjectView's "latest signal per rule" (scored_at/id order
+// favors the later-COMMITTING call, not the logically-newer one) — a
+// caller could see current_tier="high" right beside a signal showing the
+// stale round's risk=0.1/unflagged. UpsertVerdicts now rolls back the
+// whole transaction (verdict inserts included) and returns the
+// ErrStaleRound sentinel when a round turns out to be stale, so nothing
+// about it ever becomes visible.
 func TestUpsertVerdicts_OutOfOrderRoundDoesNotRegressSummary(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -622,14 +631,19 @@ func TestUpsertVerdicts_OutOfOrderRoundDoesNotRegressSummary(t *testing.T) {
 	if _, err := s.UpsertVerdicts(ctx, testTenant, "acct_ooo_round", 3, highRecords, store.SubjectSummary{Tier: "high", Score: highRisk}); err != nil {
 		t.Fatalf("UpsertVerdicts (seq=3, high): %v", err)
 	}
+	before, err := s.SubjectView(ctx, testTenant, "acct_ooo_round", nil)
+	if err != nil {
+		t.Fatalf("SubjectView (before stale round): %v", err)
+	}
 
 	lowRisk := 0.1
 	lowRecords := []store.VerdictRecord{
 		{Rule: "r", Mode: "advise", Scorer: "local", Model: "local", Probs: map[string]float64{"benign": 0.9, "abusive": 0.1},
 			Risk: &lowRisk, InputHash: "h_low", Status: "scored"},
 	}
-	if _, err := s.UpsertVerdicts(ctx, testTenant, "acct_ooo_round", 1, lowRecords, store.SubjectSummary{Tier: "low", Score: lowRisk}); err != nil {
-		t.Fatalf("UpsertVerdicts (seq=1, low): %v", err)
+	_, err = s.UpsertVerdicts(ctx, testTenant, "acct_ooo_round", 1, lowRecords, store.SubjectSummary{Tier: "low", Score: lowRisk})
+	if !errors.Is(err, store.ErrStaleRound) {
+		t.Fatalf("expected ErrStaleRound from the out-of-order seq=1 round, got %v", err)
 	}
 
 	view, err := s.SubjectView(ctx, testTenant, "acct_ooo_round", nil)
@@ -638,6 +652,12 @@ func TestUpsertVerdicts_OutOfOrderRoundDoesNotRegressSummary(t *testing.T) {
 	}
 	if view.Tier != "high" {
 		t.Fatalf("expected the out-of-order seq=1 round to leave tier=high in place, got tier=%s", view.Tier)
+	}
+	if len(view.Signals) != 1 || view.Signals[0].Risk != highRisk || !view.Signals[0].Flagged {
+		t.Fatalf("expected the stale round's verdict row to never become visible, got signals: %+v", view.Signals)
+	}
+	if view.ScoredAt == nil || before.ScoredAt == nil || !view.ScoredAt.Equal(*before.ScoredAt) {
+		t.Fatalf("expected current_scored_at to be untouched by the rolled-back stale round: before=%v after=%v", before.ScoredAt, view.ScoredAt)
 	}
 }
 
