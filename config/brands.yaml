@@ -6,16 +6,32 @@
 # bare substring check — after Skeleton-folding both the candidate text and
 # every name/alias below.
 #
-# Deliberately excluded: apple, stripe, google, amazon, dhl, ebay, chase,
-# ups, irs, microsoft. These are generic enough that they appear constantly
-# in legitimate agent/integration names ("Stripe Webhook Relay", "Google
-# Calendar Sync", "Microsoft Teams Relay") — word-boundary matching alone
-# cannot tell "impersonating Stripe" from "a real Stripe integration named
-# after Stripe", so flagging on the bare brand word would false-positive on
-# exactly the kind of automation traffic abusekit's first consumer runs.
-# Proper context-aware matching is future work (see docs/design's open
-# questions); until then these stay out of the default list rather than in
-# it and noisy.
+# R6 round 2 (option (a)): apple, stripe, google, amazon, dhl and
+# microsoft are RE-INCLUDED below, no longer excluded outright. S3
+# originally left them out because they're generic enough to appear
+# constantly in legitimate agent/integration names ("Stripe Webhook
+# Relay", "Google Calendar Sync", "Microsoft Teams Relay") and
+# word-boundary matching alone can't tell "impersonating Stripe" from "a
+# real Stripe integration named after Stripe". The fix isn't exclusion
+# any more: internal/feature.BrandSet.Matches now suppresses a match
+# outright when the candidate text ALSO contains an integration-adjacent
+# word (integration, webhook, sync, relay, notifier, tracking, bot,
+# connector, api, import, export) anywhere in it — applied uniformly to
+# every brand here, not just these six (an already-shipped, unambiguous
+# brand like PayPal needs the identical protection: "PayPal integration"
+# is a reviewed false-positive case on its own). See BrandSet's own doc
+# comment for the exact rule and why it's text-wide rather than
+# positional.
+#
+# Still excluded: ebay, chase, ups, irs. Unlike the six above, these
+# aren't false-positive-prone specifically because they double as
+# integration/platform names — they're short, ordinary English words/
+# abbreviations ("chase" the verb, "ups" as in "ups and downs", "irs" as a
+# generic acronym) whose false-positive surface the integration-token rule
+# doesn't bound at all (there's no "chase sync"/"ups webhook" pattern to
+# gate on; the collision is with ordinary prose, not with integration
+# naming). Proper context-aware matching for these remains future work
+# (see docs/design's open questions).
 brands:
   - name: PayPal
     aliases: ["Pay Pal"]
@@ -27,3 +43,9 @@ brands:
   - name: Walmart
   - name: USPS
   - name: FedEx
+  - name: Apple
+  - name: Stripe
+  - name: Google
+  - name: Amazon
+  - name: DHL
+  - name: Microsoft

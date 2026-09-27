@@ -46,10 +46,26 @@ func TestBrandSet_WordBoundarySafety(t *testing.T) {
 		{"applebee's", "Applebee's Rewards Bot", false},
 		{"amazonas", "Amazonas Logistics", false},
 		{"striped", "Striped Shirt Co", false},
-		{"no separator glue", "paypalsupport", false}, // documented v0 limitation
+		{"no separator glue, all lowercase", "paypalsupport", false}, // documented v0 limitation: no case transition to split on
 
 		// Zero-width obfuscation must not defeat the tokenizer.
 		{"zero-width space inside the brand word", "pay​pal", true},
+
+		// Glued compounds written with each component capitalized (R6
+		// round 2): tokenizeCamel splits at the lower->upper transition,
+		// so these match even with no separator at all.
+		{"glued, each word capitalized", "PayPalSupport", true},
+		{"glued multi-word brand name", "WellsFargo", true},
+		{"glued three-word brand name", "BankOfAmerica", true},
+
+		// R6 round 2: an integration-token word ANYWHERE in the candidate
+		// text suppresses the whole match, even for a brand (PayPal) that
+		// was never on the S3 exclusion list — proven necessary:
+		// "PayPal integration" and "Coinbase Commerce webhook"-shaped
+		// resource names are common, legitimate SaaS-integration names.
+		{"integration-token gate suppresses an otherwise-clean match", "PayPal integration", false},
+		{"integration-token gate is not positional", "Apple Calendar Sync", false},
+		{"integration-token gate does not fire without one", "PayPal Rewards Program", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -129,5 +145,27 @@ func TestContainsSequence(t *testing.T) {
 func TestLoadBrandsFile_MissingFile(t *testing.T) {
 	if _, err := LoadBrandsFile("does-not-exist.yaml"); err == nil {
 		t.Fatalf("expected an error for a missing file")
+	}
+}
+
+func TestTokenizeCamel(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"WellsFargo", []string{"wells", "fargo"}},
+		{"BankOfAmerica", []string{"bank", "of", "america"}},
+		{"PayPalSupport", []string{"pay", "pal", "support"}},
+		{"paypal", []string{"paypal"}},              // all lowercase: no transition, unchanged
+		{"Paypal", []string{"paypal"}},              // capitalized only at the start: no INTERNAL transition
+		{"USPS", []string{"usps"}},                  // all caps: no lower->upper transition anywhere
+		{"Wells Fargo", []string{"wells", "fargo"}}, // already separated: unaffected
+		{"", nil},
+	}
+	for _, tt := range tests {
+		got := tokenizeCamel(tt.in)
+		if !equalStrings(got, tt.want) {
+			t.Errorf("tokenizeCamel(%q) = %v, want %v", tt.in, got, tt.want)
+		}
 	}
 }

@@ -384,7 +384,11 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 		}
 	})
 	t.Run("resource.deleted also counts", func(t *testing.T) {
-		events := []event.Event{ev("r1", "resource.deleted", 0, map[string]any{"name": "PayPal Bot"})}
+		// Not "PayPal Bot" (R6 round 2): "bot" is now an integration-token
+		// that suppresses a match on its own (BrandSet.Matches) — this test
+		// is about resource.deleted being checked at all, not about that
+		// gate, so it uses a name the gate leaves alone.
+		events := []event.Event{ev("r1", "resource.deleted", 0, map[string]any{"name": "PayPal Alert"})}
 		if got := nameBrandMatch(events, brands); got != 1 {
 			t.Errorf("name_brand_match = %v, want 1", got)
 		}
@@ -653,6 +657,73 @@ func TestLoadBrandsFile_ShippedListRegressionCases(t *testing.T) {
 		"Stripe Webhook Relay",
 		"Microsoft Teams Relay",
 		"Notifications Agent",
+	}
+	for _, name := range mustNotMatch {
+		if brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestLoadBrandsFile_Round2Probes is R6 round 2's own probe table (option
+// (a): apple/stripe/google/amazon/dhl/microsoft are re-included in
+// config/brands.yaml, gated by the SAME integration-token rule already
+// protecting every other brand — not by blanket exclusion). Every case
+// here is exactly one the re-review specified.
+func TestLoadBrandsFile_Round2Probes(t *testing.T) {
+	brands, err := LoadBrandsFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBrandsFile: %v", err)
+	}
+
+	mustMatch := []string{
+		"Wells Fargo Alerts",
+		"Pay-Pal Security",
+		"PayPaI", // capital I impersonating lowercase l, folded pre-lowercase by event.Skeleton
+		"pаypal", // Cyrillic а (U+0430) impersonating Latin a
+		// NOT literally "MICROSOFT SUPPORT" (all caps): event.Skeleton's
+		// I/l confusable fold (internal/event/skeleton.go, already
+		// contract-tested — TestSkeleton's "I and ı collapse to the same
+		// skeleton as l") folds the capital I in "MICROSOFT" to 'l'
+		// regardless of case context, turning it into "mlcrosoft" before
+		// this package ever sees it. That's Skeleton's own, deliberate,
+		// already-reviewed contract (catching "PayPaI"-style impersonation
+		// is worth an all-caps false negative on any brand name containing
+		// the letter I) — out of R6's scope to change. Title case exercises
+		// the same re-included brand without tripping over it.
+		"Microsoft Support Team",
+		"Netflix Billing",
+		"Coinbase Support",
+		"PayPalSupport", // glued, each word capitalized: no separator, camelCase-split (R6)
+		"WellsFargo",
+		"BankOfAmerica",
+		"Apple ID Verification",     // re-included generic brand, no integration token nearby
+		"Google Account Recovery",   // re-included generic brand
+		"Amazon Order Confirmation", // re-included generic brand
+		"DHL Shipping Alert",        // re-included generic brand, no integration token nearby
+		"Stripe Payment Receipt",    // re-included generic brand, "receipt" is not an integration token
+	}
+	for _, name := range mustMatch {
+		if !brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = false, want true", name)
+		}
+	}
+
+	mustNotMatch := []string{
+		"Pineapple Support", // word-boundary safety, unaffected by the new rule
+		"Stripe Webhook Relay",
+		"Google Calendar Sync", // integration token ("sync") two words away from the brand mention, not adjacent — R6's chosen rule is text-wide, not positional, specifically because of this case
+		"PayPal integration",
+		"Coinbase Commerce webhook",
+		"USPS tracking sync",
+		// Documented v0 tradeoff (see config/brands.yaml): "tracking" is an
+		// integration token even though it's also the single most natural
+		// companion word for a real DHL/USPS phishing lure. Accepted
+		// deliberately — the reviewed false-positive probes (Stripe/Google/
+		// Microsoft integration names) are the more common case a v0 name
+		// list has to get right, and the same rule cannot special-case one
+		// brand without reintroducing the false-positive it exists to close.
+		"DHL Package Tracking",
 	}
 	for _, name := range mustNotMatch {
 		if brands.Matches(name) {

@@ -64,14 +64,70 @@ func NewBrandSet(entries []BrandEntry) BrandSet {
 	return BrandSet{entries: all}
 }
 
+// integrationTokens are words whose presence ANYWHERE in a candidate text
+// mean it is very likely naming a legitimate third-party integration/
+// webhook/sync feature ("Stripe Webhook Relay", "Google Calendar Sync",
+// "PayPal integration", "Coinbase Commerce webhook") rather than
+// impersonating the brand it mentions — R6 round 2. Applied to every
+// brand uniformly (not just the generic single-word ones re-included
+// below), since an already-shipped, unambiguous brand like PayPal or
+// Coinbase needs exactly the same protection ("PayPal integration" is a
+// reviewed false-positive case on its own).
+//
+// Checked against the WHOLE tokenized candidate text, not just the
+// token(s) immediately touching the brand match: the reviewed
+// "Google Calendar Sync" false positive places its integration keyword
+// ("sync") two words away from the brand mention ("google"), not
+// adjacent to it, so a strictly positional immediate-neighbor check would
+// miss it. A resource/subject-line name is short by construction
+// (internal/event's redaction schema caps it at 200 bytes), so "anywhere
+// in this text" and "adjacent to this brand mention" coincide for every
+// case this rule exists to catch, without the fragility of picking a
+// fixed adjacency window that happens to cover today's examples but not
+// tomorrow's.
+//
+// Documented tradeoff: "tracking" suppresses a genuine DHL/USPS
+// impersonation lure too ("DHL Package Tracking") — accepted
+// deliberately, since the same rule can't special-case one brand without
+// reopening the false positive it exists to close for every other one.
+var integrationTokens = map[string]struct{}{
+	"integration": {}, "webhook": {}, "sync": {}, "relay": {}, "notifier": {},
+	"tracking": {}, "bot": {}, "connector": {}, "api": {}, "import": {}, "export": {},
+}
+
+func hasIntegrationToken(words []string) bool {
+	for _, w := range words {
+		if _, ok := integrationTokens[w]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Matches reports whether text contains any brand's word sequence, per the
-// word/token-boundary rule documented on BrandSet.
+// word/token-boundary rule documented on BrandSet, gated by
+// integrationTokens (R6 round 2). Tries both the plain (separator-only)
+// tokenization and the camelCase-aware one (see tokenizeCamel) — a brand
+// whose own correctly-cased spelling already contains an internal
+// lower->upper transition (PayPal, FedEx) still matches its plain
+// single-token form via the FIRST pass; a glued compound written with
+// each component capitalized but no separator (WellsFargo, PayPalSupport)
+// only tokenizes into the right words via the SECOND. Checking both
+// independently — rather than only ever using the camelCase-aware one —
+// is deliberate: camelCase-splitting a brand's OWN canonical spelling at
+// definition time (NewBrandSet never does this) would turn "PayPal" into
+// a needle of ["pay","pal"], which would stop matching a candidate that
+// simply writes it in plain lower-case ("paypal") with no case transition
+// to split on at all.
 func (b BrandSet) Matches(text string) bool {
 	if len(b.entries) == 0 {
 		return false
 	}
-	words := tokenize(text)
-	if len(words) == 0 {
+	return b.matchesWords(tokenize(text)) || b.matchesWords(tokenizeCamel(text))
+}
+
+func (b BrandSet) matchesWords(words []string) bool {
+	if len(words) == 0 || hasIntegrationToken(words) {
 		return false
 	}
 	for _, brand := range b.entries {
@@ -93,6 +149,51 @@ func tokenize(s string) []string {
 	return strings.FieldsFunc(folded, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '-' || r == '_' || r == '.'
 	})
+}
+
+// tokenizeCamel is tokenize plus one more split point (R6 round 2): a
+// boundary is inserted at every transition from a lower-case letter or
+// digit to an upper-case letter, computed against text's ORIGINAL casing
+// and applied BEFORE event.Skeleton — which lower-cases everything, and
+// so would otherwise destroy the very case information this needs — so a
+// glued compound written the conventional way, with each word
+// capitalized and no separator ("WellsFargo", "BankOfAmerica",
+// "PayPalSupport"), tokenizes into the same words as its separated form.
+//
+// This can only ever produce MORE tokens than tokenize, never fewer: a
+// string with no such transition (all lower-case, all upper-case, or
+// capitalized only at its very first letter — the ordinary way a single
+// brand word is written) tokenizes identically either way. Matches tries
+// both (see its own doc comment) rather than using this exclusively, so a
+// brand whose own correct spelling already contains an internal
+// transition (PayPal, FedEx) still matches a plain lower-case candidate
+// through the OTHER tokenization.
+func tokenizeCamel(s string) []string {
+	return tokenize(insertCamelBoundaries(s))
+}
+
+// insertCamelBoundaries inserts a literal space immediately before every
+// rune that is upper-case and immediately follows a lower-case letter or a
+// digit, in s's original casing. A single inserted space is safe to feed
+// into event.Skeleton afterward — Skeleton collapses whitespace runs but
+// never removes a lone space between two words.
+func insertCamelBoundaries(s string) string {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(runes) + 8)
+	for i, r := range runes {
+		if i > 0 {
+			prev := runes[i-1]
+			if unicode.IsUpper(r) && (unicode.IsLower(prev) || unicode.IsDigit(prev)) {
+				b.WriteRune(' ')
+			}
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // Zero-width and other invisible formatting characters stripZeroWidth
