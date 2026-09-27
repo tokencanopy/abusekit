@@ -727,17 +727,6 @@ func TestLoadBrandsFile_Round2Probes(t *testing.T) {
 		"Pay-Pal Security",
 		"PayPaI", // capital I impersonating lowercase l, folded pre-lowercase by event.Skeleton
 		"pаypal", // Cyrillic а (U+0430) impersonating Latin a
-		// NOT literally "MICROSOFT SUPPORT" (all caps): event.Skeleton's
-		// I/l confusable fold (internal/event/skeleton.go, already
-		// contract-tested — TestSkeleton's "I and ı collapse to the same
-		// skeleton as l") folds the capital I in "MICROSOFT" to 'l'
-		// regardless of case context, turning it into "mlcrosoft" before
-		// this package ever sees it. That's Skeleton's own, deliberate,
-		// already-reviewed contract (catching "PayPaI"-style impersonation
-		// is worth an all-caps false negative on any brand name containing
-		// the letter I) — out of R6's scope to change. Title case exercises
-		// the same re-included brand without tripping over it.
-		"Microsoft Support Team",
 		"Netflix Billing",
 		"Coinbase Support",
 		"PayPalSupport", // glued, each word capitalized: no separator, camelCase-split (R6)
@@ -774,6 +763,59 @@ func TestLoadBrandsFile_Round2Probes(t *testing.T) {
 	for _, name := range mustNotMatch {
 		if brands.Matches(name) {
 			t.Errorf("brands.Matches(%q) = true, want false", name)
+		}
+	}
+}
+
+// TestLoadBrandsFile_Round3Probes is D1 round 3. Proven: event.Skeleton
+// folds an upper-case "I" to 'l' pre-lowercase (catching "PayPaI"-style
+// impersonation), but a brand definition written in its natural mixed
+// case ("Microsoft", "Netflix", "Coinbase", "Binance", "Bank of America")
+// has a LOWER-case "i", which Skeleton never touches — so an all-caps
+// candidate mention of the identical brand ("MICROSOFT SUPPORT") folds
+// its (now upper-case) I to 'l' while the brand definition never does,
+// and the two sides silently diverge. Every one of these five brands has
+// an 'i' in its name for exactly this reason. Fixed by folding every
+// remaining 'i' (canonicalise, brand.go) identically on both sides — and
+// on config/brands.yaml's own examples, none of which happen to contain
+// "i" (PayPal, Wells Fargo, Walmart, USPS, FedEx, Apple, Stripe, Google,
+// Amazon, DHL), which is exactly why the original S3/R6 rounds never
+// noticed this class of bug at all.
+func TestLoadBrandsFile_Round3Probes(t *testing.T) {
+	brands, err := LoadBrandsFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBrandsFile: %v", err)
+	}
+
+	mustMatch := []string{
+		"MICROSOFT SUPPORT",
+		"NETFLIX BILLING",
+		"COINBASE SUPPORT",
+		"BINANCE SECURITY",
+		"BANK OF AMERICA ALERT",
+	}
+	for _, name := range mustMatch {
+		if !brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = false, want true", name)
+		}
+	}
+
+	// Every existing round-1/round-2 probe (word-boundary safety,
+	// glued/camelCase compounds, and — most importantly — the
+	// integration-token gate) must keep passing: the naive fix (folding
+	// 'i' only in Matches' own candidate path, or only in brand
+	// definitions) broke the integration-gate tests, which is why D1
+	// requires canonicalise() to also rebuild integrationTokens itself.
+	mustNotMatch := []string{
+		"PAYPAL INTEGRATION",
+		"STRIPE WEBHOOK RELAY",
+		"MICROSOFT TEAMS RELAY",
+		"USPS TRACKING SYNC",
+		"COINBASE COMMERCE WEBHOOK",
+	}
+	for _, name := range mustNotMatch {
+		if brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = true, want false (integration-token gate must still fire after the i-fold)", name)
 		}
 	}
 }

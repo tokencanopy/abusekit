@@ -148,13 +148,47 @@ func TestLoadBrandsFile_MissingFile(t *testing.T) {
 	}
 }
 
+// TestCanonicalise is D1 round 3's own unit test for the shared fold: it
+// must fold every "i" (already lower-cased by the time tokenize calls it)
+// to 'l', with no other side effects.
+func TestCanonicalise(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"microsoft", "mlcrosoft"},
+		{"integration", "lntegratlon"},
+		{"america", "amerlca"},
+		{"paypal", "paypal"}, // no "i" at all: unchanged
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := canonicalise(tt.in); got != tt.want {
+			t.Errorf("canonicalise(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestBuildIntegrationTokens confirms integrationTokens is built THROUGH
+// canonicalise, not from its own hand-typed already-folded strings (D1
+// round 3) — so an all-caps candidate word that tokenize() also
+// canonicalises ("INTEGRATION" -> "lntegratlon") is recognized.
+func TestBuildIntegrationTokens(t *testing.T) {
+	for _, raw := range integrationTokenWords {
+		folded := canonicalise(raw)
+		if _, ok := integrationTokens[folded]; !ok {
+			t.Errorf("integrationTokens is missing %q (canonicalised from %q)", folded, raw)
+		}
+	}
+	if _, ok := integrationTokens["lntegratlon"]; !ok {
+		t.Errorf(`integrationTokens["lntegratlon"] missing — an all-caps "INTEGRATION" candidate would bypass the gate`)
+	}
+}
+
 func TestTokenizeCamel(t *testing.T) {
 	tests := []struct {
 		in   string
 		want []string
 	}{
 		{"WellsFargo", []string{"wells", "fargo"}},
-		{"BankOfAmerica", []string{"bank", "of", "america"}},
+		{"BankOfAmerica", []string{"bank", "of", "amerlca"}}, // canonicalise (D1 round 3) folds the remaining lower-case i in "america" too — see TestCanonicalise
 		{"PayPalSupport", []string{"pay", "pal", "support"}},
 		{"paypal", []string{"paypal"}},              // all lowercase: no transition, unchanged
 		{"Paypal", []string{"paypal"}},              // capitalized only at the start: no INTERNAL transition

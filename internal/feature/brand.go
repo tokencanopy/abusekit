@@ -90,9 +90,28 @@ func NewBrandSet(entries []BrandEntry) BrandSet {
 // impersonation lure too ("DHL Package Tracking") — accepted
 // deliberately, since the same rule can't special-case one brand without
 // reopening the false positive it exists to close for every other one.
-var integrationTokens = map[string]struct{}{
-	"integration": {}, "webhook": {}, "sync": {}, "relay": {}, "notifier": {},
-	"tracking": {}, "bot": {}, "connector": {}, "api": {}, "import": {}, "export": {},
+//
+// integrationTokenWords lists each word in its natural spelling;
+// integrationTokens (built by buildIntegrationTokens, below) canonicalises
+// every one of them the IDENTICAL way tokenize() canonicalises brand
+// definitions and candidates (D1 round 3) — otherwise an all-caps
+// candidate ("PAYPAL INTEGRATION") folds its own "INTEGRATION" to
+// "lntegratlon" (event.Skeleton's I->l fold) while this map's hand-typed
+// "integration" key never would, letting the gate silently miss its own
+// all-caps obfuscation.
+var integrationTokenWords = []string{
+	"integration", "webhook", "sync", "relay", "notifier",
+	"tracking", "bot", "connector", "api", "import", "export",
+}
+
+var integrationTokens = buildIntegrationTokens()
+
+func buildIntegrationTokens() map[string]struct{} {
+	out := make(map[string]struct{}, len(integrationTokenWords))
+	for _, w := range integrationTokenWords {
+		out[canonicalise(w)] = struct{}{}
+	}
+	return out
 }
 
 func hasIntegrationToken(words []string) bool {
@@ -140,15 +159,44 @@ func (b BrandSet) matchesWords(words []string) bool {
 
 // tokenize folds s through event.Skeleton (NFKC, confusables, lower-case,
 // whitespace-collapse), strips zero-width characters Skeleton doesn't
-// touch, and splits on whitespace plus the common name-obfuscation
-// separators hyphen/underscore/period, dropping empty tokens. "pay-pal",
-// "pay_pal", "pay.pal" and "pay pal" all tokenize identically to
-// ["pay","pal"].
+// touch, canonicalises the I/l confusable the rest of the way (see
+// canonicalise), and splits on whitespace plus the common
+// name-obfuscation separators hyphen/underscore/period, dropping empty
+// tokens. "pay-pal", "pay_pal", "pay.pal" and "pay pal" all tokenize
+// identically to ["pay","pal"].
+//
+// This is the SAME function NewBrandSet uses to tokenize every brand
+// definition and Matches uses to tokenize every candidate — canonicalise
+// is applied to both sides identically for exactly that reason (D1 round
+// 3): a fold that only ran on one side (or was hand-applied ad hoc to
+// integrationTokens' literal strings instead of through this shared
+// path) silently reintroduced the exact divergence it was meant to close.
 func tokenize(s string) []string {
-	folded := stripZeroWidth(event.Skeleton(s))
+	folded := canonicalise(stripZeroWidth(event.Skeleton(s)))
 	return strings.FieldsFunc(folded, func(r rune) bool {
 		return unicode.IsSpace(r) || r == '-' || r == '_' || r == '.'
 	})
+}
+
+// canonicalise folds every remaining lower-case "i" to 'l' (D1 round 3).
+// event.Skeleton already folds an UPPER-case "I" (and dotless "ı") to 'l'
+// pre-lowercase, specifically to catch "PayPaI"-style impersonation — but
+// it never touches an ORDINARY lower-case "i", since by itself that's
+// just a letter, not a lookalike. That asymmetry is exactly the bug this
+// closes: a brand written in its natural mixed-case spelling
+// ("Microsoft", "Netflix", "Coinbase", "Binance", "Bank of America" — all
+// with a lower-case i) tokenizes with that i untouched, while the
+// IDENTICAL brand mentioned in a candidate written in ALL CAPS
+// ("MICROSOFT SUPPORT") has its i already folded to 'l' by Skeleton
+// before this ever runs — so the two sides silently diverged. Folding
+// every remaining i to 'l' here, on BOTH sides (brand definitions via
+// NewBrandSet, candidates via Matches, and integrationTokens via
+// buildIntegrationTokens — all three go through this same function),
+// makes them converge again: "integration" and an all-caps candidate's
+// "INTEGRATION" (which Skeleton already turns into "lntegratlon") now
+// compare equal too.
+func canonicalise(s string) string {
+	return strings.ReplaceAll(s, "i", "l")
 }
 
 // tokenizeCamel is tokenize plus one more split point (R6 round 2): a
