@@ -116,6 +116,22 @@ func TestEvent_Validate(t *testing.T) {
 			mutate:   func(e *Event) { e.Subject = "acct_\x07_bad" },
 			wantCode: CodeBadSubject,
 		},
+		// S6: design says `at` is "RFC3339 UTC" — a non-zero offset is
+		// rejected outright rather than silently accepted (see
+		// TestEvent_BodyHash_NormalizesTimezoneOffset for why a mixed
+		// Z/+02:00 representation of the SAME instant is dangerous if it
+		// slipped past Validate: it would hash differently and a replay
+		// would be misreported as `conflict` instead of `duplicate`).
+		{
+			name:     "non-UTC offset is rejected",
+			mutate:   func(e *Event) { e.At = now.Add(-time.Minute).In(time.FixedZone("", 2*60*60)) },
+			wantCode: CodeBadTimestamp,
+		},
+		{
+			name:   "UTC (zero offset, non-nil FixedZone) is ok",
+			mutate: func(e *Event) { e.At = now.Add(-time.Minute).In(time.FixedZone("", 0)) },
+			wantOK: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -176,5 +192,33 @@ func TestEvent_BodyHash(t *testing.T) {
 	}
 	if len(h1) != 64 {
 		t.Errorf("expected 64 hex chars (sha256), got %d", len(h1))
+	}
+}
+
+// TestEvent_BodyHash_NormalizesTimezoneOffset is S6. Proven: the same
+// instant represented as "...Z" vs "...+02:00" hashed differently (Go's
+// time.Time.MarshalJSON renders in whatever offset the value carries), so
+// a replay of the identical event using a different (but equally valid,
+// pre-Validate) offset representation was misreported as `conflict`
+// instead of `duplicate`. BodyHash normalizes to UTC before hashing as a
+// defense-in-depth measure independent of Validate's own rejection of a
+// non-UTC offset (see TestEvent_Validate's "non-UTC offset is rejected").
+func TestEvent_BodyHash_NormalizesTimezoneOffset(t *testing.T) {
+	utc := mustTime(t, "2031-01-01T10:00:00Z")
+	sameInstantOffset := utc.In(time.FixedZone("", 2*60*60)) // same instant, +02:00 representation
+
+	e1 := Event{Subject: "s1", Type: "subject.created", At: utc, Data: map[string]any{"channel": "api"}}
+	e2 := Event{Subject: "s1", Type: "subject.created", At: sameInstantOffset, Data: map[string]any{"channel": "api"}}
+
+	h1, err := e1.BodyHash()
+	if err != nil {
+		t.Fatalf("BodyHash (UTC): %v", err)
+	}
+	h2, err := e2.BodyHash()
+	if err != nil {
+		t.Fatalf("BodyHash (+02:00): %v", err)
+	}
+	if h1 != h2 {
+		t.Fatalf("expected the same instant to hash identically regardless of timezone offset representation: %s != %s", h1, h2)
 	}
 }

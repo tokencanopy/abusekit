@@ -169,6 +169,16 @@ func (e *Event) Validate(opts ValidateOptions) error {
 	if e.At.IsZero() {
 		return badErr(CodeBadTimestamp, "at is required and must be RFC3339 UTC")
 	}
+	// S6: design says `at` is "RFC3339 UTC", not merely RFC3339 — reject a
+	// non-zero offset outright rather than silently accepting it. Without
+	// this, the SAME instant sent as "...Z" vs "...+02:00" round-trips
+	// through Go's time.Time with different Location metadata and hashes
+	// differently in BodyHash (proven: misreported as `conflict` instead
+	// of `duplicate`); rejecting at the boundary is simpler and safer than
+	// relying on every downstream consumer to normalize consistently.
+	if _, offset := e.At.Zone(); offset != 0 {
+		return badErr(CodeBadTimestamp, "at must be UTC (zero offset), e.g. \"...Z\", not a non-zero offset")
+	}
 	if !opts.Backfill {
 		now := opts.Now
 		if now.IsZero() {
@@ -199,13 +209,18 @@ func (e *Event) Validate(opts ValidateOptions) error {
 // has already dropped anything unlisted). json.Marshal serializes map
 // keys in sorted order, so the digest is stable across Go map iteration.
 func (e *Event) BodyHash() (string, error) {
+	// S6: normalize to UTC before hashing, defense-in-depth alongside
+	// Validate's own rejection of a non-UTC offset — a caller that builds
+	// an Event directly without going through Validate (some store tests
+	// do this deliberately) still gets a hash that depends only on the
+	// instant, never on which equivalent offset representation was used.
 	b, err := json.Marshal(struct {
 		Subject string         `json:"subject"`
 		Type    string         `json:"type"`
 		At      time.Time      `json:"at"`
 		Links   Links          `json:"links"`
 		Data    map[string]any `json:"data"`
-	}{e.Subject, e.Type, e.At, e.Links, e.Data})
+	}{e.Subject, e.Type, e.At.UTC(), e.Links, e.Data})
 	if err != nil {
 		return "", err
 	}
