@@ -405,7 +405,16 @@ the resolved features/text/labels — so a scorer upgrade, a newly fitted calibr
   retried once the day rolled over. Window-exit candidates only consider event types a windowed
   feature actually reads, and are coalesced to 5-minute buckets — proven, an uncoalesced burst of
   60 sends in quick succession scheduled 60 nearly-simultaneous separate rescores instead of one
-  shared one.
+  shared one. **[S2, round 2]** Accepted tradeoff: for a genuinely future-dated event (a backfill or
+  a clock-skewed producer, §5's ±24 h allowance), this same coalescing can add up to 5 minutes of
+  delay after the burst it's tracking actually lands, on top of the event's own timestamp — e.g. an
+  event dated exactly on a 5-minute boundary schedules its rescore for the boundary AFTER that (never
+  the event's own instant), and a slightly-later event in the same burst coalesces onto whichever
+  boundary is next, not necessarily the nearest one to when it individually arrives. Scheduling the
+  exact enter time instead (dropping coalescing for future-dated candidates specifically) would
+  reintroduce a version of the original "60 nearly-simultaneous rescores" problem for a producer that
+  backfills many future-dated events at once, for a bound (≤5 minutes, once) that's already small
+  relative to the 1 h/24 h windows every rate feature reads. Left as-is.
 - **Rule state:** `rule_state(subject, rule, attempts, retry_at, last_error)`; backoff 30 s, 2 m,
   5 m, capped at 15 m; a subject with any advise rule in backoff serves `degraded:true`. **[S2]** A
   whole-pass failure (the extractor or a store call erroring, as opposed to one rule's scorer)
