@@ -68,6 +68,15 @@ func (w Weights) Validate() error {
 type Scorer struct {
 	weights    Weights
 	checkpoint string
+	// sortedFeatures is s.weights.Weight's keys, sorted once at
+	// construction (S10): Score must sum weight*feature in a fixed order
+	// — ranging over the map directly is non-deterministic (Go
+	// deliberately randomizes map iteration order, even across repeated
+	// range statements over the identical map), and floating-point
+	// addition is not associative, so an unfixed order can silently
+	// produce a different risk for the identical feature vector from one
+	// call to the next.
+	sortedFeatures []string
 }
 
 // New builds the local Scorer from an already-parsed Weights value (see
@@ -82,7 +91,12 @@ func New(w Weights) (*Scorer, error) {
 	if cp == "" {
 		cp = defaultCheckpoint
 	}
-	return &Scorer{weights: w, checkpoint: cp}, nil
+	sortedFeatures := make([]string, 0, len(w.Weight))
+	for f := range w.Weight {
+		sortedFeatures = append(sortedFeatures, f)
+	}
+	sort.Strings(sortedFeatures)
+	return &Scorer{weights: w, checkpoint: cp, sortedFeatures: sortedFeatures}, nil
 }
 
 func (s *Scorer) Name() string { return "local" }
@@ -178,8 +192,8 @@ func (s *Scorer) Score(ctx context.Context, req model.ScoreRequest) (model.Score
 	}
 
 	linear := s.weights.Bias
-	for feature, weight := range s.weights.Weight {
-		linear += weight * req.Features[feature]
+	for _, feature := range s.sortedFeatures {
+		linear += s.weights.Weight[feature] * req.Features[feature]
 	}
 	pNonBenign := sigmoid(linear)
 	pBenign := 1 - pNonBenign

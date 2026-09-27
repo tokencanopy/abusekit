@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"runtime"
@@ -148,6 +149,51 @@ func TestVersion_DeterministicForIdenticalWeights(t *testing.T) {
 	}
 	if s1.Version() != s2.Version() {
 		t.Fatalf("expected Version() to be deterministic for identical weights: %q != %q", s1.Version(), s2.Version())
+	}
+}
+
+// TestScore_DeterministicAcrossManyRandomFeatureMaps is S10. Score summed
+// weight*feature by ranging over the weights map directly, whose
+// iteration order Go deliberately randomizes on every `range` statement —
+// even across separate calls over the exact same map object.
+// Floating-point addition is not associative: summing (+1e16, -1e16, +1)
+// as (+1e16 + -1e16) + 1 = 1, but as (+1e16 + 1) + -1e16 = 0 (the "+1"
+// gets rounded away while the running total is ~1e16, then the big terms
+// cancel) — so an unfixed summation order can silently produce a
+// different risk for the identical feature vector, call to call. 20
+// independent adversarial triples (each engineered exactly this way, with
+// distinct feature names so their map bucket placement differs) scored 3
+// times each gives many chances for Go's randomized map order to expose
+// this if Score doesn't force a deterministic (sorted-key) summation
+// order.
+func TestScore_DeterministicAcrossManyRandomFeatureMaps(t *testing.T) {
+	const nTriples = 20
+	weight := make(map[string]float64, nTriples*3)
+	features := make(map[string]float64, nTriples*3)
+	for i := 0; i < nTriples; i++ {
+		big, negBig, small := fmt.Sprintf("big%02d", i), fmt.Sprintf("negbig%02d", i), fmt.Sprintf("small%02d", i)
+		weight[big], weight[negBig], weight[small] = 1e16, -1e16, 1
+		features[big], features[negBig], features[small] = 1, 1, 1
+	}
+	s, err := New(Weights{BenignLabel: "benign", Bias: 0, Weight: weight})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := model.ScoreRequest{Labels: []string{"benign", "abusive"}, Features: features}
+
+	var first float64
+	for c := 0; c < 3; c++ {
+		res, err := s.Score(context.Background(), req)
+		if err != nil {
+			t.Fatalf("Score (call %d): %v", c, err)
+		}
+		if c == 0 {
+			first = res.Probs["benign"]
+			continue
+		}
+		if res.Probs["benign"] != first {
+			t.Fatalf("non-deterministic Score for an identical feature map: call 0 -> %v, call %d -> %v", first, c, res.Probs["benign"])
+		}
 	}
 }
 
