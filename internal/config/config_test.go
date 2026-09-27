@@ -823,3 +823,25 @@ vendors:
 		})
 	}
 }
+
+// TestLoadVendors_RejectsUnknownPolicyField is R6 (round 2): strict
+// decoding (KnownFields) so a misspelled policy key (e.g. "allow_text"
+// instead of "allows_text") fails the load instead of silently leaving
+// the real field at its zero value (false) — a vendor that DOES allow
+// text would load as if it didn't, and the loader's own AllowsText check
+// elsewhere would then wrongly reject a rule sending it text.
+func TestLoadVendors_RejectsUnknownPolicyField(t *testing.T) {
+	yaml := `
+vendors:
+  - name: local
+    terms_version: "n/a"
+    dpa_ref: "n/a"
+    policy:
+      allow_text: false
+      retains_inputs: false
+      trains_on_inputs: false
+`
+	if _, err := config.LoadVendors([]byte(yaml)); err == nil {
+		t.Fatalf("expected an error for a misspelled policy field")
+	}
+}

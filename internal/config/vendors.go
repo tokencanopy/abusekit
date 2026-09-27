@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 
 	"gopkg.in/yaml.v3"
@@ -34,7 +35,15 @@ type rawVendor struct {
 // for the same adapter is a data-governance bug, not a config choice.
 func LoadVendors(data []byte) (map[string]VendorEntry, error) {
 	var raw rawVendors
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	// R6 (round 2): strict decoding (KnownFields) so a misspelled policy
+	// key (e.g. "allow_text" instead of "allows_text") fails the load
+	// instead of silently leaving the real field at its zero value
+	// (false) — a vendor that DOES allow text would load as if it
+	// didn't, and the config loader's own AllowsText check would then
+	// wrongly reject a rule sending it text.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("config: parse vendors yaml: %w", err)
 	}
 	out := make(map[string]VendorEntry, len(raw.Vendors))
