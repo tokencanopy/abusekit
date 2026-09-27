@@ -1,13 +1,14 @@
 // Command abusekit is the single binary that runs abusekit (design §2:
 // "One Go binary; Postgres").
 //
-// S1 wires up the store and config layers behind two subcommands; the
-// HTTP surface (`serve`'s actual `/v1/*` handlers) is S3's job. Until
-// then, `serve` only supports `--check` (S17): it boots exactly what a
-// real server would need at startup — a validated rule config, then a
-// migrated database — and exits 0. Without `--check` it returns an
-// explicit "not implemented yet" error rather than blocking on a signal
-// with nothing actually listening.
+// S1 wired up the store and config layers behind two subcommands with
+// `serve --check` only. S2's fix round (S9) now also wires up and runs the
+// SCORING LOOP itself (internal/worker) under plain `serve` — it finds
+// dirty subjects, scores them, and commits verdicts, entirely without an
+// HTTP listener. The `/v1/*` HTTP surface is still S3's job; `serve`
+// without --check runs the worker standing, blocking on SIGINT/SIGTERM,
+// with nothing yet listening on a port. `serve --check` is unaffected: it
+// still only validates config and migrates the database, then exits 0.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -26,6 +28,7 @@ import (
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/local"
 	"github.com/tokencanopy/abusekit/internal/store"
+	"github.com/tokencanopy/abusekit/internal/worker"
 )
 
 func main() {
@@ -55,6 +58,7 @@ type serveConfig struct {
 	rulesPath   string
 	vendorsPath string
 	weightsPath string
+	brandsPath  string
 }
 
 func parseServeFlags(args []string) (serveConfig, error) {
@@ -65,6 +69,7 @@ func parseServeFlags(args []string) (serveConfig, error) {
 	fs.StringVar(&c.rulesPath, "rules", envOr("ABUSEKIT_RULES_CONFIG", "config/rules.yaml"), "path to rules.yaml")
 	fs.StringVar(&c.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&c.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
+	fs.StringVar(&c.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
 	if err := fs.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
@@ -81,66 +86,107 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// runServe implements the `serve` subcommand (S1 scope: config
-// validation and a migrated database, nothing more — the real HTTP
-// surface arrives in S3). S17: `serve` without --check is no longer a
-// blocking placeholder loop that waits on SIGINT/SIGTERM for no reason;
-// there is nothing to serve yet, so it's an explicit error instead.
+// runServe implements the `serve` subcommand: parse flags, then derive a
+// SIGINT/SIGTERM-cancelable context (S17) for runServeWithContext.
 func runServe(args []string) error {
 	c, err := parseServeFlags(args)
 	if err != nil {
 		return err
 	}
-	if !c.check {
-		return errors.New("abusekit: serve is not implemented yet without --check (the HTTP surface arrives in S3); pass --check to validate startup and exit")
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	return runServeWithContext(ctx, c)
+}
 
-	s, _, err := boot(ctx, c)
+// runServeWithContext is runServe's body, factored out (matching
+// runMigrate/runMigrateWithContext's existing pattern) so a test can drive
+// it with a context it controls directly, instead of needing a real OS
+// signal to ever make the non-check path return.
+//
+// `--check` (S17) only validates config and migrates the database, then
+// exits 0 — unaffected by S9's worker wiring below. Without --check (S9
+// fix round), it boots the same way and then runs internal/worker's
+// scoring loop standing until ctx is done; Stop() (which cancels and
+// WAITS — see Worker.Stop's doc comment) runs before this function
+// returns, so a caller can rely on the worker having actually stopped
+// touching the store by the time it does. The `/v1/*` HTTP surface itself
+// is still S3's job — nothing here listens on a port.
+func runServeWithContext(ctx context.Context, c serveConfig) error {
+	s, cfg, deps, err := boot(ctx, c)
 	if err != nil {
 		return err
 	}
 	defer s.Close() // S17: close on every exit path, including this success one
 
-	fmt.Println("abusekit: store migrated, config valid (S1 placeholder — HTTP surface arrives in S3)")
+	if c.check {
+		fmt.Println("abusekit: store migrated, config valid")
+		return nil
+	}
+
+	w, err := worker.New(worker.Deps{
+		Store:     s,
+		Config:    cfg,
+		Neighbors: deps.neighbors,
+		Brands:    deps.brands,
+		Metrics:   deps.metrics,
+		Logger:    slog.Default(),
+	})
+	if err != nil {
+		return fmt.Errorf("construct worker: %w", err)
+	}
+
+	fmt.Println("abusekit: worker running (no HTTP surface yet — that's S3); press Ctrl-C to stop")
+	w.Start(ctx)
+	// Start returns once ctx is done; Stop is still safe (and a no-op
+	// beyond releasing state, since Start already returned) to call here
+	// for symmetry with a caller that constructs a Worker and drives
+	// Start/Stop itself.
+	w.Stop()
+	fmt.Println("abusekit: worker stopped")
 	return nil
 }
 
-// boot performs the startup sequence real `serve` (S3) will also need:
-// build the scorer registry (local only in S1), load + validate the rule
-// config against it, and only THEN connect to and migrate the store
-// (S17) — a bad rules/vendors/weights file fails fast without ever
-// touching Postgres, rather than migrating a database it's about to
-// report as unusable anyway. Returns both so a future `serve` can keep
-// using them; S1's caller only needs to know whether it succeeded.
-func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, error) {
+// bootDeps are the pieces of boot's startup sequence that only `serve`
+// (not `serve --check` or `migrate`) needs to go on and construct a
+// worker.Worker from.
+type bootDeps struct {
+	neighbors feature.Neighbors
+	brands    feature.BrandSet
+	metrics   *worker.Metrics
+}
+
+// boot performs the startup sequence every `serve` invocation needs:
+// build the scorer registry (local only in S1/S2), load + validate the
+// rule config against it, load the brand list (S3 fix round), and only
+// THEN connect to and migrate the store (S17) — a bad rules/vendors/
+// weights/brands file fails fast without ever touching Postgres, rather
+// than migrating a database it's about to report as unusable anyway.
+func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, bootDeps, error) {
 	weights, err := local.LoadWeightsFile(c.weightsPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, bootDeps{}, err
 	}
 	localScorer, err := local.New(weights)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, bootDeps{}, err
 	}
 	registry := model.NewRegistry()
 	if err := registry.Register(localScorer); err != nil {
-		return nil, nil, err
+		return nil, nil, bootDeps{}, err
 	}
 
 	vendorsData, err := os.ReadFile(c.vendorsPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read vendors config: %w", err)
+		return nil, nil, bootDeps{}, fmt.Errorf("read vendors config: %w", err)
 	}
 	vendors, err := config.LoadVendors(vendorsData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, bootDeps{}, err
 	}
 
 	rulesData, err := os.ReadFile(c.rulesPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read rules config: %w", err)
+		return nil, nil, bootDeps{}, fmt.Errorf("read rules config: %w", err)
 	}
 	cfg, err := config.Load(rulesData, config.Dependencies{
 		Registry: registry,
@@ -148,20 +194,31 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, err
 		Vendors:  vendors,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("load rules config: %w", err)
+		return nil, nil, bootDeps{}, fmt.Errorf("load rules config: %w", err)
+	}
+
+	brands, err := feature.LoadBrandsFile(c.brandsPath)
+	if err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("load brands config: %w", err)
 	}
 
 	pool, err := pgxpool.New(ctx, c.databaseURL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("connect to database: %w", err)
+		return nil, nil, bootDeps{}, fmt.Errorf("connect to database: %w", err)
 	}
 	s := store.New(pool)
 	if err := s.ApplyMigrations(ctx); err != nil {
 		pool.Close()
-		return nil, nil, fmt.Errorf("apply migrations: %w", err)
+		return nil, nil, bootDeps{}, fmt.Errorf("apply migrations: %w", err)
 	}
 
-	return s, cfg, nil
+	metrics := worker.NewMetrics()
+	deps := bootDeps{
+		neighbors: feature.NewStoreNeighbors(s, feature.Config{}), // default link-kind policy (S1 fix round) until a tenant-specific override exists
+		brands:    brands,
+		metrics:   metrics,
+	}
+	return s, cfg, deps, nil
 }
 
 // runMigrate handles SIGINT/SIGTERM (S17): a long-running migration
