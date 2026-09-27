@@ -275,3 +275,67 @@ func TestReplay_DormantThenBlastReachesHigh(t *testing.T) {
 	}
 	assertBand(t, "dormant_then_blast", view.Score, 0.8, 0.98)
 }
+
+// TestReplay_SelfSendOnlyStaysBelowHigh replays eval/fixtures/
+// benign_self_send_only.jsonl — R1 round 2, proven: a developer sending 8
+// test emails to their own inbox, never externally, previously scored
+// 0.9433 (tier high) on selfSendBeforeExternal alone; capping it at
+// selfSendBeforeExternalCap brings it down to ~0.12.
+func TestReplay_SelfSendOnlyStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_self_send_only.jsonl", "acct_example_selfsend_only_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_self_send_only: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_self_send_only", view.Score, 0.05, 0.35)
+}
+
+// TestReplay_ReceiptsFanoutStaysBelowHigh replays eval/fixtures/
+// benign_receipts_fanout.jsonl — R1 round 2, proven: a day-1 receipts
+// account (1 agent) fanning out to 30 distinct, genuinely external
+// customer domains previously scored 0.9634 (tier high) on
+// first_day_distinct_domains alone; capping it at
+// firstDayDistinctDomainsCap brings it down to ~0.15.
+func TestReplay_ReceiptsFanoutStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_receipts_fanout.jsonl", "acct_example_receipts_fanout_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_receipts_fanout: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_receipts_fanout", view.Score, 0.05, 0.35)
+}
+
+// TestReplay_VariantAStaysBelowHigh replays eval/fixtures/
+// benign_variant_a.jsonl — R1 round 2's own regression guard, using the
+// re-review's literal numbers (4 agents + 2 keys in 10 minutes, then 5
+// external emails to 5 distinct domains within hour 1): the re-review
+// measured this shape at 0.49 (tier medium) against the ALREADY-RETUNED
+// weights from the first fix round and flagged it as a case any further
+// retuning must not push into high. Neither of R1's two caps actually
+// bind here (5 domains is under firstDayDistinctDomainsCap, there are no
+// self-sends at all) — the risk this guards against is a WEIGHT change
+// elsewhere (e.g. resource/key velocity) creeping this scenario upward.
+func TestReplay_VariantAStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_variant_a.jsonl", "acct_example_variant_a_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_variant_a: tier = high (score %v), want medium (this is a regression guard, not a call to make it score LOW)\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_variant_a", view.Score, 0.35, 0.65)
+}
+
+// TestReplay_SelfSendBrandNameStaysBelowHigh replays eval/fixtures/
+// benign_selfsend_brandname.jsonl — R1 round 2, proven: an agent literally
+// named "PayPal integration" that only ever sends to its own domain
+// (recipient_is_own_identity=true, 10 sends, no external send ever)
+// previously scored 0.9880 (tier high) — from TWO compounding causes: the
+// pre-R6 brand matcher had no integration-token exclusion at all (so
+// "PayPal integration" tripped name_brand_match), AND
+// selfSendBeforeExternal was uncapped. Both are now fixed independently
+// (R6's BrandSet.Matches integration-token gate; R1's cap here) — this
+// fixture proves the COMBINATION resolves too, not just either fix in
+// isolation.
+func TestReplay_SelfSendBrandNameStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_selfsend_brandname.jsonl", "acct_example_selfsend_brand_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_selfsend_brandname: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_selfsend_brandname", view.Score, 0.05, 0.35)
+}

@@ -264,7 +264,11 @@ func nameHasAt(events []event.Event) float64 {
 // firstSeenAt+window] inclusive on both ends — unlike the sliding
 // *_1h/*_24h windows, this one is anchored to the subject's first event,
 // not to "now": once past firstSeenAt+window, this feature is permanently
-// fixed.
+// fixed. Saturates at firstDayDistinctDomainsCap (R1 round 2, proven: a
+// day-1 receipts account fanning out to dozens of genuine, distinct
+// customer domains is ordinary legitimate behaviour, not itself abuse
+// evidence — uncapped, 30 real recipient domains alone was enough to push
+// a benign account's score into `high`).
 func firstDayDistinctDomains(events []event.Event, firstSeenAt time.Time, window time.Duration) float64 {
 	cutoff := firstSeenAt.Add(window)
 	domains := make(map[string]struct{})
@@ -281,13 +285,18 @@ func firstDayDistinctDomains(events []event.Event, firstSeenAt time.Time, window
 		}
 		domains[normalizeToken(d)] = struct{}{}
 	}
-	return float64(len(domains))
+	return saturate(len(domains), firstDayDistinctDomainsCap)
 }
 
 // selfSendBeforeExternal counts content.sent events with
 // recipient_is_own_identity true that occurred at or before the subject's
 // first (earliest) content.sent event with recipient_is_own_identity
 // false. All self-sends count when there is no external send yet.
+// Saturates at selfSendBeforeExternalCap (R1 round 2, proven: a developer
+// sending several test emails to their own inbox before ever emailing
+// anyone else — ordinary integration testing, not rehearsal for a blast —
+// pushed a benign account's score toward `high` on this feature alone
+// once the count ran into the high single digits).
 func selfSendBeforeExternal(events []event.Event) float64 {
 	firstExternal, haveExternal := minAt(events, func(e event.Event) bool {
 		if e.Type != "content.sent" {
@@ -297,7 +306,7 @@ func selfSendBeforeExternal(events []event.Event) float64 {
 		return ok && !own
 	})
 
-	var n float64
+	var n int
 	for _, e := range events {
 		if e.Type != "content.sent" {
 			continue
@@ -311,7 +320,7 @@ func selfSendBeforeExternal(events []event.Event) float64 {
 		}
 		n++
 	}
-	return n
+	return saturate(n, selfSendBeforeExternalCap)
 }
 
 // burstRatio is the fraction of the subject's lifetime resource.created +

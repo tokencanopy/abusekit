@@ -65,13 +65,32 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   upgrade; a fast but unremarkable developer onboarding; an org wiring up
   several real SaaS integrations) that must never reach `high`.
 - `dormant_then_blast.jsonl` — a week-old account with no upgrade that
-  suddenly creates ten resources (one brand-impersonating) and sends to
-  twenty distinct external domains within an hour; must reach `high`. The
-  review that asked for this fixture described "300 external domains" —
-  this uses 20, since no v0 feature (`first_day_distinct_domains` doesn't
-  apply this many days after signup; `burst_ratio_24h_vs_lifetime` only
-  cares that recent activity dominates lifetime activity, not the exact
-  count) distinguishes 20 from 300 post-first-day domains.
+  suddenly creates ten resources (one brand-impersonating, "PayPal Account
+  Alert" — not "...Bot": round 2's R6 made "bot" an integration-token that
+  would otherwise suppress its own brand match) and sends to twenty
+  distinct external domains within an hour; must reach `high`. The review
+  that asked for this fixture described "300 external domains" — this
+  uses 20, since no v0 feature (`first_day_distinct_domains` doesn't apply
+  this many days after signup; `burst_ratio_24h_vs_lifetime` only cares
+  that recent activity dominates lifetime activity, not the exact count)
+  distinguishes 20 from 300 post-first-day domains.
+- `benign_self_send_only.jsonl`, `benign_receipts_fanout.jsonl`,
+  `benign_selfsend_brandname.jsonl` (round 2, R1) — three more accounts
+  that must never reach `high`: a developer sending 8 test emails to their
+  own inbox and never externally; a day-1 receipts account (1 agent)
+  fanning out to 30 distinct real customer domains; an agent literally
+  named "PayPal integration" that only ever self-sends (10 times). Each
+  one previously scored `high` (0.94/0.96/0.99) on an UNCAPPED count
+  feature alone (`self_send_before_external` or
+  `first_day_distinct_domains`) — see `internal/feature`'s
+  `selfSendBeforeExternalCap`/`firstDayDistinctDomainsCap`.
+- `benign_variant_a.jsonl` (round 2, R1) — a regression guard, not a new
+  failure: 4 agents + 2 keys in 10 minutes, then 5 external emails to 5
+  distinct domains within hour 1 (the re-review's own literal numbers,
+  measured at 0.49/medium against the already-retuned round-1 weights).
+  Committed so a FUTURE weight change (as opposed to R1's feature-level
+  caps, which don't touch this fixture at all) can't silently push it into
+  `high` without a test noticing.
 
 See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually

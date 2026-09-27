@@ -31,6 +31,27 @@
 # threshold on resource burst + brand name alone; `linked_deleted_n` went
 # up substantially so design's "high from the third churned subject
 # onward" (§1.2(c)) is met now that the count also saturates at 3.
+#
+# Round 2 (R1): NO weight below changed value. The round-2 re-review found
+# self_send_before_external and first_day_distinct_domains — both counts,
+# unlike every other feature here, with no natural ceiling of their own —
+# could swamp the model on a perfectly benign account once the raw count
+# ran high (8 self-test emails, 30 real customer domains, or both at once
+# for an agent literally named "PayPal integration" that only ever
+# self-sends). Both are now capped at the FEATURE level
+# (internal/feature.selfSendBeforeExternalCap = 2,
+# firstDayDistinctDomainsCap = 10) rather than by lowering these weights —
+# lowering the weight would have also weakened the feature for every
+# fixture where it fires within a reasonable range, where it's a
+# perfectly good signal. Verified (see eval/fixtures/README.md and
+# internal/worker/replay_test.go's four new benign_* fixtures) that
+# capping alone, with every weight below UNCHANGED, resolves every
+# reported false positive while every fixture that must reach `high`
+# still does so with margin (risk >= ~0.87, a logit margin of >= 0.5 above
+# the `high` cut point) — see mutation_test.go's
+# TestLocalWeights_GoldenSignsAndNonZero and isolatedWeightScenarios for
+# how every one of these 18 weights (not just the ones a wide realistic
+# fixture happens to be sensitive to) is now provably load-bearing.
 version: v1
 benign_label: benign
 bias: -4.5
@@ -81,10 +102,28 @@ weights:
   # config/brands.yaml, not a name_brand_match false positive).
   name_brand_match: 2.0
   name_has_at: 0.5
+
+  # first_day_distinct_domains: bounded on the low side by
+  # benign_receipts_fanout (round 2, R1) — a day-1 receipts account (1
+  # agent) fanning out to 30 REAL distinct customer domains previously
+  # scored 0.9634 (tier high) on this feature alone; now capped at
+  # internal/feature.firstDayDistinctDomainsCap (10), it scores ~0.15.
+  # dormant_then_blast (the fixture that needs first_day_distinct_domains'
+  # weight to matter on the high side) doesn't actually exercise this
+  # feature at all — its sends land 7 days after signup, past the
+  # first-day window — so the cap doesn't cost that fixture anything.
   first_day_distinct_domains: 0.25
 
   # Rehearsal-to-self before an external blast (design §4.3's
-  # recipient_is_own_identity signal, aggregated into a feature).
+  # recipient_is_own_identity signal, aggregated into a feature). Bounded
+  # on the low side by benign_self_send_only (round 2, R1) — a developer
+  # sending 8 test emails to their own inbox, never externally, previously
+  # scored 0.9433 (tier high) on this feature alone — and
+  # benign_selfsend_brandname (an agent literally named "PayPal
+  # integration" that only ever self-sends, previously 0.9880 from BOTH
+  # this feature AND a name_brand_match false positive R6 separately
+  # fixed). Both now capped at internal/feature.selfSendBeforeExternalCap
+  # (2); both fixtures now score ~0.12.
   self_send_before_external: 0.8
 
   # Linked-subject evidence (design §4.2): a predecessor account sharing a
@@ -101,7 +140,10 @@ weights:
   # truncation happening at all is weak, informational evidence of a hub
   # of accounts, not itself a strong abuse signal, and no committed
   # fixture exercises it (S1's own fan-in cap is 50, far more same-tenant
-  # neighbours than any replay fixture here has).
+  # neighbours than any replay fixture here has). Round 2 (R2): no fixture
+  # is sensitive enough to this weight alone to prove it's load-bearing —
+  # see mutation_test.go's isolatedWeightScenarios for the synthetic
+  # scenario that does.
   neighbors_truncated: 0.3
 
   # Dormant-then-blast pattern. Bounded by dormant_then_blast needing
@@ -110,5 +152,12 @@ weights:
   # compare against — this weight alone can never be the sole
   # discriminator between a legitimate brand-new account and an abusive
   # one, which is why it stayed modest relative to the feature-specific
-  # signals above rather than carrying most of the weight itself.
+  # signals above rather than carrying most of the weight itself. Round 2
+  # (R1): also bounded by benign_variant_a — the re-review's own "4
+  # agents + 2 keys in 10 min then 5 external mails to 5 domains in hour
+  # 1" regression guard (measured at 0.49, medium, against these SAME
+  # weights) — a WEIGHT increase here (as opposed to R1's feature-level
+  # caps, which don't touch this fixture at all) is exactly the kind of
+  # change that could have pushed it into `high`; left unchanged and
+  # reverified to still land at 0.49.
   burst_ratio_24h_vs_lifetime: 0.3

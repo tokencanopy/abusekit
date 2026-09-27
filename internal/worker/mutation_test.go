@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,6 +11,98 @@ import (
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/local"
 )
+
+// goldenWeightSigns is R2 round 2's golden table: every feature
+// config/rules.yaml's new_account_velocity rule reads must have a
+// NON-ZERO weight in config/local_weights.yaml, with this EXACT sign
+// (+1: increases risk; -1: decreases risk). Unlike a score-band
+// assertion against a fixture, this check has no numerical fragility at
+// all — a weight set to exactly zero, dropped from the file entirely, or
+// flipped to the wrong sign fails immediately, regardless of how small
+// its magnitude is deliberately kept (upgrade_delay_min's -0.0005 is easy
+// to miss in a fixture-band check, impossible to miss here).
+//
+// subject_age_h and upgrade_delay_min are the only two negative entries:
+// an OLDER account, or one that has gone a long time with no PAID
+// upgrade (design's clamp ceiling), is LESS likely to be a fresh
+// throwaway — see local_weights.yaml's own comments for the full
+// rationale on each.
+var goldenWeightSigns = map[string]int{
+	"subject_age_h":                      -1,
+	"resource_velocity_1h":               1,
+	"resource_total":                     1,
+	"key_velocity_1h":                    1,
+	"key_total":                          1,
+	"upgrade_delay_min":                  -1,
+	"upgraded":                           1,
+	"declines_before_first_success":      1,
+	"first_funding_prepaid":              1,
+	"name_brand_match":                   1,
+	"name_has_at":                        1,
+	"first_day_distinct_domains":         1,
+	"self_send_before_external":          1,
+	"linked_deleted_n":                   1,
+	"linked_labelled_abusive_n":          1,
+	"fingerprint_seen_on_other_subjects": 1,
+	"neighbors_truncated":                1,
+	"burst_ratio_24h_vs_lifetime":        1,
+}
+
+// TestLocalWeights_GoldenSignsAndNonZero is R2 round 2's static half of
+// "the mutation check must be able to fail for every weight": rather than
+// relying on SOME fixture's score happening to be sensitive enough to
+// notice a change, this checks config/local_weights.yaml directly against
+// goldenWeightSigns, for every feature config/rules.yaml's rules actually
+// read (not a hand-copied duplicate of that list — a rule referencing a
+// feature this table doesn't know about, or vice versa, fails loudly
+// rather than silently skipping it).
+func TestLocalWeights_GoldenSignsAndNonZero(t *testing.T) {
+	weights, err := local.LoadWeightsFile(filepath.Join(repoRoot(t), "config", "local_weights.yaml"))
+	if err != nil {
+		t.Fatalf("LoadWeightsFile: %v", err)
+	}
+	cfg := loadShippedConfig(t)
+
+	ruleInputs := map[string]bool{}
+	for _, r := range cfg.Rules {
+		if r.Scorer != "local" {
+			continue
+		}
+		for _, in := range r.Inputs {
+			ruleInputs[in] = true
+		}
+	}
+
+	for name := range ruleInputs {
+		if _, ok := goldenWeightSigns[name]; !ok {
+			t.Errorf("config/rules.yaml's local-scored rule(s) read feature %q, which goldenWeightSigns doesn't know about — add it", name)
+		}
+	}
+	for name := range goldenWeightSigns {
+		if !ruleInputs[name] {
+			t.Errorf("goldenWeightSigns lists %q, but no local-scored rule in config/rules.yaml actually reads it — remove it or add it to the rule's inputs", name)
+		}
+	}
+
+	for name, wantSign := range goldenWeightSigns {
+		w, ok := weights.Weight[name]
+		if !ok {
+			t.Errorf("config/local_weights.yaml is missing a weight for %q", name)
+			continue
+		}
+		if w == 0 {
+			t.Errorf("config/local_weights.yaml has weight[%q] = 0, want non-zero (sign %+d)", name, wantSign)
+			continue
+		}
+		gotSign := 1
+		if w < 0 {
+			gotSign = -1
+		}
+		if gotSign != wantSign {
+			t.Errorf("config/local_weights.yaml has weight[%q] = %v (sign %+d), want sign %+d", name, w, gotSign, wantSign)
+		}
+	}
+}
 
 // mutationScenario is one committed replay fixture's feature vector, band,
 // and the outcome it must reach — mirroring one of replay_test.go's
@@ -86,7 +177,7 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		t.Fatalf("feature.Extract(churn subject 6): %v", err)
 	}
 
-	return []mutationScenario{
+	scenarios := []mutationScenario{
 		{"reference_operator", extractFixture(t, brands, "reference_operator.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.99, 1.0},
 		{"benign_transactional", extractFixture(t, brands, "benign_transactional.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.05},
 		{"burst_before_send", extractFixture(t, brands, "burst.jsonl", 15*time.Second, true, feature.NeighborEvidence{}), 0.9, 1.0},
@@ -96,6 +187,71 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		{"dormant_then_blast", extractFixture(t, brands, "dormant_then_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.8, 0.98},
 		{"churn_subject_3", res3.Features.Map(), 0.8, 0.95},
 		{"churn_subject_saturated", res6.Features.Map(), 0.9, 1.0},
+	}
+	return append(scenarios, isolatedWeightScenarios()...)
+}
+
+// isolatedWeightScenarios is R2 round 2: eight of the eighteen weights
+// (resource_total/key_total — minor companions to their velocity
+// counterparts; upgrade_delay_min — deliberately shrunk ~20x by B5 so it
+// can't swamp the model; subject_age_h, name_has_at,
+// linked_labelled_abusive_n, neighbors_truncated,
+// burst_ratio_24h_vs_lifetime) never move any of the WIDE, realistic
+// fixture bands above by enough to cross an edge, even though each one
+// measurably moves the score (see TestAblation_EveryWeightedFeatureMovesTheScore).
+// TestLocalWeights_GoldenSignsAndNonZero already proves each is
+// configured, non-zero, and correctly signed; these scenarios additionally
+// prove each one's OWN weight is what a SCORE actually depends on, isolated
+// from the fixtures' other signals: a shared, moderate backdrop (roughly
+// half of fullFeatureVector's values, landing baseline risk in the
+// sigmoid's sensitive middle rather than a saturated tail) plus ONE target
+// feature at a meaningfully large value, with a band computed at the
+// midpoint between the weight's baseline contribution and zero — tight
+// enough to catch the target's own removal, loose enough not to be
+// fragile against unrelated future retuning. See the "which fixture
+// bounded which weight" table (PR body / local_weights.yaml comments) for
+// the exact baseline/zeroed risk values these bands were derived from.
+func isolatedWeightScenarios() []mutationScenario {
+	backdrop := func() map[string]float64 {
+		return map[string]float64{
+			"resource_velocity_1h":               0.75,
+			"resource_total":                     1.25,
+			"key_velocity_1h":                    0.5,
+			"key_total":                          1,
+			"upgraded":                           0.25,
+			"declines_before_first_success":      0.5,
+			"first_funding_prepaid":              0.25,
+			"name_brand_match":                   0.25,
+			"first_day_distinct_domains":         0.75,
+			"self_send_before_external":          0.5,
+			"linked_deleted_n":                   0.5,
+			"fingerprint_seen_on_other_subjects": 0.25,
+		}
+	}
+	withTarget := func(name string, value float64) map[string]float64 {
+		v := backdrop()
+		v[name] = value
+		return v
+	}
+	return []mutationScenario{
+		// subject_age_h: negative weight, so zeroing INCREASES risk —
+		// base=0.160, zeroed=0.235.
+		{"isolated_subject_age_h", withTarget("subject_age_h", 24), 0.05, 0.20},
+		// resource_total: base=0.309, zeroed=0.231.
+		{"isolated_resource_total", withTarget("resource_total", 20), 0.27, 0.36},
+		// key_total: base=0.269, zeroed=0.231.
+		{"isolated_key_total", withTarget("key_total", 10), 0.25, 0.30},
+		// upgrade_delay_min: negative weight, zeroing INCREASES risk —
+		// base=0.130, zeroed=0.235.
+		{"isolated_upgrade_delay_min", withTarget("upgrade_delay_min", 1440), 0.05, 0.185},
+		// name_has_at: base=0.336, zeroed=0.235.
+		{"isolated_name_has_at", withTarget("name_has_at", 1), 0.29, 0.40},
+		// linked_labelled_abusive_n: base=0.579, zeroed=0.235.
+		{"isolated_linked_labelled_abusive_n", withTarget("linked_labelled_abusive_n", 1), 0.42, 0.75},
+		// neighbors_truncated: base=0.293, zeroed=0.235.
+		{"isolated_neighbors_truncated", withTarget("neighbors_truncated", 1), 0.27, 0.35},
+		// burst_ratio_24h_vs_lifetime: base=0.293, zeroed=0.235.
+		{"isolated_burst_ratio_24h_vs_lifetime", withTarget("burst_ratio_24h_vs_lifetime", 1.0), 0.27, 0.35},
 	}
 }
 
@@ -116,12 +272,22 @@ func inBand(risk float64, sc mutationScenario) bool {
 }
 
 // TestWeightMutation_EveryWeightIsLoadBearing is B1 fix round's mutation
-// check: zeroing any SINGLE weight in the shipped config/local_weights.yaml
-// must make at least one committed replay fixture's band assertion fail.
-// A weight that survives being zeroed out — every scenario still lands in
-// its expected band — isn't actually load-bearing for anything this repo
-// tests, which is exactly the gap a silent weight-tuning regression could
-// hide behind.
+// check, tightened by R2 round 2: zeroing any SINGLE weight in the shipped
+// config/local_weights.yaml must make at least one scenario's band
+// assertion fail — every committed replay fixture PLUS isolatedWeightScenarios
+// (added specifically because eight of the eighteen weights never crossed
+// any WIDE, realistic fixture's band on their own). A weight that survives
+// being zeroed out — every scenario still lands in its expected band —
+// isn't actually load-bearing for anything this repo tests, which is
+// exactly the gap a silent weight-tuning regression could hide behind.
+//
+// R2 round 2 removed the OLD ablation-vector FALLBACK entirely (no more
+// "or move the ablation vector's score by more than epsilon" escape
+// hatch) and the OLD "skip weights that are already zero" behaviour
+// (TestLocalWeights_GoldenSignsAndNonZero already guarantees none of the
+// eighteen ever ship as zero, so every single one is genuinely mutated and
+// checked here, unconditionally). Ablation itself is unchanged and
+// remains its own separate test (ablation_test.go).
 func TestWeightMutation_EveryWeightIsLoadBearing(t *testing.T) {
 	weights, err := local.LoadWeightsFile(filepath.Join(repoRoot(t), "config", "local_weights.yaml"))
 	if err != nil {
@@ -142,25 +308,7 @@ func TestWeightMutation_EveryWeightIsLoadBearing(t *testing.T) {
 		}
 	}
 
-	// The ablation vector (fullFeatureVector, deliberately scaled to sit
-	// near the sigmoid's sensitive middle — see its own doc comment) is
-	// folded in as one more avenue for "load bearing", alongside the
-	// fixture-derived scenarios above: several weights are intentionally
-	// small (resource_total/key_total are minor companions to their
-	// velocity counterparts; upgrade_delay_min's magnitude was cut ~20x by
-	// B5's fix so it can't swamp the model — see local_weights.yaml's own
-	// comment) and never move any WIDE fixture band by enough to cross an
-	// edge, even though they measurably move the score. The reviewed ask
-	// was "fail at least one replay/ablation test" — an OR, not just the
-	// fixture bands alone.
-	ablationBaseline := fullFeatureVector()
-	ablationBaselineRisk := scoreFeatures(t, baseline, ablationBaseline)
-	const ablationEpsilon = 1e-4
-
 	for name, original := range weights.Weight {
-		if original == 0 {
-			continue // already zero; "mutating" it to zero is a no-op, not a meaningful check.
-		}
 		mutated := weights
 		mutated.Weight = make(map[string]float64, len(weights.Weight))
 		for k, v := range weights.Weight {
@@ -185,15 +333,7 @@ func TestWeightMutation_EveryWeightIsLoadBearing(t *testing.T) {
 			}
 		}
 		if !brokeSomething {
-			if v, ok := ablationBaseline[name]; ok && v != 0 {
-				mutatedRisk := scoreFeatures(t, scorer, ablationBaseline)
-				if math.Abs(mutatedRisk-ablationBaselineRisk) > ablationEpsilon {
-					brokeSomething = true
-				}
-			}
-		}
-		if !brokeSomething {
-			t.Errorf("zeroing weight %q (was %v) neither pushed any replay scenario out of its band nor moved the ablation vector's score by more than %v", name, original, ablationEpsilon)
+			t.Errorf("zeroing weight %q (was %v) did not push any scenario (replay fixture or isolated) out of its band", name, original)
 		}
 	}
 }

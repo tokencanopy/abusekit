@@ -41,6 +41,23 @@ const (
 	upgradeDelayClampMinutes = 24 * 60
 )
 
+// firstDayDistinctDomainsCap and selfSendBeforeExternalCap bound two more
+// unbounded-by-construction counts (R1 round 2, proven: a benign day-1
+// receipts account fanning out to dozens of genuine distinct customer
+// domains, or a developer sending several self-test emails before ever
+// emailing anyone else, both pushed a benign account's score toward
+// `high` on ONE feature alone once the raw count ran high). Both
+// saturate rather than clamp to a fixed ceiling value the way the time
+// features above do, since these are already small integers with no
+// natural "still meaningful past this point" ceiling of their own —
+// saturate's own doc comment (also used by LinkedDeletedN) covers why a
+// cap rather than a log-scale transform: a hard bound is simpler to
+// reason about and to retune against fixtures than a curve.
+const (
+	firstDayDistinctDomainsCap = 10
+	selfSendBeforeExternalCap  = 2
+)
+
 // Names is the ordered, canonical list of every v0 feature Extract
 // computes — matching design §4.5's new_account_velocity inputs list
 // exactly. cmd/abusekit builds its FeatureSet from this (not a

@@ -3,6 +3,7 @@ package feature
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -442,6 +443,15 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 			t.Errorf("first_day_distinct_domains = %v, want 0", got)
 		}
 	})
+	t.Run("saturates at the cap (R1 round 2)", func(t *testing.T) {
+		var events []event.Event
+		for i := 0; i < 30; i++ {
+			events = append(events, ev(fmt.Sprintf("c%d", i), "content.sent", 0, map[string]any{"recipient_domain": fmt.Sprintf("customer-%d.example.test", i)}))
+		}
+		if got := firstDayDistinctDomains(events, base, day); got != firstDayDistinctDomainsCap {
+			t.Errorf("first_day_distinct_domains = %v, want the cap %v (30 distinct domains must not swamp the model uncapped)", got, firstDayDistinctDomainsCap)
+		}
+	})
 }
 
 func TestSelfSendBeforeExternal(t *testing.T) {
@@ -476,6 +486,15 @@ func TestSelfSendBeforeExternal(t *testing.T) {
 		}
 		if got := selfSendBeforeExternal(events); got != 2 {
 			t.Errorf("self_send_before_external = %v, want 2", got)
+		}
+	})
+	t.Run("saturates at the cap (R1 round 2)", func(t *testing.T) {
+		var events []event.Event
+		for i := 0; i < 8; i++ {
+			events = append(events, ev(fmt.Sprintf("c%d", i), "content.sent", time.Duration(i)*time.Minute, map[string]any{"recipient_is_own_identity": true}))
+		}
+		if got := selfSendBeforeExternal(events); got != selfSendBeforeExternalCap {
+			t.Errorf("self_send_before_external = %v, want the cap %v (8 self-sends before ever sending externally must not swamp the model uncapped)", got, selfSendBeforeExternalCap)
 		}
 	})
 }

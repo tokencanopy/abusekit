@@ -303,7 +303,11 @@ happened at all, independent of the delay's magnitude: `upgrade_delay_min` alone
 window" below. `subject_age_h` and `upgrade_delay_min` are both clamped at 24h/1440min — proven,
 an unbounded value for either let a multi-day-old account swamp the local scorer's linear model
 through that feature alone; `burst_ratio_24h_vs_lifetime` is what actually distinguishes "old and
-quiet" from "old and just burst," not `subject_age_h`'s raw magnitude.
+quiet" from "old and just burst," not `subject_age_h`'s raw magnitude. **[S2, round 2]**
+`self_send_before_external` and `first_day_distinct_domains` are similarly capped (at 2 and 10
+respectively) — proven, an uncapped count on either let a perfectly benign account (8 self-test
+emails before ever sending externally; 30 real customer domains fanned out to on day 1) swamp the
+model the same way an unbounded `subject_age_h`/`upgrade_delay_min` did.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
