@@ -45,6 +45,17 @@ func LoadVendors(data []byte) (map[string]VendorEntry, error) {
 		if _, exists := out[v.Name]; exists {
 			return nil, fmt.Errorf("config: duplicate vendors.yaml entry for %q", v.Name)
 		}
+		// S9: an entry with no terms_version or dpa_ref is a data-
+		// governance gap, not a valid placeholder — an adapter with
+		// genuinely no vendor terms (e.g. local) still records the
+		// literal string "n/a", so an empty string always means "nobody
+		// filled this in".
+		if v.TermsVersion == "" {
+			return nil, fmt.Errorf("config: vendors.yaml entry %q is missing terms_version", v.Name)
+		}
+		if v.DPARef == "" {
+			return nil, fmt.Errorf("config: vendors.yaml entry %q is missing dpa_ref", v.Name)
+		}
 		out[v.Name] = VendorEntry{
 			Name:         v.Name,
 			TermsVersion: v.TermsVersion,

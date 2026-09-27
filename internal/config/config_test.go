@@ -29,6 +29,10 @@ func newFixture(t *testing.T) (deps config.Dependencies, reg *model.Registry) {
 		AcceptsFeatures: true,
 		Calibrated:      true,
 	}
+	// S9: the loader compares this against Vendors["local"].Policy below —
+	// they must agree for tests that don't specifically exercise the
+	// mismatch check.
+	localLike.DataPolicyValue = model.DataPolicy{AllowsText: false, TermsVersion: "n/a"}
 	if err := reg.Register(localLike); err != nil {
 		t.Fatal(err)
 	}
@@ -41,6 +45,7 @@ func newFixture(t *testing.T) (deps config.Dependencies, reg *model.Registry) {
 		AcceptsFeatures: false,
 		Calibrated:      false, // requires a recorded calibration
 	}
+	textVendor.DataPolicyValue = model.DataPolicy{AllowsText: true, TermsVersion: "v1"}
 	if err := reg.Register(textVendor); err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +66,8 @@ func newFixture(t *testing.T) (deps config.Dependencies, reg *model.Registry) {
 		Registry: reg,
 		Features: config.NewFeatureSet("subject_age_h", "resource_velocity_1h"),
 		Vendors: map[string]config.VendorEntry{
-			"local":      {Name: "local", Policy: model.DataPolicy{AllowsText: false}},
-			"textvendor": {Name: "textvendor", Policy: model.DataPolicy{AllowsText: true}},
+			"local":      {Name: "local", Policy: model.DataPolicy{AllowsText: false, TermsVersion: "n/a"}},
+			"textvendor": {Name: "textvendor", Policy: model.DataPolicy{AllowsText: true, TermsVersion: "v1"}},
 			// "otherfixed" intentionally NOT listed, to test the allowlist check.
 		},
 	}
@@ -290,6 +295,213 @@ rules:
 `,
 			wantErr: "duplicate rule name",
 		},
+		// --- S3: config loader strictness -------------------------------
+		{
+			name: "unknown top-level field",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+totally_unknown_top_level_field: 1
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "field totally_unknown_top_level_field not found",
+		},
+		{
+			name: "unknown rule-level field (typo)",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    theshold: 0.5
+`,
+			wantErr: "field theshold not found",
+		},
+		{
+			name: "missing threshold",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+`,
+			wantErr: "missing threshold",
+		},
+		{
+			name: "NaN threshold",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: .nan
+`,
+			wantErr: "threshold",
+		},
+		{
+			name: "NaN tier cut point",
+			yaml: `
+tiers: {medium: .nan, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "tiers.medium",
+		},
+		{
+			name: "NaN min_local_risk stage condition",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: local_rule
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+  - name: r1
+    mode: shadow
+    scorer: textvendor
+    text: [subject_line_skeleton]
+    labels: [benign, phishing]
+    benign_label: benign
+    threshold: 0.5
+    stage: {min_local_risk: .nan}
+`,
+			wantErr: "min_local_risk",
+		},
+		{
+			name: "negative max_subject_age_h stage condition",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: shadow
+    scorer: textvendor
+    text: [subject_line_skeleton]
+    labels: [benign, phishing]
+    benign_label: benign
+    threshold: 0.5
+    stage: {max_subject_age_h: -1}
+`,
+			wantErr: "max_subject_age_h",
+		},
+		{
+			name: "duplicate labels",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive, benign]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "duplicate label",
+		},
+		{
+			name: "empty label",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, "", abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "empty label",
+		},
+		{
+			name: "duplicate inputs",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h, subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "duplicate input",
+		},
+		{
+			name: "rule gated on min_local_risk against itself",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: local_rule
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+    stage: {min_local_risk: 0.3}
+`,
+			wantErr: "against itself",
+		},
+		{
+			name: "rule name with a slash",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1/bad
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "rule name",
+		},
+		{
+			name: "min_scored_advise exceeds the number of advise rules",
+			yaml: `
+tiers: {medium: 0.4, high: 0.8}
+min_scored_advise: 5
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`,
+			wantErr: "min_scored_advise",
+		},
 	}
 
 	for _, tc := range tests {
@@ -457,6 +669,101 @@ func repoRoot(t *testing.T) string {
 	return filepath.Join(filepath.Dir(thisFile), "..", "..")
 }
 
+// --- S3: strictness cases that don't fit the table-driven shape above ---
+
+func TestLoad_NilFeaturesIsAnError(t *testing.T) {
+	deps, _ := newFixture(t)
+	deps.Features = nil // was silently "every feature is unknown... or is it?" before S3
+	_, err := config.Load([]byte(validYAML), deps)
+	if err == nil || !strings.Contains(err.Error(), "Features") {
+		t.Fatalf("expected an error mentioning Features for a nil FeatureSet, got %v", err)
+	}
+}
+
+func TestLoad_TextRulesNeedFeatureSupportDefaultsToTrue(t *testing.T) {
+	deps, _ := newFixture(t)
+	yaml := `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`
+	cfg, err := config.Load([]byte(yaml), deps)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.TextRulesNeedFeatureSupport {
+		t.Fatalf("expected text_rules_need_feature_support to default to true when omitted")
+	}
+}
+
+func TestLoad_TextRulesNeedFeatureSupportExplicitFalse(t *testing.T) {
+	deps, _ := newFixture(t)
+	yaml := `
+tiers: {medium: 0.4, high: 0.8}
+text_rules_need_feature_support: false
+rules:
+  - name: r1
+    mode: advise
+    scorer: local
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`
+	cfg, err := config.Load([]byte(yaml), deps)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TextRulesNeedFeatureSupport {
+		t.Fatalf("expected an explicit false to be honoured, not overridden by the default")
+	}
+}
+
+// TestLoad_RejectsVendorPolicyMismatch is S9: the loader must compare an
+// adapter's own reported Policy() against its vendors.yaml entry and
+// reject any disagreement, so a stale allowlist entry can never diverge
+// silently from what the adapter actually does with its inputs.
+func TestLoad_RejectsVendorPolicyMismatch(t *testing.T) {
+	reg := model.NewRegistry()
+	drift := fake.New()
+	drift.NameValue = "driftvendor"
+	drift.Caps = model.Capabilities{LabelMode: model.OpenLabelMode(), AcceptsFeatures: true, Calibrated: true}
+	drift.DataPolicyValue = model.DataPolicy{AllowsText: false, TermsVersion: "v1"}
+	if err := reg.Register(drift); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := config.Dependencies{
+		Registry: reg,
+		Features: config.NewFeatureSet("subject_age_h"),
+		Vendors: map[string]config.VendorEntry{
+			// AllowsText disagrees with drift.DataPolicyValue above.
+			"driftvendor": {Name: "driftvendor", Policy: model.DataPolicy{AllowsText: true, TermsVersion: "v1"}},
+		},
+	}
+	yaml := `
+tiers: {medium: 0.4, high: 0.8}
+rules:
+  - name: r1
+    mode: advise
+    scorer: driftvendor
+    inputs: [subject_age_h]
+    labels: [benign, abusive]
+    benign_label: benign
+    threshold: 0.5
+`
+	_, err := config.Load([]byte(yaml), deps)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected a vendor policy mismatch error, got %v", err)
+	}
+}
+
 func TestLoadVendors_RejectsDuplicateNames(t *testing.T) {
 	yaml := `
 vendors:
@@ -467,5 +774,43 @@ vendors:
 `
 	if _, err := config.LoadVendors([]byte(yaml)); err == nil {
 		t.Fatalf("expected an error for a duplicate vendor name")
+	}
+}
+
+// TestLoadVendors_RejectsMissingTermsOrDPA is S9: an allowlist entry
+// recording no terms_version or no dpa_ref is a data-governance gap, not
+// a valid placeholder — vendors.yaml uses the literal string "n/a" when
+// an adapter genuinely has no vendor terms (e.g. local), so an empty
+// string always means "forgot to fill this in".
+func TestLoadVendors_RejectsMissingTermsOrDPA(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{
+			name: "missing terms_version",
+			yaml: `
+vendors:
+  - name: local
+    dpa_ref: "n/a"
+    policy: {allows_text: false}
+`,
+		},
+		{
+			name: "missing dpa_ref",
+			yaml: `
+vendors:
+  - name: local
+    terms_version: "n/a"
+    policy: {allows_text: false}
+`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := config.LoadVendors([]byte(tc.yaml)); err == nil {
+				t.Fatalf("expected an error for an entry with no %s", tc.name)
+			}
+		})
 	}
 }

@@ -16,8 +16,11 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"math"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -25,6 +28,13 @@ import (
 
 	"github.com/tokencanopy/abusekit/internal/model"
 )
+
+// ruleNameRe enforces "rule names must match [a-z0-9_]+ (no /)" (S3): a
+// rule name is also half of internal/core.Key's calibration lookup key
+// (design §4.6: "(rule, scorer, checkpoint)", joined with "/"), so a
+// rule name containing "/" could collide with a different (rule, scorer)
+// pair's key.
+var ruleNameRe = regexp.MustCompile(`^[a-z0-9_]+$`)
 
 // Mode is a rule's contribution mode (design §2/§4.5).
 type Mode string
@@ -153,21 +163,29 @@ type rawConfig struct {
 		Medium float64 `yaml:"medium"`
 		High   float64 `yaml:"high"`
 	} `yaml:"tiers"`
-	MinScoredAdvise             int       `yaml:"min_scored_advise"`
-	TextRulesNeedFeatureSupport bool      `yaml:"text_rules_need_feature_support"`
+	MinScoredAdvise int `yaml:"min_scored_advise"`
+	// TextRulesNeedFeatureSupport is a *bool (not bool) so Load can tell
+	// "omitted from the YAML" from "explicitly set to false" (S3: this
+	// defaults to TRUE — the safer setting — when omitted, not to Go's
+	// bool zero value).
+	TextRulesNeedFeatureSupport *bool     `yaml:"text_rules_need_feature_support"`
 	Rules                       []rawRule `yaml:"rules"`
 }
 
 type rawRule struct {
-	Name        string             `yaml:"name"`
-	Mode        string             `yaml:"mode"`
-	Scorer      string             `yaml:"scorer"`
-	Inputs      yaml.Node          `yaml:"inputs"`
-	Text        []string           `yaml:"text"`
-	Labels      []string           `yaml:"labels"`
-	BenignLabel string             `yaml:"benign_label"`
-	Threshold   float64            `yaml:"threshold"`
-	Stage       map[string]float64 `yaml:"stage"`
+	Name        string    `yaml:"name"`
+	Mode        string    `yaml:"mode"`
+	Scorer      string    `yaml:"scorer"`
+	Inputs      yaml.Node `yaml:"inputs"`
+	Text        []string  `yaml:"text"`
+	Labels      []string  `yaml:"labels"`
+	BenignLabel string    `yaml:"benign_label"`
+	// Threshold is a *float64 (not float64) so Load can tell "omitted"
+	// from "explicitly set to 0" (S3: threshold is required — a rule
+	// that never sets one is a config mistake, not a rule that flags on
+	// every request).
+	Threshold *float64           `yaml:"threshold"`
+	Stage     map[string]float64 `yaml:"stage"`
 }
 
 type sameAsRef struct {
@@ -181,7 +199,9 @@ type sameAsRef struct {
 // distinguish them programmatically).
 func Load(data []byte, deps Dependencies) (*Config, error) {
 	var raw rawConfig
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true) // S3: a typo'd or stale field name fails the load, not silently no-ops
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("config: parse rules yaml: %w", err)
 	}
 
@@ -190,26 +210,48 @@ func Load(data []byte, deps Dependencies) (*Config, error) {
 		minScoredAdvise = 1
 	}
 
+	textRulesNeedFeatureSupport := true // S3: the safer default when omitted
+	if raw.TextRulesNeedFeatureSupport != nil {
+		textRulesNeedFeatureSupport = *raw.TextRulesNeedFeatureSupport
+	}
+
 	var issues []error
 
-	if raw.Tiers.Medium <= 0 || raw.Tiers.High <= 0 {
-		issues = append(issues, errors.New("config: tiers.medium and tiers.high must both be set and positive"))
-	} else if raw.Tiers.High <= raw.Tiers.Medium {
-		issues = append(issues, fmt.Errorf("config: tiers.high (%v) must be greater than tiers.medium (%v)", raw.Tiers.High, raw.Tiers.Medium))
+	if deps.Features == nil {
+		// S3: nil silently meant "every feature check is skipped" (via a
+		// `deps.Features != nil &&` guard below) — treat it as a load
+		// error instead, so a caller that forgot to build a FeatureSet
+		// finds out immediately rather than shipping a config where every
+		// `inputs` reference was rubber-stamped.
+		issues = append(issues, errors.New("config: Dependencies.Features must not be nil"))
 	}
-	if raw.Tiers.High > 1 || raw.Tiers.Medium > 1 {
-		issues = append(issues, errors.New("config: tier cut points must be <= 1"))
-	}
+
+	issues = append(issues, validateTiers(raw.Tiers.Medium, raw.Tiers.High)...)
 
 	rules, resolveIssues := resolveInputs(raw.Rules)
 	issues = append(issues, resolveIssues...)
 
+	adviseCount := 0
+	for _, r := range rules {
+		if r.Mode == ModeAdvise {
+			adviseCount++
+		}
+	}
+	if minScoredAdvise < 1 {
+		issues = append(issues, fmt.Errorf("config: min_scored_advise (%d) must be >= 1", minScoredAdvise))
+	} else if adviseCount > 0 && minScoredAdvise > adviseCount {
+		issues = append(issues, fmt.Errorf("config: min_scored_advise (%d) must be <= the number of advise rules (%d)", minScoredAdvise, adviseCount))
+	}
+
 	seenNames := make(map[string]bool, len(rules))
 	scorers := make(map[string]model.Scorer, len(rules))
-	for _, r := range rules {
+	for i, r := range rules {
 		if r.Name == "" {
 			issues = append(issues, errors.New("config: a rule is missing `name`"))
 			continue
+		}
+		if !ruleNameRe.MatchString(r.Name) {
+			issues = append(issues, fmt.Errorf("config: rule name %q must match ^[a-z0-9_]+$ (lower-case letters, digits, underscore only — no \"/\")", r.Name))
 		}
 		if seenNames[r.Name] {
 			issues = append(issues, fmt.Errorf("config: duplicate rule name %q", r.Name))
@@ -219,17 +261,26 @@ func Load(data []byte, deps Dependencies) (*Config, error) {
 		if r.Mode != ModeAdvise && r.Mode != ModeShadow {
 			issues = append(issues, fmt.Errorf("config: rule %q has invalid mode %q (want %q or %q)", r.Name, r.Mode, ModeAdvise, ModeShadow))
 		}
-		if r.Threshold < 0 || r.Threshold > 1 {
-			issues = append(issues, fmt.Errorf("config: rule %q threshold %v must be in [0,1]", r.Name, r.Threshold))
+
+		if rawThreshold := raw.Rules[i].Threshold; rawThreshold == nil {
+			issues = append(issues, fmt.Errorf("config: rule %q is missing threshold", r.Name))
+		} else if math.IsNaN(*rawThreshold) || math.IsInf(*rawThreshold, 0) {
+			issues = append(issues, fmt.Errorf("config: rule %q threshold must be a finite number, got %v", r.Name, *rawThreshold))
+		} else if *rawThreshold < 0 || *rawThreshold > 1 {
+			issues = append(issues, fmt.Errorf("config: rule %q threshold %v must be in [0,1]", r.Name, *rawThreshold))
 		}
+
 		if r.BenignLabel == "" {
 			issues = append(issues, fmt.Errorf("config: rule %q is missing benign_label", r.Name))
 		} else if !containsString(r.Labels, r.BenignLabel) {
 			issues = append(issues, fmt.Errorf("config: rule %q benign_label %q is not in its labels %v", r.Name, r.BenignLabel, r.Labels))
 		}
+		issues = append(issues, validateNoDuplicatesOrEmpty(r.Name, "label", r.Labels)...)
+
 		if len(r.Inputs) == 0 && len(r.Text) == 0 {
 			issues = append(issues, fmt.Errorf("config: rule %q has neither inputs nor text", r.Name))
 		}
+		issues = append(issues, validateNoDuplicatesOrEmpty(r.Name, "input", r.Inputs)...)
 
 		for _, f := range r.Inputs {
 			if deps.Features != nil && !deps.Features.Has(f) {
@@ -269,6 +320,19 @@ func Load(data []byte, deps Dependencies) (*Config, error) {
 			if len(r.Text) > 0 && !vendor.Policy.AllowsText {
 				issues = append(issues, fmt.Errorf("config: rule %q sends text to adapter %q, whose recorded policy forbids text", r.Name, member))
 			}
+			// S9: the adapter's own reported Policy() must agree with what
+			// vendors.yaml records for it — a stale or hand-edited
+			// allowlist entry must never silently diverge from what the
+			// adapter actually does with its inputs.
+			if deps.Registry != nil {
+				if memberScorer, ok := deps.Registry.Get(member); ok {
+					if p := memberScorer.Policy(); p != vendor.Policy {
+						issues = append(issues, fmt.Errorf(
+							"config: adapter %q's reported policy (%+v) does not match vendors.yaml's recorded policy (%+v)",
+							member, p, vendor.Policy))
+					}
+				}
+			}
 		}
 
 		if !caps.Calibrated && !deps.calibrated(r.Name, r.Scorer) {
@@ -283,10 +347,59 @@ func Load(data []byte, deps Dependencies) (*Config, error) {
 	return &Config{
 		Tiers:                       Tiers{Medium: raw.Tiers.Medium, High: raw.Tiers.High},
 		MinScoredAdvise:             minScoredAdvise,
-		TextRulesNeedFeatureSupport: raw.TextRulesNeedFeatureSupport,
+		TextRulesNeedFeatureSupport: textRulesNeedFeatureSupport,
 		Rules:                       rules,
 		scorers:                     scorers,
 	}, nil
+}
+
+// validateTiers checks the global tier cut points (S3): both finite (a
+// `.nan` in YAML round-trips into a real NaN and previously slipped past
+// every existing check, since a NaN comparison is always false) and in
+// (0,1], with high strictly greater than medium.
+func validateTiers(medium, high float64) []error {
+	var issues []error
+	mediumOK, highOK := true, true
+
+	if math.IsNaN(medium) || math.IsInf(medium, 0) {
+		issues = append(issues, errors.New("config: tiers.medium must be a finite number"))
+		mediumOK = false
+	} else if medium <= 0 || medium > 1 {
+		issues = append(issues, fmt.Errorf("config: tiers.medium (%v) must be in (0,1]", medium))
+		mediumOK = false
+	}
+	if math.IsNaN(high) || math.IsInf(high, 0) {
+		issues = append(issues, errors.New("config: tiers.high must be a finite number"))
+		highOK = false
+	} else if high <= 0 || high > 1 {
+		issues = append(issues, fmt.Errorf("config: tiers.high (%v) must be in (0,1]", high))
+		highOK = false
+	}
+	if mediumOK && highOK && high <= medium {
+		issues = append(issues, fmt.Errorf("config: tiers.high (%v) must be greater than tiers.medium (%v)", high, medium))
+	}
+	return issues
+}
+
+// validateNoDuplicatesOrEmpty checks a rule's `labels` or `inputs` list
+// (S3) for an empty string or a repeated entry — either is a config
+// mistake (a copy-paste error, or a label typo'd into two spellings) that
+// silently produces a rule with fewer effective entries than the author
+// intended.
+func validateNoDuplicatesOrEmpty(ruleName, kind string, values []string) []error {
+	var issues []error
+	seen := make(map[string]bool, len(values))
+	for _, v := range values {
+		if v == "" {
+			issues = append(issues, fmt.Errorf("config: rule %q has an empty %s", ruleName, kind))
+			continue
+		}
+		if seen[v] {
+			issues = append(issues, fmt.Errorf("config: rule %q has duplicate %s %q", ruleName, kind, v))
+		}
+		seen[v] = true
+	}
+	return issues
 }
 
 // knownStageKeys enumerates the stage conditions internal/core
@@ -300,7 +413,7 @@ var knownStageKeys = map[string]bool{
 }
 
 func validateStage(r Rule) error {
-	for k := range r.Stage {
+	for k, v := range r.Stage {
 		if !knownStageKeys[k] {
 			keys := make([]string, 0, len(knownStageKeys))
 			for k := range knownStageKeys {
@@ -309,6 +422,30 @@ func validateStage(r Rule) error {
 			sort.Strings(keys)
 			return fmt.Errorf("unknown stage condition %q (known: %s)", k, strings.Join(keys, ", "))
 		}
+		// S3: a `.nan`/infinite stage value previously slipped past every
+		// comparison in core.Plan's stageSkip (a NaN comparison is always
+		// false), silently making the condition a no-op instead of a
+		// load-time error.
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("stage condition %q must be a finite number, got %v", k, v)
+		}
+		switch k {
+		case "min_local_risk":
+			if v < 0 || v > 1 {
+				return fmt.Errorf("stage condition %q must be in [0,1], got %v", k, v)
+			}
+		case "max_subject_age_h", "min_subject_age_h":
+			if v < 0 {
+				return fmt.Errorf("stage condition %q must be >= 0 hours, got %v", k, v)
+			}
+		}
+	}
+	// S3: a rule scored by "local" cannot stage itself on min_local_risk —
+	// core.Plan's stageSkip gates on "the max risk so far among rules
+	// scored by local", and a rule using its own not-yet-computed risk to
+	// decide whether to compute itself is circular.
+	if _, ok := r.Stage["min_local_risk"]; ok && r.Scorer == "local" {
+		return errors.New("cannot stage min_local_risk against itself (it is itself scored by \"local\")")
 	}
 	return nil
 }
@@ -351,6 +488,10 @@ func resolveInputs(raw []rawRule) ([]Rule, []error) {
 	var issues []error
 
 	for i, rr := range raw {
+		var threshold float64
+		if rr.Threshold != nil {
+			threshold = *rr.Threshold
+		}
 		rules[i] = Rule{
 			Name:        rr.Name,
 			Mode:        Mode(rr.Mode),
@@ -358,7 +499,7 @@ func resolveInputs(raw []rawRule) ([]Rule, []error) {
 			Text:        rr.Text,
 			Labels:      rr.Labels,
 			BenignLabel: rr.BenignLabel,
-			Threshold:   rr.Threshold,
+			Threshold:   threshold, // presence/range validated in Load, from the raw *float64
 			Stage:       rr.Stage,
 		}
 		if rr.Name != "" {
