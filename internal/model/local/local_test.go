@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -20,6 +21,15 @@ func TestWeights_Validate(t *testing.T) {
 		{"valid", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": 1}}, false},
 		{"missing benign label", Weights{Weight: map[string]float64{"x": 1}}, true},
 		{"missing weights", Weights{BenignLabel: "benign"}, true},
+		// R5 (round 2): a NaN/Inf bias or weight makes the scorer's every
+		// answer NaN forever (NaN propagates through the linear sum and
+		// sigmoid) without ever failing anywhere — a "dark rule" that
+		// looks registered and healthy but can never usefully score.
+		// Reject it at load time instead.
+		{"NaN bias", Weights{BenignLabel: "benign", Bias: math.NaN(), Weight: map[string]float64{"x": 1}}, true},
+		{"Inf bias", Weights{BenignLabel: "benign", Bias: math.Inf(1), Weight: map[string]float64{"x": 1}}, true},
+		{"NaN weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": math.NaN()}}, true},
+		{"Inf weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": math.Inf(-1)}}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -244,6 +254,34 @@ func TestLoadWeightsFile_ShippedConfig(t *testing.T) {
 		Features: map[string]float64{"resource_velocity_1h": 6, "key_velocity_1h": 4},
 	}); err != nil {
 		t.Fatalf("Score with shipped weights: %v", err)
+	}
+}
+
+// TestLoadWeightsFile_RejectsUnknownTopLevelField is R5 (round 2): strict
+// decoding (KnownFields) so a typo'd or stale top-level key
+// (e.g. "bais" instead of "bias") fails the load instead of silently
+// leaving that field at its zero value.
+func TestLoadWeightsFile_RejectsUnknownTopLevelField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "weights.yaml")
+	if err := os.WriteFile(path, []byte("version: v1\nbenign_label: benign\nbais: -2\nweights: {x: 1}\n"), 0o644); err != nil {
+		t.Fatalf("write weights file: %v", err)
+	}
+	if _, err := LoadWeightsFile(path); err == nil {
+		t.Fatalf("expected LoadWeightsFile to reject an unknown top-level field")
+	}
+}
+
+// TestLoadWeightsFile_RejectsNaN is R5: LoadWeightsFile's own load path
+// (not just a directly-constructed Weights{}) must reject a NaN bias.
+func TestLoadWeightsFile_RejectsNaN(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "weights.yaml")
+	if err := os.WriteFile(path, []byte("version: v1\nbenign_label: benign\nbias: .nan\nweights: {x: 1}\n"), 0o644); err != nil {
+		t.Fatalf("write weights file: %v", err)
+	}
+	if _, err := LoadWeightsFile(path); err == nil {
+		t.Fatalf("expected LoadWeightsFile to reject a NaN bias")
 	}
 }
 

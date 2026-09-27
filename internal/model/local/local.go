@@ -60,6 +60,19 @@ func (w Weights) Validate() error {
 	if len(w.Weight) == 0 {
 		return fmt.Errorf("local: weights.weights must have at least one entry")
 	}
+	// R5 (round 2): a NaN/Inf bias or weight makes every Score call return
+	// NaN forever (NaN propagates through the linear sum and sigmoid)
+	// without the scorer ever visibly failing — a "dark rule" that looks
+	// registered and healthy but can never produce a usable answer.
+	// Reject it at load time instead.
+	if math.IsNaN(w.Bias) || math.IsInf(w.Bias, 0) {
+		return fmt.Errorf("local: weights.bias must be a finite number, got %v", w.Bias)
+	}
+	for feature, weight := range w.Weight {
+		if math.IsNaN(weight) || math.IsInf(weight, 0) {
+			return fmt.Errorf("local: weights.weights[%q] must be a finite number, got %v", feature, weight)
+		}
+	}
 	return nil
 }
 
