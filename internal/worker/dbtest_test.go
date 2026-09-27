@@ -51,6 +51,34 @@ func unavailable(t *testing.T, format string, args ...any) {
 // newTestStore opens a throwaway, migrated database dedicated to one test.
 func newTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	dbURL, ok := newThrowawayDatabaseURL(t)
+	if !ok {
+		return nil
+	}
+	pool, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("open pool for %s: %v", dbURL, err)
+	}
+	t.Cleanup(pool.Close)
+
+	s := store.New(pool)
+	if err := s.ApplyMigrations(context.Background()); err != nil {
+		t.Fatalf("apply migrations: %v", err)
+	}
+	return s
+}
+
+// newThrowawayDatabaseURL provisions (and schedules cleanup of) a fresh,
+// empty database dedicated to one test, returning its connection URL —
+// the part of newTestStore's setup a caller needing more than one
+// *store.Store against the SAME database (e.g. R4 round 2's two-instance
+// lease test, which needs two Store values built with a custom
+// store.WithClaimLease, sharing one database the way two real worker
+// processes would share one production Postgres) can reuse directly
+// rather than duplicating. ok is false when the test was skipped/failed
+// because the underlying Postgres server itself is unreachable.
+func newThrowawayDatabaseURL(t *testing.T) (dbURL string, ok bool) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping DB-backed test in -short mode")
 	}
@@ -60,7 +88,7 @@ func newTestStore(t *testing.T) *store.Store {
 	probe, err := pgxpool.New(ctx, base)
 	if err != nil {
 		unavailable(t, "test database not available: %v", err)
-		return nil
+		return "", false
 	}
 	pingErr := probe.Ping(ctx)
 	probe.Close()
@@ -68,7 +96,7 @@ func newTestStore(t *testing.T) *store.Store {
 		var pgErr *pgconn.PgError
 		if !errors.As(pingErr, &pgErr) || pgErr.Code != "3D000" { // invalid_catalog_name: base db missing, server reachable
 			unavailable(t, "test database not available: %v", pingErr)
-			return nil
+			return "", false
 		}
 	}
 
@@ -79,24 +107,13 @@ func newTestStore(t *testing.T) *store.Store {
 	name := fmt.Sprintf("abusekit_worker_%d_%d", os.Getpid(), time.Now().UnixNano())
 	fresh := *u
 	fresh.Path = "/" + name
-	dbURL := fresh.String()
+	dbURL = fresh.String()
 
 	if err := createDatabase(ctx, base, name); err != nil {
 		t.Fatalf("create throwaway database %s: %v", name, err)
 	}
 	t.Cleanup(func() { _ = dropDatabase(context.Background(), base, name) })
-
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		t.Fatalf("open pool for %s: %v", name, err)
-	}
-	t.Cleanup(pool.Close)
-
-	s := store.New(pool)
-	if err := s.ApplyMigrations(ctx); err != nil {
-		t.Fatalf("apply migrations: %v", err)
-	}
-	return s
+	return dbURL, true
 }
 
 func createDatabase(ctx context.Context, baseURL, name string) error {

@@ -90,7 +90,7 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 		limit = DefaultClaimBatchSize
 	}
 	newSubjectCutoff := now.Add(-newSubjectAge)
-	claimedUntil := now.Add(DefaultClaimLease)
+	claimedUntil := now.Add(s.claimLeaseOrDefault())
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -194,6 +194,47 @@ func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string) error 
 	`, tenant, subject)
 	if err != nil {
 		return fmt.Errorf("store: release claim for %s: %w", subject, err)
+	}
+	return nil
+}
+
+// ExtendClaims pushes every (tenants[i], subjects[i])'s claimed_until out
+// to now+the configured claim lease, in one statement (R4 round 2).
+// tenants and subjects must be the same length; a length of 0 is a no-op.
+//
+// Called by internal/worker at the start of EVERY per-subject loop
+// iteration, for the WHOLE REMAINING TAIL of the current batch (not just
+// the one subject about to be processed), with a freshly-taken now — not
+// the tick-level now ClaimDirtySubjects used to claim the whole batch.
+// Proven necessary with only the ONE-subject-at-a-time version first
+// tried: with a 200ms lease and three subjects each taking 150ms to
+// score, the third subject's turn doesn't come up until 300ms in — 100ms
+// past its UNTOUCHED original claim (set once, batch-wide, at t=0) — so a
+// second instance's ClaimDirtySubjects call landing in that window would
+// still have reclaimed it even though the first instance was working
+// through the batch correctly. Re-extending the whole remaining tail on
+// every iteration (not just the current subject) means no claimed
+// subject's lease can ever lag behind actual elapsed time by more than
+// one iteration's own processing time — bounded by a single subject's
+// worst case (ScoreTimeout), never the whole batch's cumulative total.
+//
+// This intentionally does not check whether a subject is CURRENTLY
+// claimed (by this or any instance) before extending — it always sets
+// claimed_until unconditionally, the same as ClaimDirtySubjects' own
+// claiming UPDATE. The caller only ever calls this for subjects it just
+// claimed itself.
+func (s *Store) ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error {
+	if len(tenants) == 0 {
+		return nil
+	}
+	until := now.Add(s.claimLeaseOrDefault())
+	_, err := s.pool.Exec(ctx, `
+		UPDATE subjects s SET claimed_until = $1
+		FROM unnest($2::text[], $3::text[]) AS c(tenant, subject)
+		WHERE s.tenant = c.tenant AND s.subject = c.subject
+	`, until, tenants, subjects)
+	if err != nil {
+		return fmt.Errorf("store: extend claims: %w", err)
 	}
 	return nil
 }

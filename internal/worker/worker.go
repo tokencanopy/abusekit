@@ -91,6 +91,7 @@ type Store interface {
 	PruneRuleState(ctx context.Context, tenant, subject string, currentRules []string) error
 	RecordSubjectFailure(ctx context.Context, tenant, subject string, nextAttemptAt time.Time) error
 	ReleaseClaim(ctx context.Context, tenant, subject string) error
+	ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error
 	QueueStats(ctx context.Context, now time.Time) (depth int, oldestDirtyAge time.Duration, err error)
 }
 
@@ -317,14 +318,45 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 	}
 
 	result := TickResult{Claimed: len(dirty)}
-	for _, d := range dirty {
+	for i, d := range dirty {
 		if err := ctx.Err(); err != nil {
 			break
 		}
-		scored, err := w.scoreSubject(ctx, d, now)
+
+		// R4 round 2: extend the WHOLE remaining tail's claim lease from a
+		// freshly-taken now — not the tick-start now used to claim the
+		// batch — before processing this subject. A single-subject
+		// extension isn't enough: with a lease shorter than the batch's
+		// cumulative processing time, a subject further back in the queue
+		// would sit on its UNTOUCHED original claim until its own turn
+		// comes up, which can already be past that original lease's
+		// expiry. Re-extending everything still pending on every
+		// iteration bounds that gap to one subject's own worst-case
+		// scoring time, never the whole batch's.
+		subjectNow := w.deps.now()
+		remaining := dirty[i:]
+		tenants := make([]string, len(remaining))
+		subjects := make([]string, len(remaining))
+		for j, rd := range remaining {
+			tenants[j] = rd.Tenant
+			subjects[j] = rd.Subject
+		}
+		if err := w.deps.Store.ExtendClaims(ctx, tenants, subjects, subjectNow); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("%s/%s: extend claim: %w", d.Tenant, d.Subject, err))
+			retryAt := subjectNow.Add(backoffDuration(d.FailCount + 1))
+			if ferr := w.deps.Store.RecordSubjectFailure(ctx, d.Tenant, d.Subject, retryAt); ferr != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("%s/%s: record failure: %w", d.Tenant, d.Subject, ferr))
+			}
+			if w.deps.Metrics != nil {
+				w.deps.Metrics.IncSubjectsFailed()
+			}
+			continue
+		}
+
+		scored, err := w.scoreSubject(ctx, d, subjectNow)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Errorf("%s/%s: %w", d.Tenant, d.Subject, err))
-			retryAt := now.Add(backoffDuration(d.FailCount + 1))
+			retryAt := subjectNow.Add(backoffDuration(d.FailCount + 1))
 			if ferr := w.deps.Store.RecordSubjectFailure(ctx, d.Tenant, d.Subject, retryAt); ferr != nil {
 				result.Errors = append(result.Errors, fmt.Errorf("%s/%s: record failure: %w", d.Tenant, d.Subject, ferr))
 			}

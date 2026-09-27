@@ -62,6 +62,131 @@ func TestClaimDirtySubjects_LeaseExcludesAlreadyClaimedSubject(t *testing.T) {
 	}
 }
 
+func TestExtendClaims_PushesLeaseForwardPastTheOriginalClaim(t *testing.T) {
+	// R4 round 2: a batch whose per-subject processing time adds up to
+	// more than the lease a single tick-start claim set (a slow scorer,
+	// several subjects deep into a batch) must be able to extend an
+	// already-claimed subject's lease from a freshly-taken "now", or a
+	// second instance's ClaimDirtySubjects would see the ORIGINAL,
+	// now-too-old claimed_until and reselect it out from under the first.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T12:00:00Z")
+
+	appendAt(t, ctx, s, "acct_extend", "subject.created", now, nil)
+
+	claimed, err := s.ClaimDirtySubjects(ctx, now.Add(time.Minute), 0)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].Subject != "acct_extend" {
+		t.Fatalf("claim = %v, want exactly [acct_extend]", claimed)
+	}
+
+	// Without extending: moments before the ORIGINAL lease would expire,
+	// the subject is still correctly excluded (sanity check the fixture's
+	// own baseline before testing the extension itself).
+	stillExcluded, err := s.ClaimDirtySubjects(ctx, now.Add(time.Minute).Add(store.DefaultClaimLease).Add(-time.Second), 0)
+	if err != nil {
+		t.Fatalf("claim before extension: %v", err)
+	}
+	for _, d := range stillExcluded {
+		if d.Subject == "acct_extend" {
+			t.Fatalf("acct_extend was reclaimable before its original lease even expired")
+		}
+	}
+
+	// Extend from a LATER "now" (simulating this subject having actually
+	// started processing later in the batch than the tick-level claim
+	// time).
+	extendFrom := now.Add(time.Minute).Add(store.DefaultClaimLease).Add(-time.Second)
+	if err := s.ExtendClaims(ctx, []string{testTenant}, []string{"acct_extend"}, extendFrom); err != nil {
+		t.Fatalf("ExtendClaims: %v", err)
+	}
+
+	// Just past what the ORIGINAL claim's lease would have allowed: still
+	// excluded, because the extension pushed claimed_until out further.
+	pastOriginalLease := now.Add(time.Minute).Add(store.DefaultClaimLease).Add(time.Second)
+	afterOriginal, err := s.ClaimDirtySubjects(ctx, pastOriginalLease, 0)
+	if err != nil {
+		t.Fatalf("claim just past the original lease: %v", err)
+	}
+	for _, d := range afterOriginal {
+		if d.Subject == "acct_extend" {
+			t.Fatalf("acct_extend was reclaimed past its ORIGINAL lease — ExtendClaim did not take effect")
+		}
+	}
+
+	// Past the EXTENDED lease (extendFrom + DefaultClaimLease): reclaimable
+	// again.
+	pastExtendedLease := extendFrom.Add(store.DefaultClaimLease).Add(time.Second)
+	afterExtended, err := s.ClaimDirtySubjects(ctx, pastExtendedLease, 0)
+	if err != nil {
+		t.Fatalf("claim past the extended lease: %v", err)
+	}
+	found := false
+	for _, d := range afterExtended {
+		if d.Subject == "acct_extend" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("acct_extend was not reclaimable after its EXTENDED lease expired")
+	}
+}
+
+func TestExtendClaims_ExtendsEveryPairInOneCall(t *testing.T) {
+	// R4 round 2: internal/worker calls this for the WHOLE remaining tail
+	// of a batch each iteration, not one subject at a time — must actually
+	// extend every (tenant, subject) pair given, not just the first.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T13:00:00Z")
+
+	appendAt(t, ctx, s, "acct_extend_multi_1", "subject.created", now, nil)
+	appendAt(t, ctx, s, "acct_extend_multi_2", "subject.created", now, nil)
+
+	claimed, err := s.ClaimDirtySubjects(ctx, now.Add(time.Minute), 0)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	claimedSubjects := map[string]bool{}
+	for _, d := range claimed {
+		claimedSubjects[d.Subject] = true
+	}
+	if !claimedSubjects["acct_extend_multi_1"] || !claimedSubjects["acct_extend_multi_2"] {
+		t.Fatalf("claim = %v, want both acct_extend_multi_1 and acct_extend_multi_2", claimed)
+	}
+
+	extendFrom := now.Add(time.Minute).Add(store.DefaultClaimLease).Add(-time.Second)
+	if err := s.ExtendClaims(ctx,
+		[]string{testTenant, testTenant},
+		[]string{"acct_extend_multi_1", "acct_extend_multi_2"},
+		extendFrom,
+	); err != nil {
+		t.Fatalf("ExtendClaims: %v", err)
+	}
+
+	pastOriginalLease := now.Add(time.Minute).Add(store.DefaultClaimLease).Add(time.Second)
+	afterOriginal, err := s.ClaimDirtySubjects(ctx, pastOriginalLease, 0)
+	if err != nil {
+		t.Fatalf("claim just past the original lease: %v", err)
+	}
+	for _, d := range afterOriginal {
+		if d.Subject == "acct_extend_multi_1" || d.Subject == "acct_extend_multi_2" {
+			t.Fatalf("%s was reclaimed past its ORIGINAL lease — ExtendClaims did not extend every pair", d.Subject)
+		}
+	}
+}
+
+func TestExtendClaims_EmptyIsANoop(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.ExtendClaims(ctx, nil, nil, mustTime(t, "2031-09-27T13:00:00Z")); err != nil {
+		t.Fatalf("ExtendClaims with no pairs: %v", err)
+	}
+}
+
 func TestClaimDirtySubjects_ReleasedByUpsertVerdicts(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

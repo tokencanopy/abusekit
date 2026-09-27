@@ -76,6 +76,10 @@ func (f *fakeStore) ReleaseClaim(ctx context.Context, tenant, subject string) er
 	return f.real.ReleaseClaim(ctx, tenant, subject)
 }
 
+func (f *fakeStore) ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error {
+	return f.real.ExtendClaims(ctx, tenants, subjects, now)
+}
+
 func (f *fakeStore) QueueStats(ctx context.Context, now time.Time) (int, time.Duration, error) {
 	return f.real.QueueStats(ctx, now)
 }
