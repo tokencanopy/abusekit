@@ -138,6 +138,38 @@ func TestAppendEvents_BumpsSubjectDirtySeq(t *testing.T) {
 	}
 }
 
+// TestAppendEvents_NeverReturnsAcceptedAlongsideError is B3: on an
+// unexpected DB-level error partway through a batch, the whole call must
+// report the error with an EMPTY result, never a partial Accepted list
+// alongside a non-nil error. e2 deliberately bypasses Validate (which
+// would normally reject a NUL byte per B1) to exercise AppendEvents' own
+// INSERT failure path directly — a NUL byte in a text column is exactly
+// the Postgres 22021/22P05 error the design references, and B1 makes it
+// unreachable from real ingest traffic, but the store's own contract must
+// still hold if it ever happens (a bug elsewhere, a future caller that
+// forgets to Validate, ...): the transaction rolls back everything
+// regardless, so a caller trusting a returned Accepted id here would
+// believe an event was durably stored when it was not.
+func TestAppendEvents_NeverReturnsAcceptedAlongsideError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-01-01T00:00:00Z")
+
+	e1 := mkEvent(t, "evt_ok", "acct_partial", "resource.created", now, map[string]any{"kind": "agent", "name": "a"})
+	e2 := event.Event{
+		ID: "evt_bad", Subject: "acct_partial\x00bad", Type: "resource.created", At: now.Add(time.Second),
+		Data: map[string]any{"kind": "agent", "name": "b"},
+	}
+
+	res, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{e1, e2})
+	if err == nil {
+		t.Fatalf("expected an error from the NUL byte in e2's subject")
+	}
+	if len(res.Accepted) != 0 || len(res.Duplicates) != 0 || len(res.Rejected) != 0 {
+		t.Fatalf("expected an empty AppendResult alongside an error, got %+v", res)
+	}
+}
+
 func TestAppendEvents_SubjectClassUpdatesSubjectRow(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

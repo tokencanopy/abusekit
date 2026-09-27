@@ -52,18 +52,24 @@ type AppendResult struct {
 // per-event durability independent of a batch failure should call this
 // once per event, at the cost of losing the (small) efficiency of a
 // shared transaction.
+//
+// AppendEvents never returns a non-empty AppendResult alongside a non-nil
+// error (design §4.2/§4.3: per-item rejection is how a partial batch is
+// reported — a batch-level error means the whole transaction rolled back,
+// so any result accumulated so far never actually committed and must not
+// be handed back as if it had).
 func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, events []event.Event) (AppendResult, error) {
-	var result AppendResult
 	if len(events) == 0 {
-		return result, nil
+		return AppendResult{}, nil
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return result, fmt.Errorf("store: begin append transaction: %w", err)
+		return AppendResult{}, fmt.Errorf("store: begin append transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
+	var result AppendResult
 	for i, e := range events {
 		bodyHash, err := e.BodyHash()
 		if err != nil {
@@ -74,11 +80,11 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 		}
 		linksJSON, err := json.Marshal(e.Links)
 		if err != nil {
-			return result, fmt.Errorf("store: marshal links for event %s: %w", e.ID, err)
+			return AppendResult{}, fmt.Errorf("store: marshal links for event %s: %w", e.ID, err)
 		}
 		dataJSON, err := json.Marshal(e.Data)
 		if err != nil {
-			return result, fmt.Errorf("store: marshal data for event %s: %w", e.ID, err)
+			return AppendResult{}, fmt.Errorf("store: marshal data for event %s: %w", e.ID, err)
 		}
 
 		var seq int64
@@ -91,7 +97,7 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
-				return result, fmt.Errorf("store: insert event %s: %w", e.ID, err)
+				return AppendResult{}, fmt.Errorf("store: insert event %s: %w", e.ID, err)
 			}
 			// ON CONFLICT DO NOTHING means no row was returned: this
 			// (tenant, producer, id) already exists. Decide
@@ -102,7 +108,7 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 				tenant, producer, e.ID,
 			).Scan(&existingHash)
 			if lookupErr != nil {
-				return result, fmt.Errorf("store: look up existing event %s: %w", e.ID, lookupErr)
+				return AppendResult{}, fmt.Errorf("store: look up existing event %s: %w", e.ID, lookupErr)
 			}
 			if existingHash == bodyHash {
 				result.Duplicates = append(result.Duplicates, e.ID)
@@ -116,7 +122,7 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 		}
 
 		if err := touchSubjectTx(ctx, tx, tenant, e.Subject, e.At); err != nil {
-			return result, err
+			return AppendResult{}, err
 		}
 		if e.Type == "subject.class" {
 			if class, ok := e.Data["class"].(string); ok && class != "" {
@@ -124,13 +130,13 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 					`UPDATE subjects SET class = $1 WHERE tenant = $2 AND subject = $3`,
 					class, tenant, e.Subject,
 				); err != nil {
-					return result, fmt.Errorf("store: update subject class for %s: %w", e.Subject, err)
+					return AppendResult{}, fmt.Errorf("store: update subject class for %s: %w", e.Subject, err)
 				}
 			}
 		}
 		for _, kh := range e.Links.Kinds() {
 			if err := upsertLinkTx(ctx, tx, tenant, kh.Kind, kh.Hash, e.Subject, e.At); err != nil {
-				return result, err
+				return AppendResult{}, err
 			}
 		}
 
@@ -138,7 +144,7 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return result, fmt.Errorf("store: commit append transaction: %w", err)
+		return AppendResult{}, fmt.Errorf("store: commit append transaction: %w", err)
 	}
 	return result, nil
 }
