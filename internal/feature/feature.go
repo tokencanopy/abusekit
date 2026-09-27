@@ -25,8 +25,21 @@ import (
 // resource_* totals, never to key_*). resource.created's `kind` field is
 // free text in internal/event's redaction schema (no enum, unlike e.g.
 // email_domain_class), so this is a convention producers must follow, not
-// something ingest itself enforces.
+// something ingest itself enforces. Compared case/whitespace-insensitively
+// (S10 fix round) since it's producer-supplied free text.
 const resourceKindKey = "key"
+
+// subjectAgeClampHours and upgradeDelayClampMinutes bound the two
+// unbounded-by-construction time features (B5 fix round, proven to
+// otherwise swamp the local scorer's linear model for a multi-day-old
+// account: a 14-day-old dormant-then-blast subject's raw upgrade_delay_min
+// alone could run into the tens of thousands). Both features saturate at
+// 24h once an account is at least that old/that far from a paid upgrade,
+// which is exactly the design's own suggested treatment.
+const (
+	subjectAgeClampHours     = 24
+	upgradeDelayClampMinutes = 24 * 60
+)
 
 // Names is the ordered, canonical list of every v0 feature Extract
 // computes — matching design §4.5's new_account_velocity inputs list
@@ -42,6 +55,7 @@ var Names = []string{
 	"key_velocity_1h",
 	"key_total",
 	"upgrade_delay_min",
+	"upgraded",
 	"declines_before_first_success",
 	"first_funding_prepaid",
 	"name_brand_match",
@@ -51,6 +65,7 @@ var Names = []string{
 	"linked_deleted_n",
 	"linked_labelled_abusive_n",
 	"fingerprint_seen_on_other_subjects",
+	"neighbors_truncated",
 	"burst_ratio_24h_vs_lifetime",
 }
 
@@ -60,7 +75,11 @@ var Names = []string{
 type Features struct {
 	// SubjectAgeH is hours between the subject's first-ever event and
 	// Windows.Now, floored at 0 (a clock-skewed event slightly in the
-	// future would otherwise make this negative).
+	// future would otherwise make this negative) and capped at
+	// subjectAgeClampHours (B5: an old account must not swamp the linear
+	// model through this feature alone — burst_ratio_24h_vs_lifetime is
+	// what actually distinguishes "old and quiet" from "old and just
+	// burst").
 	SubjectAgeH float64
 	// ResourceVelocity1h / ResourceTotal count every resource.created
 	// event (any kind) in the trailing Windows.OneHour window, and over
@@ -69,20 +88,26 @@ type Features struct {
 	ResourceTotal      float64
 	// KeyVelocity1h / KeyTotal are ResourceVelocity1h/ResourceTotal
 	// restricted to resource.created events whose `kind` is "key"
-	// (resourceKindKey) — API-key creation velocity specifically, since a
-	// burst of keys is often a stronger abuse signal than agents alone.
+	// (resourceKindKey, compared case/whitespace-insensitively) — API-key
+	// creation velocity specifically, since a burst of keys is often a
+	// stronger abuse signal than agents alone.
 	KeyVelocity1h float64
 	KeyTotal      float64
 	// UpgradeDelayMin is minutes between the subject's first event and its
-	// first subscription.changed event. A subject with no
-	// subscription.changed event yet uses minutes-elapsed-so-far instead
-	// of a sentinel: it is a genuine (if provisional) answer to "how long
-	// after signup, so far, has this account NOT upgraded", grows the
-	// longer an account goes without upgrading (correctly reducing this
-	// feature's — negatively weighted — contribution to risk over time),
-	// and never needs the local scorer or Combine to special-case a
-	// sentinel value.
+	// first PAID subscription.changed event (amount_minor > 0 — B5: a
+	// free-plan change or a cancellation must never count as an
+	// "upgrade"). A subject with no paid upgrade yet uses
+	// minutes-elapsed-so-far instead of a sentinel, clamped (with the paid
+	// case) at upgradeDelayClampMinutes so neither a genuinely fast
+	// upgrade nor a long-unresolved non-upgrade can swamp the model. See
+	// Upgraded for whether a paid upgrade has happened at all — the two
+	// are deliberately separate features (design open question / B5):
+	// UpgradeDelayMin alone can't distinguish "just upgraded, delay
+	// unknown yet" from "never upgraded, waited the full clamp window".
 	UpgradeDelayMin float64
+	// Upgraded is 1 when the subject has ever recorded a PAID
+	// subscription.changed event (amount_minor > 0), else 0.
+	Upgraded float64
 	// DeclinesBeforeFirstSuccess counts payment.attempt events with
 	// outcome "declined" that occurred before the subject's first
 	// "succeeded" attempt. Before any success, this is a running count of
@@ -94,8 +119,8 @@ type Features struct {
 	// successful attempt yet").
 	FirstFundingPrepaid float64
 	// NameBrandMatch is 1 when any resource.created/resource.deleted
-	// event's name_skeleton (internal/event.Skeleton's homoglyph-folded
-	// form) contains a curated brand name (see brandNames), else 0.
+	// event's raw `name` field matches a curated, word/token-boundary-aware
+	// brand name (BrandSet, config/brands.yaml, S3 fix round), else 0.
 	NameBrandMatch float64
 	// NameHasAt is 1 when any resource.created/resource.deleted event's
 	// raw `name` field contains a literal "@" (checked on the RAW name,
@@ -104,8 +129,9 @@ type Features struct {
 	// feature exists to catch), else 0.
 	NameHasAt float64
 	// FirstDayDistinctDomains counts distinct content.sent
-	// recipient_domain values seen within the subject's first 24h
-	// (Windows.DayHour) of existence — design's "first-day recipient
+	// recipient_domain values (case-folded, S10 — "Example.TEST" and
+	// "example.test" are the same domain) seen within the subject's first
+	// 24h (Windows.DayHour) of existence — design's "first-day recipient
 	// fan-out" (§1). Unlike the *_24h features below, this window is
 	// anchored to the subject's first event, not to Windows.Now: once the
 	// first day has passed, this feature is permanently fixed.
@@ -119,9 +145,16 @@ type Features struct {
 	SelfSendBeforeExternal float64
 	// LinkedDeletedN / LinkedLabelledAbusiveN count this subject's
 	// same-tenant neighbours (design §4.2, via the injected Neighbors —
-	// ASN-excluded by default, see Config.IncludeASN) that have ever
-	// emitted a subject.deleted event, or carry an "abusive" label,
-	// respectively.
+	// see Config for which link kinds count as evidence by default)
+	// that have ever emitted a PERMANENT subject.deleted event (a
+	// trash-mode deletion — reversible within e2a's own retention window —
+	// does not count; N3 fix round: a later-restored trash deletion must
+	// not read as abandonment forever), or carry an "abusive" label,
+	// respectively. LinkedDeletedN saturates at 3 (S1 fix round): past
+	// that point additional deleted neighbours are strong-but-not-linearly-
+	// stronger evidence, and an unbounded count let a long churn chain
+	// dominate the score far past the threshold that already established
+	// "this is a churn incarnation".
 	LinkedDeletedN         float64
 	LinkedLabelledAbusiveN float64
 	// FingerprintSeenOnOtherSubjects is 1 when this subject shares a
@@ -129,8 +162,15 @@ type Features struct {
 	// subject, else 0. Unlike LinkedDeletedN/LinkedLabelledAbusiveN, this
 	// specifically checks the card_fingerprint_hash link kind (design's
 	// incident narrative: "several stolen-card declines" reused across
-	// accounts) and is not affected by Config.IncludeASN.
+	// accounts) and is always considered regardless of Config's
+	// link-kind-inclusion knobs.
 	FingerprintSeenOnOtherSubjects float64
+	// NeighborsTruncated is 1 when the same-tenant neighbour discovery
+	// backing the linked_* features above hit design §4.2's fan-in cap (S1
+	// fix round: the design explicitly calls for surfacing this as a
+	// feature — "neighbors_truncated=true (a feature)" — rather than
+	// silently under-counting evidence when a link key fans out wide).
+	NeighborsTruncated float64
 	// BurstRatio24hVsLifetime is the fraction of the subject's lifetime
 	// resource.created + content.sent activity that fell within the
 	// trailing Windows.DayHour window: close to 1.0 for a brand-new
@@ -151,6 +191,7 @@ func (f Features) Map() map[string]float64 {
 		"key_velocity_1h":                    f.KeyVelocity1h,
 		"key_total":                          f.KeyTotal,
 		"upgrade_delay_min":                  f.UpgradeDelayMin,
+		"upgraded":                           f.Upgraded,
 		"declines_before_first_success":      f.DeclinesBeforeFirstSuccess,
 		"first_funding_prepaid":              f.FirstFundingPrepaid,
 		"name_brand_match":                   f.NameBrandMatch,
@@ -160,6 +201,7 @@ func (f Features) Map() map[string]float64 {
 		"linked_deleted_n":                   f.LinkedDeletedN,
 		"linked_labelled_abusive_n":          f.LinkedLabelledAbusiveN,
 		"fingerprint_seen_on_other_subjects": f.FingerprintSeenOnOtherSubjects,
+		"neighbors_truncated":                f.NeighborsTruncated,
 		"burst_ratio_24h_vs_lifetime":        f.BurstRatio24hVsLifetime,
 	}
 }
@@ -195,7 +237,8 @@ func DefaultWindows(now time.Time) Windows {
 // linked_* features need about one subject (design §4.2).
 type NeighborEvidence struct {
 	// DeletedCount is how many of the subject's same-tenant neighbours
-	// have ever emitted a subject.deleted event.
+	// have ever emitted a PERMANENT subject.deleted event (see
+	// Features.LinkedDeletedN).
 	DeletedCount int
 	// LabelledAbusiveCount is how many of the subject's same-tenant
 	// neighbours carry an "abusive" label.
@@ -204,13 +247,16 @@ type NeighborEvidence struct {
 	// card_fingerprint_hash link with at least one other same-tenant
 	// subject.
 	FingerprintShared bool
+	// Truncated reports whether discovering the evidence above hit design
+	// §4.2's fan-in cap (S1 fix round) — see Features.NeighborsTruncated.
+	Truncated bool
 }
 
 // Neighbors resolves NeighborEvidence for one subject. Extract depends on
 // this narrow interface rather than on internal/store directly, so a unit
 // test can supply canned evidence without a database (see NoNeighbors),
-// and so the ASN-inclusion policy (design's open question, Config) lives
-// in the one implementation that actually queries link kinds
+// and so the link-kind-inclusion policy (design's open question, Config)
+// lives in the one implementation that actually queries link kinds
 // (StoreNeighbors), not in Extract itself.
 type Neighbors interface {
 	Evidence(ctx context.Context, tenant, subject string) (NeighborEvidence, error)
@@ -235,7 +281,9 @@ func (noNeighbors) Evidence(context.Context, string, string) (NeighborEvidence, 
 // feature-window expiry"). The zero time.Time means "nothing pending" —
 // no window feature is currently keeping any event artificially "current"
 // past its natural expiry, so only a new event (bumping dirty_seq) will
-// bring the subject back into the worker's queue.
+// bring the subject back into the worker's queue. internal/worker combines
+// this with rule-retry and budget-reset scheduling (design §4.8 / B4 fix
+// round) that Extract has no visibility into.
 type Result struct {
 	Features      Features
 	NextRescoreAt time.Time
@@ -245,7 +293,7 @@ type Result struct {
 // event.Event ever stored for (tenant, subject), sorted oldest-first
 // (internal/store.EventsForSubject's own contract already guarantees this
 // order; Extract does not re-sort or deduplicate) — plus neighbors'
-// same-tenant linking evidence, as of windows.Now.
+// same-tenant linking evidence and a brand list, as of windows.Now.
 //
 // events empty returns the zero Result (every feature 0/false, no pending
 // rescore), never an error: "no events yet" is a normal state (e.g. a
@@ -254,8 +302,9 @@ type Result struct {
 // events for), not a caller mistake.
 //
 // neighbors nil is treated as NoNeighbors, a convenience for a caller (or
-// test) that doesn't care about the linked_* features.
-func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows) (Result, error) {
+// test) that doesn't care about the linked_* features. brands' zero value
+// (BrandSet{}) holds name_brand_match at 0.
+func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet) (Result, error) {
 	if windows.Now.IsZero() {
 		return Result{}, fmt.Errorf("feature: windows.Now must be set")
 	}
@@ -289,15 +338,17 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		KeyVelocity1h:                  resourceCount(events, resourceKindKey, now, windows.OneHour),
 		KeyTotal:                       resourceCount(events, resourceKindKey, now, 0),
 		UpgradeDelayMin:                upgradeDelayMinutes(events, firstSeenAt, now),
+		Upgraded:                       upgraded(events),
 		DeclinesBeforeFirstSuccess:     declinesBeforeFirstSuccess(events),
 		FirstFundingPrepaid:            firstFundingPrepaid(events),
-		NameBrandMatch:                 nameBrandMatch(events),
+		NameBrandMatch:                 nameBrandMatch(events, brands),
 		NameHasAt:                      nameHasAt(events),
 		FirstDayDistinctDomains:        firstDayDistinctDomains(events, firstSeenAt, windows.DayHour),
 		SelfSendBeforeExternal:         selfSendBeforeExternal(events),
-		LinkedDeletedN:                 float64(ev.DeletedCount),
+		LinkedDeletedN:                 saturate(ev.DeletedCount, 3),
 		LinkedLabelledAbusiveN:         float64(ev.LabelledAbusiveCount),
 		FingerprintSeenOnOtherSubjects: boolToFloat(ev.FingerprintShared),
+		NeighborsTruncated:             boolToFloat(ev.Truncated),
 		BurstRatio24hVsLifetime:        burstRatio(events, now, windows.DayHour),
 	}
 
@@ -314,13 +365,21 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
-// dataString and dataBool read a possibly-absent, possibly-wrong-typed key
-// out of an event's already-redacted Data map. internal/event.Redact
-// guarantees a listed field's dynamic type matches its declared kind, but
-// Extract has no way to know an event actually went through Redact (a test
-// building event.Event by hand, or a future caller feeding it raw), so
-// every read here degrades to "absent" on a type mismatch rather than
-// panicking on a failed type assertion.
+// saturate caps n at max (S1 fix round: linked_deleted_n's saturating cap).
+func saturate(n, max int) float64 {
+	if n > max {
+		n = max
+	}
+	return float64(n)
+}
+
+// dataString, dataBool and dataNumber read a possibly-absent,
+// possibly-wrong-typed key out of an event's already-redacted Data map.
+// internal/event.Redact guarantees a listed field's dynamic type matches
+// its declared kind, but Extract has no way to know an event actually went
+// through Redact (a test building event.Event by hand, or a future caller
+// feeding it raw), so every read here degrades to "absent" on a type
+// mismatch rather than panicking on a failed type assertion.
 func dataString(data map[string]any, key string) (string, bool) {
 	v, ok := data[key]
 	if !ok {
@@ -337,4 +396,17 @@ func dataBool(data map[string]any, key string) (bool, bool) {
 	}
 	b, ok := v.(bool)
 	return b, ok
+}
+
+// dataNumber reads a numeric field. encoding/json decodes every JSON
+// number into float64, which is also what a test constructing
+// map[string]any by hand should use (as the real ingest path's redacted
+// events always do).
+func dataNumber(data map[string]any, key string) (float64, bool) {
+	v, ok := data[key]
+	if !ok {
+		return 0, false
+	}
+	f, ok := v.(float64)
+	return f, ok
 }

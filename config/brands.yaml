@@ -1,0 +1,29 @@
+# config/brands.yaml — the curated brand-impersonation name list
+# (internal/feature.LoadBrandsFile, design §1, S3 fix round).
+#
+# Data, not logic: reviewed and extended like any other config, matched via
+# internal/feature.BrandSet's word/token-boundary-aware matcher — never a
+# bare substring check — after Skeleton-folding both the candidate text and
+# every name/alias below.
+#
+# Deliberately excluded: apple, stripe, google, amazon, dhl, ebay, chase,
+# ups, irs, microsoft. These are generic enough that they appear constantly
+# in legitimate agent/integration names ("Stripe Webhook Relay", "Google
+# Calendar Sync", "Microsoft Teams Relay") — word-boundary matching alone
+# cannot tell "impersonating Stripe" from "a real Stripe integration named
+# after Stripe", so flagging on the bare brand word would false-positive on
+# exactly the kind of automation traffic abusekit's first consumer runs.
+# Proper context-aware matching is future work (see docs/design's open
+# questions); until then these stay out of the default list rather than in
+# it and noisy.
+brands:
+  - name: PayPal
+    aliases: ["Pay Pal"]
+  - name: Netflix
+  - name: Coinbase
+  - name: Binance
+  - name: Wells Fargo
+  - name: Bank of America
+  - name: Walmart
+  - name: USPS
+  - name: FedEx

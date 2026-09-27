@@ -160,7 +160,7 @@ func TestStoreNeighbors_ExcludesASNByDefault(t *testing.T) {
 	asn := "AS64500"
 	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{ASN: asn}, nil)
 	mustAppend(t, ctx, s, "acct_b", "subject.created", now, event.Links{ASN: asn}, nil)
-	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "trash"})
+	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "permanent"})
 
 	n := feature.NewStoreNeighbors(s, feature.Config{IncludeASN: false})
 	ev, err := n.Evidence(ctx, testTenant, "acct_a")
@@ -234,6 +234,123 @@ func TestStoreNeighbors_FingerprintSharedIsCardSpecific(t *testing.T) {
 	}
 	if evNoFingerprint.FingerprintShared {
 		t.Errorf("FingerprintShared = true for acct_c, want false (only shares an ASN, no card fingerprint)")
+	}
+}
+
+func TestStoreNeighbors_UAHashExcludedByDefault(t *testing.T) {
+	// S1 fix round, proven: a shared ua_hash ALONE (the same email client or
+	// SDK — extremely common) previously produced linked_deleted_n=1 for a
+	// totally unrelated subject.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	ua := hexHash("shared-user-agent")
+	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{UAHash: ua}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.created", now, event.Links{UAHash: ua}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "permanent"})
+
+	n := feature.NewStoreNeighbors(s, feature.Config{})
+	ev, err := n.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if ev.DeletedCount != 0 {
+		t.Errorf("with a shared ua_hash only and IncludeUAHash unset: DeletedCount = %d, want 0", ev.DeletedCount)
+	}
+
+	n2 := feature.NewStoreNeighbors(s, feature.Config{IncludeUAHash: true})
+	ev2, err := n2.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if ev2.DeletedCount != 1 {
+		t.Errorf("with IncludeUAHash=true: DeletedCount = %d, want 1", ev2.DeletedCount)
+	}
+}
+
+func TestStoreNeighbors_IP24HashExcludedByDefault(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	ip := hexHash("shared-ip24")
+	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{IP24Hash: ip}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.created", now, event.Links{IP24Hash: ip}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "permanent"})
+
+	n := feature.NewStoreNeighbors(s, feature.Config{})
+	ev, err := n.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if ev.DeletedCount != 0 {
+		t.Errorf("with a shared ip24_hash only and IncludeIP24Hash unset: DeletedCount = %d, want 0", ev.DeletedCount)
+	}
+}
+
+func TestStoreNeighbors_DeviceHashIncludedByDefault(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	device := hexHash("shared-device")
+	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{DeviceHash: device}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.created", now, event.Links{DeviceHash: device}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "permanent"})
+
+	n := feature.NewStoreNeighbors(s, feature.Config{})
+	ev, err := n.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if ev.DeletedCount != 1 {
+		t.Errorf("device_hash should count by default: DeletedCount = %d, want 1", ev.DeletedCount)
+	}
+}
+
+func TestStoreNeighbors_TrashModeDeletionDoesNotCount(t *testing.T) {
+	// N3 fix round: a trash-mode deletion is reversible (e2a's own
+	// soft-deletion design supports restoring one within the retention
+	// window), so it must not count as permanent-abandonment evidence.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	emailHash := hexHash("trash-mode-email")
+	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{EmailHash: emailHash}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.created", now, event.Links{EmailHash: emailHash}, nil)
+	mustAppend(t, ctx, s, "acct_b", "subject.deleted", now.Add(time.Minute), event.Links{}, map[string]any{"mode": "trash"})
+
+	n := feature.NewStoreNeighbors(s, feature.Config{})
+	ev, err := n.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if ev.DeletedCount != 0 {
+		t.Errorf("a trash-mode deletion should not count: DeletedCount = %d, want 0", ev.DeletedCount)
+	}
+}
+
+func TestStoreNeighbors_NeighborsTruncatedPropagates(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	emailHash := hexHash("fanned-out-email")
+	mustAppend(t, ctx, s, "acct_a", "subject.created", now, event.Links{EmailHash: emailHash}, nil)
+	// One more than store.DefaultNeighborCapPerKey (50) sharing the same key.
+	for i := 0; i < store.DefaultNeighborCapPerKey+1; i++ {
+		mustAppend(t, ctx, s, fmt.Sprintf("acct_fanout_%d", i), "subject.created", now, event.Links{EmailHash: emailHash}, nil)
+	}
+
+	n := feature.NewStoreNeighbors(s, feature.Config{})
+	ev, err := n.Evidence(ctx, testTenant, "acct_a")
+	if err != nil {
+		t.Fatalf("Evidence: %v", err)
+	}
+	if !ev.Truncated {
+		t.Errorf("Truncated = false, want true when the fan-in cap is exceeded")
 	}
 }
 
