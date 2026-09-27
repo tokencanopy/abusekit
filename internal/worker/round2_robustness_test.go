@@ -61,3 +61,51 @@ func TestSafeScore_StillRecoversAPanicInTheGoroutine(t *testing.T) {
 		t.Fatalf("expected a panic to surface as an error")
 	}
 }
+
+// TestStartStop_ConcurrentStartAndStopRace is R9 round 2. Proven risk: the
+// original Start set w.cancel/w.done under w.mu, and Stop read them under
+// the SAME mutex — individually race-free, but if a caller's own
+// `go w.Start(ctx); w.Stop()` pattern (Start's own doc comment says Stop
+// is callable from another goroutine while Start runs in its own — that's
+// the whole reason Stop exists as a separate method) has Stop's goroutine
+// win the race and run BEFORE Start has gotten far enough to set w.cancel,
+// Stop sees a nil cancel and treats it as "Start was never called",
+// returning immediately as a no-op — even though Start is about to run its
+// scoring loop indefinitely, now with nothing left to ever stop it.
+//
+// Repeated many times (the race window is a handful of instructions
+// between the `go` statement and Start's first mutex acquisition — small,
+// but real, and -race widens it) rather than relying on a single
+// precisely-timed reproduction.
+func TestStartStop_ConcurrentStartAndStopRace(t *testing.T) {
+	s := newTestStore(t)
+	cfg := loadShippedConfig(t)
+
+	const iterations = 200
+	for i := 0; i < iterations; i++ {
+		w, err := New(Deps{Store: s, Config: cfg, Interval: time.Millisecond, Logger: discardLogger()})
+		if err != nil {
+			t.Fatalf("iteration %d: New: %v", i, err)
+		}
+
+		startReturned := make(chan struct{})
+		go func() {
+			w.Start(context.Background())
+			close(startReturned)
+		}()
+		w.Stop() // races Start's own goroutine, deliberately with no synchronization in between
+
+		select {
+		case <-startReturned:
+			// expected: Start honored the (possibly pre-empted) stop and
+			// returned, whether or not it ever ran a tick.
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d: Start did not return after a concurrent Stop — the Start/Stop race left it running forever", i)
+		}
+	}
+}
+
+// R9 round 2's other half ("Stop on a never-started worker is a no-op")
+// is already covered by robustness_test.go's existing
+// TestStop_NoopWithoutStart, unaffected by this round's changes — not
+// duplicated here.

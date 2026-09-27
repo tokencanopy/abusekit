@@ -181,9 +181,10 @@ type TickResult struct {
 type Worker struct {
 	deps Deps
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	done    chan struct{}
+	stopped bool // R9 round 2: Stop() was called, possibly before Start() finished initializing — see both methods' doc comments.
 }
 
 // New validates deps and returns a Worker, applying documented defaults
@@ -223,6 +224,17 @@ func New(deps Deps) (*Worker, error) {
 // Stop can cancel it independently of whatever the caller's ctx does; call
 // Start at most once per Worker (starting it twice is not supported and
 // leaves the first goroutine's cancel/done state overwritten).
+//
+// R9 round 2: a caller may legitimately run `go w.Start(ctx)` and call
+// Stop from another goroutine with NO synchronization in between (that is
+// the entire reason Stop exists as its own method rather than just asking
+// the caller to cancel ctx itself) — if Stop's goroutine wins that race
+// and runs before Start has set w.cancel, it must not silently treat that
+// as "Start was never called" and no-op, leaving this goroutine's loop
+// running with nothing left able to stop it. Start checks w.stopped
+// (set under the SAME mutex Stop uses) right after recording its own
+// cancel/done, and honors an already-requested stop immediately rather
+// than entering the ticking loop at all.
 func (w *Worker) Start(ctx context.Context) {
 	runCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -230,9 +242,14 @@ func (w *Worker) Start(ctx context.Context) {
 	w.mu.Lock()
 	w.cancel = cancel
 	w.done = done
+	alreadyStopped := w.stopped
 	w.mu.Unlock()
 
 	defer close(done)
+
+	if alreadyStopped {
+		return
+	}
 
 	ticker := time.NewTicker(w.deps.Interval)
 	defer ticker.Stop()
@@ -258,9 +275,14 @@ func (w *Worker) Start(ctx context.Context) {
 // returned (B2 fix round) — a caller past Stop() can rely on the worker
 // having stopped touching the store, not just having been asked to. Safe
 // to call more than once, and safe to call even if Start was never called
-// (a no-op in that case).
+// (a no-op in that case) — including when Stop happens to run BEFORE a
+// concurrently-starting Start has recorded its cancel func yet (R9 round
+// 2): this always records the stop request first, under the same mutex
+// Start checks right after its own setup, so a race between the two never
+// leaves the worker running with no way left to stop it.
 func (w *Worker) Stop() {
 	w.mu.Lock()
+	w.stopped = true
 	cancel := w.cancel
 	done := w.done
 	w.mu.Unlock()
