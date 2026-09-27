@@ -13,6 +13,8 @@ package model
 import (
 	"context"
 	"errors"
+	"sort"
+	"strings"
 )
 
 // LabelMode describes which label sets a Scorer can be asked to score
@@ -76,9 +78,11 @@ func (m LabelMode) Accepts(labels []string) bool {
 }
 
 // Equal reports whether m and other describe the same label set: both
-// Open, or both Fixed with identical (order-independent) sets. Used by
-// Vote (below) to enforce "vote(...) members with differing label sets"
-// (design §4.5) is a config-load error.
+// Open, or both Fixed with identical (order-independent) sets. Design
+// §4.5's "vote(...) members with differing label sets" load-time check
+// will use this once vote is reintroduced (see the TODO in
+// internal/config's resolveScorer); TestLabelMode exercises it directly
+// until then.
 func (m LabelMode) Equal(other LabelMode) bool {
 	if m.open != other.open {
 		return false
@@ -87,6 +91,17 @@ func (m LabelMode) Equal(other LabelMode) bool {
 		return true
 	}
 	return m.Accepts(other.fixed) && other.Accepts(m.fixed)
+}
+
+// String gives a stable, human-readable rendering of a LabelMode for
+// error messages (e.g. "fixed[abusive,benign]" or "open").
+func (m LabelMode) String() string {
+	if m.open {
+		return "open"
+	}
+	sorted := append([]string(nil), m.fixed...)
+	sort.Strings(sorted)
+	return "fixed[" + strings.Join(sorted, ",") + "]"
 }
 
 // Capabilities describes what a Scorer can be asked to do, and how much

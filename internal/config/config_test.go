@@ -178,21 +178,6 @@ rules:
 			wantErr: "does not accept text",
 		},
 		{
-			name: "vote label-set mismatch",
-			yaml: `
-tiers: {medium: 0.4, high: 0.8}
-rules:
-  - name: r1
-    mode: shadow
-    scorer: vote(textvendor, otherfixed)
-    text: [subject_line_skeleton]
-    labels: [benign, phishing]
-    benign_label: benign
-    threshold: 0.5
-`,
-			wantErr: "differing label sets",
-		},
-		{
 			name: "missing calibration for uncalibrated scorer",
 			yaml: `
 tiers: {medium: 0.4, high: 0.8}

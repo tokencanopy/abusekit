@@ -18,7 +18,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -314,39 +313,23 @@ func validateStage(r Rule) error {
 	return nil
 }
 
-// voteExprRe matches a "vote(a, b, ...)" scorer expression: two or more
-// comma-separated registered scorer names.
-var voteExprRe = regexp.MustCompile(`^vote\(\s*([a-zA-Z0-9_.\-]+(?:\s*,\s*[a-zA-Z0-9_.\-]+)+)\s*\)$`)
-
 // resolveScorer turns a rule's `scorer:` string into a constructed
 // model.Scorer plus the list of base adapter names it is built from (for
-// vendor-allowlist checking): a plain name resolves to itself; a
-// "vote(a,b,...)" expression looks up each member in reg and builds a
-// combined scorer via model.Vote, which is what enforces "vote(...)
-// members with differing label sets" (design §4.5) — Vote returns that
-// exact error, resolveScorer just attributes it to the rule.
+// vendor-allowlist checking).
+//
+// S1 (design's v0 slice) resolves only a plain registered scorer name.
+// The design's `vote(a,b,...)` combinator (§4.6) is deliberately NOT
+// parsed here — S1's own review found its semantics deviate from the
+// design (it averaged member scorers' raw probabilities; the design
+// calls for a mean of already-CALIBRATED risks, which only makes sense
+// after Combine's calibration step, i.e. living in internal/core rather
+// than internal/model). TODO(design §4.6): reintroduce `vote(...)` in a
+// later slice, implemented in core over calibrated risks, with its own
+// "members must share a label set" load-time check (model.LabelMode.Equal
+// already exists for that).
 func resolveScorer(expr string, reg *model.Registry) (model.Scorer, []string, error) {
 	if reg == nil {
 		return nil, nil, fmt.Errorf("no scorer registry configured")
-	}
-	if m := voteExprRe.FindStringSubmatch(expr); m != nil {
-		parts := strings.Split(m[1], ",")
-		members := make([]model.Scorer, 0, len(parts))
-		names := make([]string, 0, len(parts))
-		for _, p := range parts {
-			name := strings.TrimSpace(p)
-			s, ok := reg.Get(name)
-			if !ok {
-				return nil, nil, fmt.Errorf("unknown scorer %q (member of %q); registered: %v", name, expr, reg.Names())
-			}
-			members = append(members, s)
-			names = append(names, name)
-		}
-		s, err := model.Vote(expr, members...)
-		if err != nil {
-			return nil, nil, err
-		}
-		return s, names, nil
 	}
 	s, ok := reg.Get(expr)
 	if !ok {

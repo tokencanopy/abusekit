@@ -197,29 +197,6 @@ func TestLocalContract(t *testing.T) {
 	})
 }
 
-func TestVoteContract(t *testing.T) {
-	newVote := func() model.Scorer {
-		a := fake.New()
-		a.NameValue = "member-a"
-		b := fake.New()
-		b.NameValue = "member-b"
-		v, err := model.Vote("vote(a,b)", a, b)
-		if err != nil {
-			t.Fatalf("Vote: %v", err)
-		}
-		return v
-	}
-	RunContractSuite(t, ContractConfig{
-		New: newVote,
-		ValidRequest: model.ScoreRequest{
-			Labels:   []string{"benign", "abusive"},
-			Features: map[string]float64{"x": 1},
-			Text:     []string{"hello"},
-		},
-		RejectedLabelSets: [][]string{{}},
-	})
-}
-
 func TestFakeContract_OpenUnbounded(t *testing.T) {
 	RunContractSuite(t, ContractConfig{
 		New: func() model.Scorer { return fake.New() },
@@ -262,23 +239,6 @@ func TestFake_TimeoutViaDelay(t *testing.T) {
 	_, err := s.Score(ctx, model.ScoreRequest{Labels: []string{"benign", "abusive"}})
 	if err == nil {
 		t.Fatalf("expected a timeout error from a slow Score racing a short deadline")
-	}
-}
-
-func TestVote_RejectsDifferingLabelSets(t *testing.T) {
-	a := fake.New()
-	a.Caps.LabelMode = model.FixedLabelMode("benign", "abusive")
-	b := fake.New()
-	b.Caps.LabelMode = model.FixedLabelMode("benign", "phishing")
-	if _, err := model.Vote("vote(a,b)", a, b); err == nil {
-		t.Fatalf("expected Vote to reject members with differing label sets")
-	}
-}
-
-func TestVote_RequiresAtLeastTwoMembers(t *testing.T) {
-	a := fake.New()
-	if _, err := model.Vote("vote(a)", a); err == nil {
-		t.Fatalf("expected Vote to reject a single member")
 	}
 }
 
