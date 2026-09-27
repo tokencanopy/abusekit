@@ -213,7 +213,7 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	t.Run("paid upgrade recorded", func(t *testing.T) {
 		events := []event.Event{
 			ev("s1", "subject.created", 0, nil),
-			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "scale", "status": "active", "amount_minor": float64(2900)}),
+			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(2900)}),
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 16 {
@@ -223,7 +223,7 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	t.Run("a trialing subscription with a price is NOT an upgrade (R5, round 2)", func(t *testing.T) {
 		events := []event.Event{
 			ev("s1", "subject.created", 0, nil),
-			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "scale", "status": "trialing", "amount_minor": float64(2900)}),
+			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "plan_b", "status": "trialing", "amount_minor": float64(2900)}),
 		}
 		if u := upgraded(events); u != 0 {
 			t.Errorf("upgraded = %v, want 0 for a trialing subscription (a price on file is not the same as actually being charged)", u)
@@ -236,8 +236,8 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 	t.Run("active status with a price after a trialing one: only the active one counts", func(t *testing.T) {
 		events := []event.Event{
 			ev("s1", "subject.created", 0, nil),
-			ev("u1", "subscription.changed", 5*time.Minute, map[string]any{"plan": "scale", "status": "trialing", "amount_minor": float64(2900)}),
-			ev("u2", "subscription.changed", 20*time.Minute, map[string]any{"plan": "scale", "status": "active", "amount_minor": float64(2900)}),
+			ev("u1", "subscription.changed", 5*time.Minute, map[string]any{"plan": "plan_b", "status": "trialing", "amount_minor": float64(2900)}),
+			ev("u2", "subscription.changed", 20*time.Minute, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(2900)}),
 		}
 		if u := upgraded(events); u != 1 {
 			t.Errorf("upgraded = %v, want 1", u)
