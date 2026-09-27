@@ -1,0 +1,40 @@
+# config/rules.yaml — the rule set (design §4.5). Loaded by
+# internal/config.Load against a model.Registry, a FeatureSet, and
+# config/vendors.yaml.
+#
+# S1 ships exactly one rule: new_account_velocity, scored by the always-
+# available `local` adapter (internal/model/local). It is the "advise
+# rule of last resort" design §4.6 describes — the only rule that can run
+# with nothing but the local scorer registered, which is all S1 wires up.
+# The jev/laya shadow rules from the design §4.5 example arrive with
+# their adapters in S5; adding them here before S5 would fail Load with
+# "unknown scorer" against this slice's registry.
+tiers:
+  medium: 0.4
+  high: 0.8
+min_scored_advise: 1
+text_rules_need_feature_support: true
+rules:
+  - name: new_account_velocity
+    mode: advise
+    scorer: local
+    inputs:
+      - subject_age_h
+      - resource_velocity_1h
+      - resource_total
+      - key_velocity_1h
+      - key_total
+      - upgrade_delay_min
+      - declines_before_first_success
+      - first_funding_prepaid
+      - name_brand_match
+      - name_has_at
+      - first_day_distinct_domains
+      - self_send_before_external
+      - linked_deleted_n
+      - linked_labelled_abusive_n
+      - fingerprint_seen_on_other_subjects
+      - burst_ratio_24h_vs_lifetime
+    labels: [benign, suspicious, abusive]
+    benign_label: benign
+    threshold: 0.6

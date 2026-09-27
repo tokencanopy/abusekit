@@ -1,0 +1,17 @@
+# config/vendors.yaml — the adapter allowlist (design §4.6). The config
+# loader (internal/config) refuses to use any scorer whose base adapter
+# name is not listed here, and refuses text inputs to an adapter whose
+# policy.allows_text is false.
+#
+# S1 ships only the `local` adapter (internal/model/local): no network
+# call, so no vendor terms to record. S5 adds jev/laya/gemini entries here
+# alongside their adapters, each with its real terms_version and dpa_ref
+# recorded from the signed agreement, not left as placeholders.
+vendors:
+  - name: local
+    terms_version: "n/a"
+    dpa_ref: "n/a"
+    policy:
+      allows_text: false
+      retains_inputs: false
+      trains_on_inputs: false

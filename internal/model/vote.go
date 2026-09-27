@@ -39,8 +39,8 @@ func Vote(name string, members ...Scorer) (Scorer, error) {
 	for _, m := range members {
 		c := m.Capabilities()
 		if !c.LabelMode.Equal(first.LabelMode) {
-			return nil, fmt.Errorf("model: vote %q members have differing label sets: %q vs %q",
-				name, first.LabelMode.describe(), c.LabelMode.describe())
+			return nil, fmt.Errorf("model: vote %q members have differing label sets: %s vs %s",
+				name, first.LabelMode.String(), c.LabelMode.String())
 		}
 		acceptsText = acceptsText && c.AcceptsText
 		acceptsFeatures = acceptsFeatures && c.AcceptsFeatures
@@ -145,9 +145,9 @@ func (v *voteScorer) Score(ctx context.Context, req ScoreRequest) (ScoreResult, 
 	}, nil
 }
 
-// describe gives a stable, human-readable rendering of a LabelMode for
+// String gives a stable, human-readable rendering of a LabelMode for
 // error messages (e.g. "fixed[abusive,benign]" or "open").
-func (m LabelMode) describe() string {
+func (m LabelMode) String() string {
 	if m.open {
 		return "open"
 	}
