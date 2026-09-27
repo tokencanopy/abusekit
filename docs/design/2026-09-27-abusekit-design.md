@@ -596,3 +596,21 @@ erasure rules. Migrations embedded, expand-only.
    open — defaulted to excluded (alongside `ip24_hash`/`ua_hash`, also newly excluded by default)
    pending real labelled data; see `internal/feature.Config`'s own doc comment. Decision owner:
    Josh.
+9. **[S2, round 3, D3]** Known limits of the local scorer's v0 feature set, deliberately deferred
+   rather than fixed here (S4/S5 concerns — the eval harness and a labelled-corpus retune are what
+   would justify each one, not another hand-tuned weight):
+   - `fingerprint_seen_on_other_subjects` only checks the `card_fingerprint_hash` link kind (§4.2) —
+     a churn chain sharing a `device_hash` but never a card (no payment method reused, or none
+     collected yet) gets none of this signal from its own onboarding round; `linked_deleted_n`
+     still catches it, but only from the round AFTER a predecessor is deleted, i.e. one subject
+     later than a card-linked chain would.
+   - No v0 feature reacts to a fan-out that happens AFTER day 1. `first_day_distinct_domains` is
+     anchored to `firstSeenAt` and permanently fixed once that window closes (§4.5);
+     `burst_ratio_24h_vs_lifetime` only compares recent activity to the subject's OWN lifetime
+     total, so a long-quiet account's day-30 blast is caught by burst detection generally, but
+     nothing specifically measures recipient fan-out breadth past the first day the way
+     `first_day_distinct_domains` does within it.
+   - No feature represents a "verified owner" signal (a human confirming control of the account —
+     email verification, a KYC-style check, a long-lived OAuth session) that would legitimately
+     lower risk independent of behavioural velocity. Every v0 signal is behavioural; an
+     otherwise-suspicious-looking but genuinely verified account has no way to net that out.
