@@ -182,7 +182,7 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		{"benign_transactional", extractFixture(t, brands, "benign_transactional.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.05},
 		{"burst_before_send", extractFixture(t, brands, "burst.jsonl", 15*time.Second, true, feature.NeighborEvidence{}), 0.9, 1.0},
 		{"burst_final", extractFixture(t, brands, "burst.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
-		{"benign_fast_onboarding", extractFixture(t, brands, "benign_fast_onboarding.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.15, 0.4},
+		{"benign_fast_onboarding", extractFixture(t, brands, "benign_fast_onboarding.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.15, 0.45}, // upper edge widened, D2 round 3 — see replay_test.go's TestReplay_BenignFastOnboardingStaysBelowHigh
 		{"benign_integration_heavy", extractFixture(t, brands, "benign_integration_heavy.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.05, 0.35},
 		{"dormant_then_blast", extractFixture(t, brands, "dormant_then_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.8, 0.98},
 		{"churn_subject_3", res3.Features.Map(), 0.8, 0.95},

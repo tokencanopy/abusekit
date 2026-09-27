@@ -106,12 +106,20 @@ weights:
   # first_day_distinct_domains: bounded on the low side by
   # benign_receipts_fanout (round 2, R1) — a day-1 receipts account (1
   # agent) fanning out to 30 REAL distinct customer domains previously
-  # scored 0.9634 (tier high) on this feature alone; now capped at
-  # internal/feature.firstDayDistinctDomainsCap (10), it scores ~0.15.
-  # dormant_then_blast (the fixture that needs first_day_distinct_domains'
-  # weight to matter on the high side) doesn't actually exercise this
-  # feature at all — its sends land 7 days after signup, past the
-  # first-day window — so the cap doesn't cost that fixture anything.
+  # scored 0.9634 (tier high) on this feature alone. R1 round 2 fixed it
+  # with a hard cap of 10; round 3 (D2) replaced that with a log1p(n)
+  # curve (internal/feature.firstDayDistinctDomainsLogScale) instead, so
+  # a 300-domain fan-out doesn't read identically to a 30-domain one —
+  # scaled so n=10 reproduces the OLD cap's contribution exactly, meaning
+  # THIS weight didn't need to change even though the feature's shape did.
+  # benign_receipts_fanout now scores ~0.34 (was ~0.15 under the hard cap;
+  # test band widened accordingly — log1p's concavity means it gives every
+  # count BELOW the anchor point more weight than a flat count did, not
+  # just counts above it more than zero). dormant_then_blast (the fixture
+  # that needs this weight to matter on the high side) doesn't actually
+  # exercise this feature at all — its sends land 7 days after signup,
+  # past the first-day window — so neither the cap nor the curve costs
+  # that fixture anything.
   first_day_distinct_domains: 0.25
 
   # Rehearsal-to-self before an external blast (design §4.3's

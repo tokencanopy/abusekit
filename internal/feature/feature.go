@@ -14,6 +14,7 @@ package feature
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/tokencanopy/abusekit/internal/event"
@@ -41,22 +42,30 @@ const (
 	upgradeDelayClampMinutes = 24 * 60
 )
 
-// firstDayDistinctDomainsCap and selfSendBeforeExternalCap bound two more
-// unbounded-by-construction counts (R1 round 2, proven: a benign day-1
-// receipts account fanning out to dozens of genuine distinct customer
-// domains, or a developer sending several self-test emails before ever
-// emailing anyone else, both pushed a benign account's score toward
-// `high` on ONE feature alone once the raw count ran high). Both
-// saturate rather than clamp to a fixed ceiling value the way the time
-// features above do, since these are already small integers with no
-// natural "still meaningful past this point" ceiling of their own —
-// saturate's own doc comment (also used by LinkedDeletedN) covers why a
-// cap rather than a log-scale transform: a hard bound is simpler to
-// reason about and to retune against fixtures than a curve.
-const (
-	firstDayDistinctDomainsCap = 10
-	selfSendBeforeExternalCap  = 2
-)
+// selfSendBeforeExternalCap bounds another unbounded-by-construction count
+// (R1 round 2, proven: a developer sending several self-test emails before
+// ever emailing anyone else pushed a benign account's score toward `high`
+// on this feature alone once the raw count ran high). Saturates rather
+// than clamping to a fixed ceiling value the way the time features above
+// do, since it's already a small integer with no natural "still
+// meaningful past this point" ceiling of its own.
+const selfSendBeforeExternalCap = 2
+
+// firstDayDistinctDomainsLogScale scales first_day_distinct_domains'
+// log1p(n) curve (D2 round 3) so that n=10 reproduces EXACTLY the
+// contribution R1 round 2's hard cap of 10 gave it — chosen so
+// config/local_weights.yaml's weight for this feature didn't need to
+// change alongside the formula. R1 round 2 capped this feature outright
+// (a benign day-1 receipts account fanning out to dozens of genuine
+// distinct customer domains pushed a benign score toward `high` on this
+// feature alone), but a hard cap makes every count above it read
+// identically — a 30-domain account and a 300-domain account would score
+// the same, when the latter is a meaningfully bigger fan-out. log1p
+// keeps volume sensitivity above the old cap (compressed, not linear —
+// the whole point is that a `high`-worthy signal has to come from
+// elsewhere too, not from domain count alone) instead of flattening it to
+// zero.
+var firstDayDistinctDomainsLogScale = 10 / math.Log1p(10)
 
 // Names is the ordered, canonical list of every v0 feature Extract
 // computes — matching design §4.5's new_account_velocity inputs list

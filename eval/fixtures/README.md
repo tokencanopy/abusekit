@@ -83,7 +83,12 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   one previously scored `high` (0.94/0.96/0.99) on an UNCAPPED count
   feature alone (`self_send_before_external` or
   `first_day_distinct_domains`) — see `internal/feature`'s
-  `selfSendBeforeExternalCap`/`firstDayDistinctDomainsCap`.
+  `selfSendBeforeExternalCap` (a hard cap) and
+  `firstDayDistinctDomainsLogScale` (round 3, D2: a log1p(n) curve
+  replacing R1's original hard cap, so volume above it is still
+  meaningfully sensed instead of read identically to volume at the cap;
+  `benign_receipts_fanout` now scores ~0.34, was ~0.15 under the hard
+  cap — still comfortably medium/low either way).
 - `benign_variant_a.jsonl` (round 2, R1) — a regression guard, not a new
   failure: 4 agents + 2 keys in 10 minutes, then 5 external emails to 5
   distinct domains within hour 1 (the re-review's own literal numbers,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -423,6 +424,16 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 	})
 }
 
+// domainsFor builds n content.sent events, each to its own distinct
+// domain, all landing inside window from firstSeenAt.
+func domainsFor(n int) []event.Event {
+	events := make([]event.Event, n)
+	for i := 0; i < n; i++ {
+		events[i] = ev(fmt.Sprintf("c%d", i), "content.sent", 0, map[string]any{"recipient_domain": fmt.Sprintf("customer-%d.example.test", i)})
+	}
+	return events
+}
+
 func TestFirstDayDistinctDomains(t *testing.T) {
 	day := 24 * time.Hour
 	t.Run("counts distinct domains within the first day, boundary inclusive, case-folded", func(t *testing.T) {
@@ -433,8 +444,11 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 			ev("c4", "content.sent", day, map[string]any{"recipient_domain": "c.example.test"}),             // exactly at the cutover: included
 			ev("c5", "content.sent", day+time.Second, map[string]any{"recipient_domain": "d.example.test"}), // just past: excluded
 		}
-		if got := firstDayDistinctDomains(events, base, day); got != 3 {
-			t.Errorf("first_day_distinct_domains = %v, want 3 (a, b, c)", got)
+		// 3 distinct domains (a, b, c) -> log1p-scaled (D2 round 3), not
+		// the raw count: firstDayDistinctDomainsLogScale * log1p(3).
+		want := firstDayDistinctDomainsLogScale * math.Log1p(3)
+		if got := firstDayDistinctDomains(events, base, day); math.Abs(got-want) > 1e-9 {
+			t.Errorf("first_day_distinct_domains = %v, want %v (log1p(3) scaled)", got, want)
 		}
 	})
 	t.Run("sends after the first day don't count", func(t *testing.T) {
@@ -443,13 +457,43 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 			t.Errorf("first_day_distinct_domains = %v, want 0", got)
 		}
 	})
-	t.Run("saturates at the cap (R1 round 2)", func(t *testing.T) {
-		var events []event.Event
-		for i := 0; i < 30; i++ {
-			events = append(events, ev(fmt.Sprintf("c%d", i), "content.sent", 0, map[string]any{"recipient_domain": fmt.Sprintf("customer-%d.example.test", i)}))
+	t.Run("no domains at all is exactly zero", func(t *testing.T) {
+		if got := firstDayDistinctDomains(nil, base, day); got != 0 {
+			t.Errorf("first_day_distinct_domains = %v, want 0", got)
 		}
-		if got := firstDayDistinctDomains(events, base, day); got != firstDayDistinctDomainsCap {
-			t.Errorf("first_day_distinct_domains = %v, want the cap %v (30 distinct domains must not swamp the model uncapped)", got, firstDayDistinctDomainsCap)
+	})
+	// D2 round 3: replaced the hard cap of 10 with a log1p(n) curve scaled
+	// so n=10 reproduces exactly the OLD cap's contribution (10) — the
+	// weight (config/local_weights.yaml) didn't have to change — while
+	// still growing, just compressed, past it: volume sensitivity above
+	// the old cap must not be exactly zero.
+	t.Run("n=10 matches the old hard cap's value exactly (weight-compatible)", func(t *testing.T) {
+		got := firstDayDistinctDomains(domainsFor(10), base, day)
+		if math.Abs(got-10) > 1e-9 {
+			t.Errorf("first_day_distinct_domains(10 domains) = %v, want 10 (log1p scaling must reproduce the old cap's contribution exactly at n=10)", got)
+		}
+	})
+	t.Run("n=150 is meaningfully higher than n=10 (not flat past the old cap)", func(t *testing.T) {
+		at10 := firstDayDistinctDomains(domainsFor(10), base, day)
+		at150 := firstDayDistinctDomains(domainsFor(150), base, day)
+		if at150 <= at10+5 {
+			t.Errorf("first_day_distinct_domains(150) = %v, first_day_distinct_domains(10) = %v — want the former meaningfully higher (>=+5), not flat past the old cap", at150, at10)
+		}
+	})
+	t.Run("n=30 (benign_receipts_fanout's own count) still lands well under a doubling of the old cap", func(t *testing.T) {
+		got := firstDayDistinctDomains(domainsFor(30), base, day)
+		if got < 10 || got > 20 {
+			t.Errorf("first_day_distinct_domains(30) = %v, want in [10,20] (grows past the old cap's 10, but compressed by log1p, not linear)", got)
+		}
+	})
+	t.Run("strictly monotonic in the number of distinct domains", func(t *testing.T) {
+		prev := 0.0
+		for _, n := range []int{1, 5, 10, 30, 100, 300} {
+			got := firstDayDistinctDomains(domainsFor(n), base, day)
+			if got <= prev {
+				t.Errorf("first_day_distinct_domains(%d) = %v, want strictly greater than the previous n's %v", n, got, prev)
+			}
+			prev = got
 		}
 	})
 }

@@ -304,10 +304,15 @@ window" below. `subject_age_h` and `upgrade_delay_min` are both clamped at 24h/1
 an unbounded value for either let a multi-day-old account swamp the local scorer's linear model
 through that feature alone; `burst_ratio_24h_vs_lifetime` is what actually distinguishes "old and
 quiet" from "old and just burst," not `subject_age_h`'s raw magnitude. **[S2, round 2]**
-`self_send_before_external` and `first_day_distinct_domains` are similarly capped (at 2 and 10
-respectively) — proven, an uncapped count on either let a perfectly benign account (8 self-test
-emails before ever sending externally; 30 real customer domains fanned out to on day 1) swamp the
-model the same way an unbounded `subject_age_h`/`upgrade_delay_min` did.
+`self_send_before_external` and `first_day_distinct_domains` are similarly bounded — proven, an
+uncapped count on either let a perfectly benign account (8 self-test emails before ever sending
+externally; 30 real customer domains fanned out to on day 1) swamp the model the same way an
+unbounded `subject_age_h`/`upgrade_delay_min` did. `self_send_before_external` is hard-capped at 2.
+**[S2, round 3]** `first_day_distinct_domains` was ALSO a hard cap (at 10) in round 2, but that made
+every count above it read identically — a 30-domain and a 300-domain fan-out scored the same. It is
+now a `log1p(n)` curve instead, scaled so `n=10` reproduces exactly the hard cap's old contribution
+(no weight change needed) while `n=150` scores meaningfully higher — volume sensitivity above the
+old cap is preserved, just compressed rather than flattened to zero.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with

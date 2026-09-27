@@ -1,6 +1,7 @@
 package feature
 
 import (
+	"math"
 	"strings"
 	"time"
 
@@ -264,11 +265,12 @@ func nameHasAt(events []event.Event) float64 {
 // firstSeenAt+window] inclusive on both ends — unlike the sliding
 // *_1h/*_24h windows, this one is anchored to the subject's first event,
 // not to "now": once past firstSeenAt+window, this feature is permanently
-// fixed. Saturates at firstDayDistinctDomainsCap (R1 round 2, proven: a
+// fixed. Scaled by log1p (D2 round 3, replacing R1 round 2's hard cap of
+// 10 — see firstDayDistinctDomainsLogScale) rather than a raw count: a
 // day-1 receipts account fanning out to dozens of genuine, distinct
 // customer domains is ordinary legitimate behaviour, not itself abuse
-// evidence — uncapped, 30 real recipient domains alone was enough to push
-// a benign account's score into `high`).
+// evidence, but a hard cap made a 30-domain and a 300-domain account read
+// identically, with zero volume sensitivity past it.
 func firstDayDistinctDomains(events []event.Event, firstSeenAt time.Time, window time.Duration) float64 {
 	cutoff := firstSeenAt.Add(window)
 	domains := make(map[string]struct{})
@@ -285,7 +287,7 @@ func firstDayDistinctDomains(events []event.Event, firstSeenAt time.Time, window
 		}
 		domains[normalizeToken(d)] = struct{}{}
 	}
-	return saturate(len(domains), firstDayDistinctDomainsCap)
+	return firstDayDistinctDomainsLogScale * math.Log1p(float64(len(domains)))
 }
 
 // selfSendBeforeExternal counts content.sent events with

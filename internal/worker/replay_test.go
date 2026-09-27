@@ -230,13 +230,20 @@ func TestReplay_BurstFinalTierHigh(t *testing.T) {
 // benign_fast_onboarding.jsonl (B1 fix round, proven: this exact shape —
 // 3 agents + 1 key in 10 minutes, one self-send, one external send, no
 // payment at all — previously scored 0.925, tier high) and asserts it now
-// stays below high.
+// stays below high. Upper edge widened to 0.45 (D2 round 3): switching
+// first_day_distinct_domains from a hard cap to a log1p curve anchored at
+// n=10 (see internal/feature.firstDayDistinctDomainsLogScale) makes a
+// SMALL domain count (this fixture's) contribute MORE than the old
+// literal-count formula did — log1p is concave, so it sits above the
+// straight line from (0,0) to (10,10) everywhere in between — which
+// nudged this fixture from ~0.26 to ~0.40, still comfortably medium/low,
+// but too close to the old 0.4 edge to leave a safe margin.
 func TestReplay_BenignFastOnboardingStaysBelowHigh(t *testing.T) {
 	view := runReplay(t, "benign_fast_onboarding.jsonl", "acct_example_fast_onboarding_1")
 	if view.Tier == "high" {
 		t.Errorf("benign_fast_onboarding: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
-	assertBand(t, "benign_fast_onboarding", view.Score, 0.15, 0.4)
+	assertBand(t, "benign_fast_onboarding", view.Score, 0.15, 0.45)
 }
 
 // TestReplay_BenignIntegrationHeavyStaysBelowHigh replays eval/fixtures/
@@ -293,14 +300,16 @@ func TestReplay_SelfSendOnlyStaysBelowHigh(t *testing.T) {
 // benign_receipts_fanout.jsonl — R1 round 2, proven: a day-1 receipts
 // account (1 agent) fanning out to 30 distinct, genuinely external
 // customer domains previously scored 0.9634 (tier high) on
-// first_day_distinct_domains alone; capping it at
-// firstDayDistinctDomainsCap brings it down to ~0.15.
+// first_day_distinct_domains alone; R1's hard cap brought it down to
+// ~0.15, and D2 round 3's log1p replacement (still anchored so n=10 gives
+// the same contribution the old cap did) leaves it at ~0.34 — comfortably
+// medium/low, not the flat-zero-sensitivity-past-10 the hard cap gave it.
 func TestReplay_ReceiptsFanoutStaysBelowHigh(t *testing.T) {
 	view := runReplay(t, "benign_receipts_fanout.jsonl", "acct_example_receipts_fanout_1")
 	if view.Tier == "high" {
 		t.Errorf("benign_receipts_fanout: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
-	assertBand(t, "benign_receipts_fanout", view.Score, 0.05, 0.35)
+	assertBand(t, "benign_receipts_fanout", view.Score, 0.05, 0.4)
 }
 
 // TestReplay_VariantAStaysBelowHigh replays eval/fixtures/
@@ -309,16 +318,20 @@ func TestReplay_ReceiptsFanoutStaysBelowHigh(t *testing.T) {
 // external emails to 5 distinct domains within hour 1): the re-review
 // measured this shape at 0.49 (tier medium) against the ALREADY-RETUNED
 // weights from the first fix round and flagged it as a case any further
-// retuning must not push into high. Neither of R1's two caps actually
-// bind here (5 domains is under firstDayDistinctDomainsCap, there are no
-// self-sends at all) — the risk this guards against is a WEIGHT change
-// elsewhere (e.g. resource/key velocity) creeping this scenario upward.
+// retuning must not push into high. Upper edge widened to 0.70 (D2 round
+// 3): its 5 distinct domains are well under the old hard cap of 10, but
+// log1p's concave shape still gives them more weight than the old
+// literal-count formula did (see TestReplay_BenignFastOnboardingStaysBelowHigh's
+// comment for why), nudging this fixture from 0.49 to ~0.64 — still
+// clearly medium, not high, but too close to the old 0.65 edge for a safe
+// margin. The regression this guards against is unchanged: a WEIGHT
+// change elsewhere (e.g. resource/key velocity) creeping it upward.
 func TestReplay_VariantAStaysBelowHigh(t *testing.T) {
 	view := runReplay(t, "benign_variant_a.jsonl", "acct_example_variant_a_1")
 	if view.Tier == "high" {
 		t.Errorf("benign_variant_a: tier = high (score %v), want medium (this is a regression guard, not a call to make it score LOW)\nsignals: %+v", view.Score, view.Signals)
 	}
-	assertBand(t, "benign_variant_a", view.Score, 0.35, 0.65)
+	assertBand(t, "benign_variant_a", view.Score, 0.35, 0.70)
 }
 
 // TestReplay_SelfSendBrandNameStaysBelowHigh replays eval/fixtures/
