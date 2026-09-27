@@ -138,9 +138,22 @@ product ◀─GET score / POST evaluate──────── serve ◀── 
   kind, hash, subject, first_seen, last_seen)` with an index on `(tenant, kind, hash)`.
 - **Neighbors(subject)** returns the set of subjects sharing any link key, with a fan-in cap of
   50 per key and a total cap of 200; capped results set `neighbors_truncated=true` (a feature).
-- Linked features (all per tenant): `linked_subjects_n`, `linked_deleted_n`,
-  `linked_labelled_abusive_n`, `linked_max_risk`, `fingerprint_seen_on_other_subjects`,
-  `email_hash_seen_on_deleted_subject`. These make the churn fixture reachable.
+  **[S2]** By default, `asn` is excluded from which link kinds count as evidence (already true from
+  S1) and `ip24_hash`/`ua_hash` now are too — proven, a shared `ua_hash` alone (the same email
+  client or SDK, extremely common) produced `linked_deleted_n=1` for a totally unrelated subject.
+  The default candidate set is `{email_hash, card_fingerprint_hash, device_hash}`; all three
+  excluded kinds are opt-in per tenant (`internal/feature.Config`). `fingerprint_seen_on_other_subjects`
+  always checks `card_fingerprint_hash` specifically regardless of this policy.
+- Linked features (all per tenant): `linked_deleted_n`, `linked_labelled_abusive_n`,
+  `fingerprint_seen_on_other_subjects`, `neighbors_truncated`. These make the churn fixture
+  reachable. **[S2]** `linked_deleted_n` only counts a same-tenant neighbour's PERMANENT
+  `subject.deleted` (never a trash-mode one, which e2a's own soft-deletion design allows restoring
+  within its retention window — there is no `subject.restored` event in this vocabulary to correct
+  a wrongly-flagged restored account, so counting a reversible deletion as abandonment forever was
+  the wrong default) and saturates at 3 (an unbounded count let one long churn chain dominate the
+  score far past the point it had already proven the pattern). **[S2]** `linked_subjects_n`,
+  `linked_max_risk` and `email_hash_seen_on_deleted_subject` remain deferred (not built in v0) —
+  see §8's open questions; nothing here currently computes them.
 - Cross-tenant linking is an additive change: drop the tenant column from the index key.
 
 ### 4.3 Event API
@@ -252,10 +265,10 @@ rules:
     mode: advise
     scorer: local            # deterministic; always answers
     inputs: [subject_age_h, resource_velocity_1h, resource_total, key_velocity_1h, key_total,
-             upgrade_delay_min, declines_before_first_success, first_funding_prepaid,
+             upgrade_delay_min, upgraded, declines_before_first_success, first_funding_prepaid,
              name_brand_match, name_has_at, first_day_distinct_domains, self_send_before_external,
              linked_deleted_n, linked_labelled_abusive_n, fingerprint_seen_on_other_subjects,
-             burst_ratio_24h_vs_lifetime]
+             neighbors_truncated, burst_ratio_24h_vs_lifetime]
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6
@@ -281,7 +294,16 @@ rules:
 derived features in YAML). Windows are per feature, not per rule: `*_1h`, `*_24h`, `*_total`
 (lifetime), and **permanent onboarding facts** (`declines_before_first_success`,
 `first_funding_prepaid`, `upgrade_delay_min`, `email_domain_class`) that never age out.
-`burst_ratio_24h_vs_lifetime` catches dormant-then-blast.
+`burst_ratio_24h_vs_lifetime` catches dormant-then-blast. **[S2]** `email_domain_class` remains
+deferred — no v0 feature reads it yet; see §8. **[S2]** `upgrade_delay_min` only counts a PAID
+`subscription.changed` (`amount_minor > 0`) as an upgrade — a free-plan change or a cancellation
+must not read as one. A new `upgraded` (0/1) feature carries whether a paid upgrade has ever
+happened at all, independent of the delay's magnitude: `upgrade_delay_min` alone can't distinguish
+"just upgraded, delay not meaningfully small yet" from "never upgraded, waited out the clamp
+window" below. `subject_age_h` and `upgrade_delay_min` are both clamped at 24h/1440min — proven,
+an unbounded value for either let a multi-day-old account swamp the local scorer's linear model
+through that feature alone; `burst_ratio_24h_vs_lifetime` is what actually distinguishes "old and
+quiet" from "old and just burst," not `subject_age_h`'s raw magnitude.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
@@ -364,22 +386,43 @@ the resolved features/text/labels — so a scorer upgrade, a newly fitted calibr
 ### 4.8 Worker **[r2]**
 
 - **Queue:** `subjects.dirty_seq` (monotonic, set on every event) and `scored_seq`; the worker
-  selects `dirty_seq > scored_seq OR next_rescore_at <= now`, ordered by priority: new subjects
-  (age < 24 h) first, then rising `current_score`, then oldest dirty; `FOR UPDATE SKIP LOCKED`;
-  batch 200 per 10 s tick; multi-instance safe.
+  selects `dirty_seq > scored_seq OR next_rescore_at <= now`, ordered by priority: dirty subjects
+  strictly ahead of timer-only rescores **[S2]**, then new subjects (age < 24 h), then higher
+  `current_score` with a never-scored subject (`current_score IS NULL`) ranked highest of all
+  **[S2]** (the design's original "rising `current_score`" wording under-specified the NULL case;
+  an account with no evidence yet is the most urgent to get a first score, not the least), then
+  oldest dirty; `FOR UPDATE SKIP LOCKED`; batch 200 per 10 s tick; multi-instance safe. **[S2]**
+  Multi-instance safety needed a real per-subject claim lease (`subjects.claimed_until`) on top of
+  the row lock — proven, a bare select-then-commit-before-scoring claim let two instances issue 40
+  scorer calls for 20 subjects, since the lock's own duration was too short to cover a whole scoring
+  pass.
 - **Compare-and-clear:** after scoring, set `scored_seq = the dirty_seq read at start`; a later
   event keeps the subject dirty.
 - **Rescore-at:** `next_rescore_at` = earliest feature-window expiry, so decayed velocities are
-  recomputed without a new event.
+  recomputed without a new event. **[S2]** Also the minimum of: the earliest in-flight rule's
+  `retry_at`, and the next UTC midnight if any rule was `cost_cap`'d this round — proven gaps, an
+  errored rule on an otherwise-quiet subject was never retried, and a cost-capped rule was never
+  retried once the day rolled over. Window-exit candidates only consider event types a windowed
+  feature actually reads, and are coalesced to 5-minute buckets — proven, an uncoalesced burst of
+  60 sends in quick succession scheduled 60 nearly-simultaneous separate rescores instead of one
+  shared one.
 - **Rule state:** `rule_state(subject, rule, attempts, retry_at, last_error)`; backoff 30 s, 2 m,
-  5 m, capped at 15 m; a subject with any advise rule in backoff serves `degraded:true`.
+  5 m, capped at 15 m; a subject with any advise rule in backoff serves `degraded:true`. **[S2]** A
+  whole-pass failure (the extractor or a store call erroring, as opposed to one rule's scorer)
+  backs the SUBJECT off the same way (`subjects.fail_count`/`next_attempt_at`) — proven, a subject
+  whose scoring always failed outright was reclaimed and retried every single tick forever,
+  starving the rest of the batch.
 - **Budgets:** per adapter daily cap, per subject daily cap (default 20 calls), per producer daily
   cap; 25% of each adapter cap is reserved for subjects at `medium` or above; hitting a cap pages
   the operator and sets `error_code: cost_cap` on the affected rules while the local rule keeps
-  answering.
+  answering. **[S1]** Implemented per-TENANT rather than per-producer (a subject isn't tied to one
+  producer once claimed off the dirty queue); **[S2]** counters are persisted (a `budget_usage`
+  table), not in-memory-only, so a restart or a second worker instance shares the same count
+  instead of each keeping its own.
 - **Class skip:** `internal` and `synthetic` subjects are stored but never queued.
-- **Metrics:** queue depth, oldest dirty age, per-adapter latency/cost/errors, `emit_dropped_total`
-  reported by producers, verdicts by tier.
+- **Metrics [S2]:** queue depth, oldest dirty age, per-adapter calls/errors/mean-latency, verdicts
+  by tier, and budget denials are implemented (`internal/worker.Metrics`, expvar-backed);
+  `emit_dropped_total` is the producer-side emitter's own counter (S6, not yet built).
 
 ### 4.9 Labels and corpus **[r2]**
 
@@ -473,6 +516,16 @@ erasure rules. Migrations embedded, expand-only.
 - Homoglyph names → NFKC + confusables skeleton before brand matching. **[S1]** The confusables table
   is a curated subset (Cyrillic/Greek Latin-lookalikes plus common leetspeak digit substitutions)
   covering lookalikes seen in labelled examples, not a full UTS #39 confusables implementation.
+  **[S2]** Brand matching itself moved to `config/brands.yaml` (data, not a Go literal) and is now
+  word/token-boundary-aware rather than a bare substring check — proven, a substring check both
+  false-positived ("Pineapple"/"Grapple"/"Applebee's"/"Amazonas"/"Striped" all matching a bare
+  brand-name substring) and false-negatived (a multi-word brand like "Wells Fargo" never matching
+  its own smashed-together "wellsfargo" dictionary entry, since a real display name has a space the
+  entry didn't). Generic single-word brands that collide with legitimate integration names
+  ("Stripe Webhook Relay", "Google Calendar Sync", "Microsoft Teams Relay") are excluded from the
+  shipped list rather than flagged and accepted as noisy — word-boundary matching alone can't tell
+  "impersonating Stripe" from "a real Stripe integration named after Stripe"; proper context-aware
+  matching for those is future work.
 - Invalid config → reload rejected, previous config live, `/healthz` reports it.
 - Lost update in the worker → `dirty_seq` compare-and-clear.
 - Clock skew → ±24 h on events (except `backfill` scope), ±5 min on request signatures.
@@ -512,3 +565,16 @@ erasure rules. Migrations embedded, expand-only.
 4. Whether `content.sent` should carry the first 200 chars of body text. v1 proposal: no.
 5. Tier cut points and the local scorer's initial weights: placeholders until the first gate run.
 6. Legal review of the 24-month retention basis and the privacy-page subprocessor update.
+7. **[S2]** Deferred v0 features, not yet computed by anything: `linked_subjects_n` (§4.2's total
+   same-tenant neighbour count, distinct from the deleted/labelled/fingerprint-specific ones that
+   are built), `linked_max_risk` (§4.2, needs a neighbour's own current score, not just its
+   deleted/labelled status), `email_hash_seen_on_deleted_subject` (§4.2, narrower than
+   `linked_deleted_n`: specifically whether THIS subject's own email hash, not device or card, was
+   seen on a deleted one), and `email_domain_class` (§4.5, `subject.created`'s own field is ingested
+   and stored but no rule reads it as a feature yet). None are wired into `config/rules.yaml`'s
+   `new_account_velocity` inputs or `internal/feature.Names`; adding any is a small, additive change
+   whenever a labelled corpus justifies the weight.
+8. **[S2]** Whether ASN should ever count as same-tenant linking evidence at all (§4.2) is still
+   open — defaulted to excluded (alongside `ip24_hash`/`ua_hash`, also newly excluded by default)
+   pending real labelled data; see `internal/feature.Config`'s own doc comment. Decision owner:
+   Josh.

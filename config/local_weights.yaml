@@ -2,12 +2,10 @@
 # (internal/model/local, design §4.6).
 #
 # PLACEHOLDER WEIGHTS. Every sign and magnitude below is hand-set to a
-# plausible direction from a synthetic reference scenario (design §1),
-# not fit against labelled data. They exist so the local scorer can
-# always answer something and so S2's replay fixtures (burst/fast/churn)
-# have a rule to score against; they are reviewed like code, and are
-# expected to be replaced by the first `abusekit calibrate`/gate run
-# (design §4.6, open question 5; plan.md S9).
+# plausible direction from the synthetic replay fixtures (design §1,
+# eval/fixtures/), not fit against labelled data. They are reviewed like
+# code and are expected to be replaced by the first `abusekit calibrate`/
+# gate run (design §4.6, open question 5; plan.md S9).
 #
 # linear = bias + sum(weight[feature] * features[feature])
 # p(non-benign) = sigmoid(linear); p(benign) = 1 - p(non-benign)
@@ -16,40 +14,101 @@
 # A feature named here with no corresponding rule input is harmless (dead
 # weight); a rule input with no weight here contributes 0 — see
 # internal/model/local.Scorer.Score's doc comment.
+#
+# S2 fix round (B1): retuned from S1's placeholders against eval/fixtures'
+# full set (reference_operator, burst, churn, benign_transactional,
+# benign_fast_onboarding, benign_integration_heavy, dormant_then_blast) —
+# see internal/worker/replay_test.go's TestReplay_* for the score-band
+# assertions these weights satisfy, and the PR body's "which fixture
+# bounded which weight" table for how each one below was chosen. The
+# short version: `upgraded` and a much smaller `upgrade_delay_min`
+# together replace S1's single `upgrade_delay_min`-only signal (a small
+# delay used to be read as "just upgraded" whether or not an upgrade
+# actually happened); `resource_velocity_1h`/`key_velocity_1h` came down
+# sharply (S1's magnitude alone made an ordinary few-agents-in-an-hour
+# onboarding score `high`); `name_brand_match` went up to let
+# `dormant_then_blast` (no payment signals at all) still cross the `high`
+# threshold on resource burst + brand name alone; `linked_deleted_n` went
+# up substantially so design's "high from the third churned subject
+# onward" (§1.2(c)) is met now that the count also saturates at 3.
 version: v1
 benign_label: benign
-bias: -4.0
+bias: -4.5
 weights:
   # Negative: an older account is less likely to be a fresh throwaway.
+  # Bounded by: benign_transactional (must stay low despite 24h-clamped
+  # age contributing its full weight).
   subject_age_h: -0.02
 
-  # Resource (agent/key) creation velocity and totals: the churn fixture's
-  # signature is many resources in a short window.
-  resource_velocity_1h: 0.8
-  resource_total: 0.05
-  key_velocity_1h: 0.9
-  key_total: 0.05
+  # Resource (agent/key) creation velocity and totals. Bounded on the low
+  # side by benign_fast_onboarding (4 resources/1 key in 10 minutes) and
+  # benign_integration_heavy (6 resources/1 key in an hour) staying well
+  # under the `medium` cut point with no other signal firing; bounded on
+  # the high side by dormant_then_blast (9-10 resources/5 keys) needing to
+  # reach `high` in combination with name_brand_match alone (no payment
+  # signals at all in that fixture) and by burst.jsonl needing `high`
+  # within 15s of its last setup event, before any send.
+  resource_velocity_1h: 0.35
+  resource_total: 0.02
+  key_velocity_1h: 0.35
+  key_total: 0.02
 
-  # Permanent onboarding facts (never age out, design §4.5).
-  upgrade_delay_min: -0.01 # a quick upgrade after signup is the burst fixture's shape
+  # Permanent onboarding facts (never age out, design §4.5). S2 fix round
+  # (B5): upgrade_delay_min alone used to double as "did this account
+  # upgrade at all" AND "how fast" — a benign account that simply hadn't
+  # upgraded YET (a small elapsed-so-far value, indistinguishable from a
+  # genuinely fast paid upgrade) inflated risk it shouldn't have.
+  # `upgraded` now carries "a paid upgrade happened at all" on its own
+  # weight; upgrade_delay_min's magnitude dropped by 20x so a moderate
+  # value (whether from a fast upgrade or from a benign account's
+  # elapsed-so-far fallback) barely moves the score either way — only the
+  # 1440-minute clamp ceiling (a long-unresolved non-upgrade OR
+  # benign_transactional's genuinely slow one) still contributes
+  # meaningfully, and in the benign direction. Bounded by
+  # benign_transactional (upgraded=1 from a real-but-3-days-slow upgrade
+  # must still net low) on one side and churn/burst (upgraded=1 within
+  # minutes must net high) on the other.
+  upgrade_delay_min: -0.0005
+  upgraded: 1.3
   declines_before_first_success: 0.6
-  first_funding_prepaid: 0.7
+  first_funding_prepaid: 0.9
 
-  # Name/identity patterns.
-  name_brand_match: 1.2
+  # Name/identity patterns. name_brand_match bounded by dormant_then_blast
+  # needing to reach `high` on resource burst + this alone (no payment
+  # signals at all there), while benign_integration_heavy's
+  # "Stripe Webhook Relay"/"Google Calendar Sync"/"Microsoft Teams Relay"
+  # names correctly contribute 0 (S3 fix round: excluded from
+  # config/brands.yaml, not a name_brand_match false positive).
+  name_brand_match: 2.0
   name_has_at: 0.5
-  first_day_distinct_domains: 0.3
+  first_day_distinct_domains: 0.25
 
   # Rehearsal-to-self before an external blast (design §4.3's
   # recipient_is_own_identity signal, aggregated into a feature).
-  self_send_before_external: 1.0
+  self_send_before_external: 0.8
 
   # Linked-subject evidence (design §4.2): a predecessor account sharing a
   # link key that was deleted or already labelled abusive is strong
-  # evidence for a churn incarnation.
-  linked_deleted_n: 0.4
+  # evidence for a churn incarnation. linked_deleted_n bounded by
+  # churn.jsonl needing `high` from the third churned subject onward
+  # (§1.2(c)) — subject 3 has linked_deleted_n=2 (saturation, S1 fix
+  # round, doesn't cap until 3) plus its own onboarding-fact signals.
+  linked_deleted_n: 1.3
   linked_labelled_abusive_n: 1.5
-  fingerprint_seen_on_other_subjects: 0.9
+  fingerprint_seen_on_other_subjects: 1.0
 
-  # Dormant-then-blast pattern.
-  burst_ratio_24h_vs_lifetime: 0.7
+  # S1 fix round: surfaces design §4.2's fan-in-cap flag; a small weight —
+  # truncation happening at all is weak, informational evidence of a hub
+  # of accounts, not itself a strong abuse signal, and no committed
+  # fixture exercises it (S1's own fan-in cap is 50, far more same-tenant
+  # neighbours than any replay fixture here has).
+  neighbors_truncated: 0.3
+
+  # Dormant-then-blast pattern. Bounded by dormant_then_blast needing
+  # `high` and every fresh-signup fixture (burst, churn, both benign ones)
+  # having burst_ratio=1.0 too, purely because nothing OLDER exists yet to
+  # compare against — this weight alone can never be the sole
+  # discriminator between a legitimate brand-new account and an abusive
+  # one, which is why it stayed modest relative to the feature-specific
+  # signals above rather than carrying most of the weight itself.
+  burst_ratio_24h_vs_lifetime: 0.3

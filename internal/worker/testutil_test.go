@@ -75,6 +75,20 @@ func loadShippedConfig(t *testing.T) *config.Config {
 	return cfg
 }
 
+// loadShippedBrands loads the real config/brands.yaml this repo ships
+// (S3 fix round) — used alongside loadShippedConfig by every replay test
+// so name_brand_match is exercised against the actual curated list, not
+// silently held at 0 by an unset Deps.Brands.
+func loadShippedBrands(t *testing.T) feature.BrandSet {
+	t.Helper()
+	root := repoRoot(t)
+	brands, err := feature.LoadBrandsFile(filepath.Join(root, "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("load brands.yaml: %v", err)
+	}
+	return brands
+}
+
 // newFakeRuleConfig builds a *config.Config with exactly one advise rule,
 // "fake_rule", scored by scorer (registered as "fake_test_scorer") — used
 // by tests that need to force a scorer error or a budget denial, which the

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tokencanopy/abusekit/internal/config"
+	"github.com/tokencanopy/abusekit/internal/feature"
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/fake"
 	"github.com/tokencanopy/abusekit/internal/model/local"
@@ -696,13 +697,12 @@ func TestShippedConfigsLoadTogether(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read rules.yaml: %v", err)
 	}
-	features := config.NewFeatureSet(
-		"subject_age_h", "resource_velocity_1h", "resource_total", "key_velocity_1h", "key_total",
-		"upgrade_delay_min", "declines_before_first_success", "first_funding_prepaid",
-		"name_brand_match", "name_has_at", "first_day_distinct_domains", "self_send_before_external",
-		"linked_deleted_n", "linked_labelled_abusive_n", "fingerprint_seen_on_other_subjects",
-		"burst_ratio_24h_vs_lifetime",
-	)
+	// S2 fix round: sourced from internal/feature.Names (the same single
+	// source of truth cmd/abusekit uses) instead of a hand-copied literal,
+	// so this test can't silently drift from what Extract actually
+	// computes the way the S1-era literal here did the moment B5/S1 fix
+	// round added `upgraded`/`neighbors_truncated`.
+	features := config.NewFeatureSet(feature.Names...)
 	cfg, err := config.Load(rulesData, config.Dependencies{
 		Registry: reg,
 		Features: features,
