@@ -47,6 +47,26 @@
 # body's weight-sweep table, including which weight(s) — if any — this
 # floor set does not catch and why.
 #
+# min_high_tier_recall is 0.60, not baseline-minus-the-usual-margin
+# (0.7222 - ~0.09 would round to ~0.63): at n=54 abusive subjects, zeroing
+# burst_ratio_24h_vs_lifetime, first_day_distinct_domains, or
+# linked_labelled_abusive_n each independently moves this metric to the
+# EXACT same value (34/54 = 0.6296 — verified, not a rounding
+# coincidence), so no threshold on this metric alone can catch one of
+# those three without also catching the other two. Since burst_ratio and
+# linked_labelled_abusive_n are the deliberately-NOT-gate-breaking weights
+# from the sweep (T3: burst_ratio is an S5-calibration candidate with no
+# weight change; linked_labelled_abusive_n is real but not solely
+# load-bearing yet), 0.60 is set below that tie point rather than above
+# it — trading away this floor's ability to catch first_day_distinct_
+# domains alone, honestly reported in the PR body's sweep table
+# (first_day_distinct_domains, self_send_before_external, and
+# linked_deleted_n are, this round, not independently caught by ANY
+# current floor — a real reduction in gate sensitivity from round 1,
+# where all three broke the gate; a bigger abusive corpus, or a
+# mutation_test.go-style isolated scenario the way neighbors_truncated/
+# name_has_at already need, would restore it).
+#
 # A NEGATIVE-signed weight (subject_age_h, upgrade_delay_min) zeroed out
 # can only ever move recall/high-tier-recall/family-recall UP, never
 # down — those floors are all one-sided minimums and structurally cannot
@@ -73,7 +93,7 @@ floors:
     min_recall: 0.77
     max_ece: 0.115
     min_auroc: 0.93
-    min_high_tier_recall: 0.63
+    min_high_tier_recall: 0.60
     family_min_high_tier_recall:
       burst: 0.60
       churn_incarnation_ge3: 0.85
