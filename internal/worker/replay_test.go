@@ -263,18 +263,23 @@ func TestReplay_BenignIntegrationHeavyStaysBelowHigh(t *testing.T) {
 
 // TestReplay_DormantThenBlastReachesHigh replays eval/fixtures/
 // dormant_then_blast.jsonl — a week-old account, no upgrade ever, that
-// suddenly creates 10 resources (one brand-impersonating) and sends to 20
-// distinct external domains within an hour — and asserts it reaches
-// "high" (B1 fix round, proven: this exact shape previously scored 0.000,
-// tier low, since every "just signed up" feature this account doesn't
-// have — payment/upgrade signals — carried most of S1's placeholder
-// weights). Note (fixture-sizing interpretation): the review's own
-// description named "300 external domains"; this fixture uses 20, since
-// no v0 feature (first_day_distinct_domains doesn't apply — these sends
-// land 7 days after signup, well past its first-day window;
-// burst_ratio_24h_vs_lifetime only cares that recent activity dominates
-// lifetime activity, not the exact count) actually distinguishes 20 from
-// 300 distinct post-first-day domains.
+// suddenly sends to 100 distinct external (non-webmail) domains within
+// ten minutes — and asserts it reaches "high" (B1 fix round, proven: this
+// exact shape previously scored 0.000, tier low, since every "just signed
+// up" feature this account doesn't have — payment/upgrade signals —
+// carried most of S1's placeholder weights).
+//
+// Round 2's R1 fix round: this fixture no longer has a brand-impersonating
+// agent name or a resource-creation burst at all (a SINGLE neutral agent)
+// — the review asked for proof that the volume/recipient signals ALONE,
+// with no other evidence, still carry this shape to `high`, replacing the
+// old hard 7-day age gate (proven evadable by simply waiting past it, and
+// blind to whether the account had any real prior sending at all) with a
+// history-relative burst_factor: this subject has NO prior sending
+// history, so its 100-recipient burst reads at close to full strength
+// (see internal/feature.burstFactor/priorTenMinutePeak), discounted only
+// by ageDecayFactor for its 7-day age (still close to full weight; the
+// floor doesn't bind until ~day 25).
 func TestReplay_DormantThenBlastReachesHigh(t *testing.T) {
 	view := runReplay(t, "dormant_then_blast.jsonl", "acct_example_dormant_blast_1")
 	if view.Tier != "high" {
@@ -302,14 +307,27 @@ func TestReplay_SelfSendOnlyStaysBelowHigh(t *testing.T) {
 // customer domains previously scored 0.9634 (tier high) on
 // first_day_distinct_domains alone; R1's hard cap brought it down to
 // ~0.15, and D2 round 3's log1p replacement (still anchored so n=10 gives
-// the same contribution the old cap did) leaves it at ~0.34 — comfortably
-// medium/low, not the flat-zero-sensitivity-past-10 the hard cap gave it.
+// the same contribution the old cap did) leaves it at ~0.34.
+//
+// Round 2's R1 fix round widened the upper edge of this band from 0.4 to
+// 0.55: this fixture, like dormant_then_blast, has NO prior sending
+// history, so sends_10m_max/sends_1h/distinct_recipients_1h's new
+// burst_factor reads its 30-recipient, 1-hour fan-out at close to full
+// strength too — the SAME history-relative measure that (correctly)
+// carries dormant_then_blast to `high` on a much larger, more
+// concentrated burst also pushes this smaller, more spread-out one from
+// `low` into low `medium`. Documented trade-off, not a fixture
+// regression: this fixture's own defining shape (30 recipients spread
+// across a full hour, one legitimate account) keeps its sends_10m_max far
+// below dormant_then_blast's (a burst concentrated into 10 minutes), so
+// it still lands clearly short of `high` — the qualitative claim this
+// test exists to protect.
 func TestReplay_ReceiptsFanoutStaysBelowHigh(t *testing.T) {
 	view := runReplay(t, "benign_receipts_fanout.jsonl", "acct_example_receipts_fanout_1")
 	if view.Tier == "high" {
 		t.Errorf("benign_receipts_fanout: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
-	assertBand(t, "benign_receipts_fanout", view.Score, 0.05, 0.4)
+	assertBand(t, "benign_receipts_fanout", view.Score, 0.4, 0.55)
 }
 
 // TestReplay_VariantAStaysBelowHigh replays eval/fixtures/
@@ -360,12 +378,21 @@ func TestReplay_SelfSendBrandNameStaysBelowHigh(t *testing.T) {
 // all). Addresses a common bulk-phishing shape on volume and webmail
 // concentration ALONE, with no brand signal to lean on — must reach at
 // least tier "medium".
+//
+// Round 2's R1 fix round raised the band from medium-sized ([0.55, 0.85])
+// to this: with no prior sending history at all, burst_factor now reads
+// this 100-in-10-minutes burst at close to full strength on BOTH
+// sends_10m_max and webmail_sends_1h at once (the account's single
+// webmail domain means every one of these new weights fires together,
+// unlike a fixture that splits its volume across webmail and non-webmail
+// recipients) — the qualitative claim ("at least medium") still holds
+// with room to spare; the fixture now clears all the way to `high`.
 func TestReplay_WebmailBlastReachesAtLeastMedium(t *testing.T) {
 	view := runReplay(t, "webmail_blast.jsonl", "acct_example_webmail_blast_1")
 	if view.Tier == "low" {
 		t.Errorf("webmail_blast: tier = low (score %v), want medium or high\nsignals: %+v", view.Score, view.Signals)
 	}
-	assertBand(t, "webmail_blast", view.Score, 0.55, 0.85)
+	assertBand(t, "webmail_blast", view.Score, 0.9, 1.0)
 }
 
 // TestReplay_SingleBrandBlastReachesHigh replays eval/fixtures/
@@ -392,9 +419,12 @@ func TestReplay_SingleBrandBlastReachesHigh(t *testing.T) {
 // consumer webmail) within 10 minutes — the exact shape a lifetime-max
 // volume feature with no account-age awareness would flag `high` on
 // alone, and the flag would never decay for an account that keeps
-// operating normally afterward. youngAccountFactor (B1 fix round) zeroes
-// every send-volume feature for an account this far past its first week,
-// so this fixture must stay below tier "medium".
+// operating normally afterward. Round 2's R1 fix round: this account HAS
+// a real prior sending history (its own weekly sends), so
+// burstFactor(current 300-recipient burst, that real prior baseline)
+// reads the burst as only moderately elevated rather than maximally
+// unusual, and ageDecayFactor discounts it further at 60 days old (near
+// its 0.2 floor) — so this fixture must stay below tier "medium".
 func TestReplay_EstablishedNewsletterStaysBelowMedium(t *testing.T) {
 	view := runReplay(t, "established_newsletter_burst.jsonl", "acct_example_established_newsletter_1")
 	if view.Tier != "low" {
@@ -420,4 +450,60 @@ func TestReplay_Day0MarketplaceSellerStaysBelowHigh(t *testing.T) {
 		t.Errorf("day0_marketplace_seller: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
 	assertBand(t, "day0_marketplace_seller", view.Score, 0.6, 0.78)
+}
+
+// TestReplay_DormantBrandedBurst8dReachesHigh replays eval/fixtures/
+// dormant_branded_burst_8d.jsonl — round 2's R1(a) required outcome: an
+// account that sat dormant for 8 days (one day PAST the old hard 7-day
+// gate) then bursts 100 branded webmail recipients within 10 minutes.
+// The old calendar gate was evadable by simply waiting past it — this
+// account would have read as fully "established" under it despite never
+// having sent anything before. burst_factor (no prior history at this
+// subject at all) reads the burst at close to full strength, discounted
+// only slightly by ageDecayFactor at 8 days (still close to 1.0 — the
+// floor doesn't bind until ~day 25) — must reach at least medium, and in
+// fact clears all the way to high.
+func TestReplay_DormantBrandedBurst8dReachesHigh(t *testing.T) {
+	view := runReplay(t, "dormant_branded_burst_8d.jsonl", "acct_example_dormant_branded_8d_1")
+	if view.Tier == "low" {
+		t.Errorf("dormant_branded_burst_8d: tier = low (score %v), want medium or high\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "dormant_branded_burst_8d", view.Score, 0.9, 1.0)
+}
+
+// TestReplay_PaidLaunch5dStaysBelowHigh replays eval/fixtures/
+// paid_launch_5d.jsonl — round 2's R1(c) required outcome: a 5-day-old
+// paid SaaS account, with a real (if modest) history of prior sends,
+// that pushes a launch-announcement burst of 250 webmail recipients over
+// 15 minutes with an entirely neutral subject line (no brand mentioned).
+// Its prior sends give burstFactor a real, non-trivial baseline to
+// compare against (unlike dormant_branded_burst_8d/dormant_then_blast,
+// which have none) — the burst reads as elevated but not nearly as
+// extreme, and ageDecayFactor at 5 days is barely discounted yet, so this
+// fixture must stay below `high` on the strength of that history alone,
+// with a comfortable margin.
+func TestReplay_PaidLaunch5dStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "paid_launch_5d.jsonl", "acct_example_paid_launch_5d_1")
+	if view.Tier == "high" {
+		t.Errorf("paid_launch_5d: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "paid_launch_5d", view.Score, 0.0, 0.4)
+}
+
+// TestReplay_WebmailSpread1hMediumBand replays eval/fixtures/
+// webmail_spread_1h.jsonl — round 2's R6: a fixture that isolates
+// webmail_sends_1h from sends_10m_max specifically, so the mutation
+// sweep can prove webmail_sends_1h load-bearing on its own (see
+// mutation_test.go's "webmail_spread_1h" scenario). 80 webmail
+// recipients spread evenly across a full hour (8-minute intervals) —
+// deliberately NOT concentrated into any 10-minute window the way
+// webmail_blast's burst is, so sends_10m_max stays modest (20) while
+// webmail_sends_1h/sends_1h/distinct_recipients_1h (80 each) carry most
+// of the signal.
+func TestReplay_WebmailSpread1hMediumBand(t *testing.T) {
+	view := runReplay(t, "webmail_spread_1h.jsonl", "acct_example_webmail_spread_1")
+	if view.Tier == "high" {
+		t.Errorf("webmail_spread_1h: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "webmail_spread_1h", view.Score, 0.65, 0.78)
 }

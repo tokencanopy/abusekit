@@ -936,27 +936,41 @@ func TestKeyVelocity_RecognisesAliasedKinds(t *testing.T) {
 
 // --- S2b: send-volume young-account scoping (B1) ------------------------
 
-func TestSends1h_GatedByAccountAge(t *testing.T) {
+// TestSends1h_HistoryRelativeNotCalendarGated is round 2's R1: a young
+// account with NO prior sending history reads its current burst at
+// (nearly) full strength; the SAME current volume from an account with a
+// real, comparable prior baseline reads far lower — replacing round 1's
+// hard 7-day cliff (which any of this ever landed the same score for,
+// purely by calendar age, regardless of prior history).
+func TestSends1h_HistoryRelativeNotCalendarGated(t *testing.T) {
 	firstSeenAt := base
 	events := []event.Event{
 		ev("c1", "content.sent", 6*24*time.Hour, map[string]any{"recipient_count": float64(50)}),
 	}
-	// Within the first 7 days: the send counts.
 	young := sends1h(events, firstSeenAt.Add(6*24*time.Hour), firstSeenAt, time.Hour)
-	if young != 50 {
-		t.Errorf("sends_1h (young account) = %v, want 50", young)
+	if young <= 0 {
+		t.Errorf("sends_1h (young account, no prior history) = %v, want a strongly positive burst_factor-driven value", young)
 	}
 
-	// An established (>7 day old) account sending the SAME volume right
-	// now must not read the same as day 0 (B1's established-sender
-	// fixture).
-	oldEvents := []event.Event{
+	// An established account (60 days old) with a comparable REAL prior
+	// baseline sending the SAME current volume must read far lower than a
+	// brand-new account with no history at all would for the same burst —
+	// never a hard 0 the way the old calendar gate produced, but heavily
+	// discounted by BOTH burstFactor (a real baseline to compare against)
+	// and ageDecayFactor (floored at 0.2, never fully gone).
+	establishedEvents := []event.Event{
+		// A comparable prior 10-minute peak within the last 30 days
+		// (excluding the trailing 24h "current" period).
+		ev("c0", "content.sent", 60*24*time.Hour-48*time.Hour, map[string]any{"recipient_count": float64(300)}),
 		ev("c1", "content.sent", 60*24*time.Hour, map[string]any{"recipient_count": float64(300)}),
 	}
 	oldNow := firstSeenAt.Add(60 * 24 * time.Hour)
-	old := sends1h(oldEvents, oldNow, firstSeenAt, time.Hour)
-	if old != 0 {
-		t.Errorf("sends_1h (established account, >7 days old) = %v, want 0", old)
+	old := sends1h(establishedEvents, oldNow, firstSeenAt, time.Hour)
+	if old <= 0 {
+		t.Errorf("sends_1h (established, real prior baseline) = %v, want > 0 (never a hard 0)", old)
+	}
+	if old >= young {
+		t.Errorf("sends_1h established=%v must read LOWER than young=%v despite an equal or larger raw burst", old, young)
 	}
 }
 
@@ -987,8 +1001,8 @@ func TestSendsFirstDay_NotGatedByAccountAge(t *testing.T) {
 	firstSeenAt := base
 	events := []event.Event{ev("c1", "content.sent", time.Hour, map[string]any{"recipient_count": float64(40)})}
 	// SendsFirstDay is a permanent day-1 fact: it must still report the
-	// same value long after the account has matured past
-	// youngAccountWindow, unlike Sends1h/Sends10mMax/WebmailSends1h/
+	// same value long after the account has matured, unlike its
+	// history-relative siblings Sends1h/Sends10mMax/WebmailSends1h/
 	// DistinctRecipients1h.
 	now := firstSeenAt.Add(60 * 24 * time.Hour)
 	got := sendsFirstDay(events, firstSeenAt, now, 24*time.Hour)
@@ -1124,5 +1138,88 @@ func TestExtract_SubjectBrandMatchDoesNotDoubleCount(t *testing.T) {
 	}
 	if res.Features.SubjectBrandMatch != 0 {
 		t.Errorf("SubjectBrandMatch = %v, want 0 (S2: PayPal already counted via NameBrandMatch)", res.Features.SubjectBrandMatch)
+	}
+}
+
+// --- Round 2, R1: history-relative volume signal, no hard age cliff ----
+
+// TestAgeDecayFactor_NoCliff is R1: probing 6d23h, 7d and 7d1h must show
+// smooth continuity (each step differs only by the ordinary slope of the
+// ramp), never a jump the way the old hard 7-day gate produced (1 -> 0).
+func TestAgeDecayFactor_NoCliff(t *testing.T) {
+	firstSeenAt := base
+	at6d23h := ageDecayFactor(firstSeenAt, firstSeenAt.Add(6*24*time.Hour+23*time.Hour))
+	at7d := ageDecayFactor(firstSeenAt, firstSeenAt.Add(7*24*time.Hour))
+	at7d1h := ageDecayFactor(firstSeenAt, firstSeenAt.Add(7*24*time.Hour+time.Hour))
+	at8d := ageDecayFactor(firstSeenAt, firstSeenAt.Add(8*24*time.Hour))
+
+	// No cliff: consecutive probes differ by a small, continuous amount,
+	// not by anywhere near the old gate's full 1 -> 0 jump.
+	const maxStepAcrossOneHour = 0.01
+	if diff := at7d - at7d1h; diff < 0 || diff > maxStepAcrossOneHour {
+		t.Errorf("ageDecayFactor(7d)=%v -> ageDecayFactor(7d1h)=%v moved by %v, want a small continuous step (<= %v)", at7d, at7d1h, diff, maxStepAcrossOneHour)
+	}
+	if diff := at6d23h - at7d; diff < 0 || diff > maxStepAcrossOneHour {
+		t.Errorf("ageDecayFactor(6d23h)=%v -> ageDecayFactor(7d)=%v moved by %v, want a small continuous step (<= %v)", at6d23h, at7d, diff, maxStepAcrossOneHour)
+	}
+	// Monotonically non-increasing with age over this range.
+	if !(at6d23h >= at7d && at7d >= at7d1h && at7d1h >= at8d) {
+		t.Errorf("ageDecayFactor must be non-increasing with age: 6d23h=%v 7d=%v 7d1h=%v 8d=%v", at6d23h, at7d, at7d1h, at8d)
+	}
+}
+
+// TestAgeDecayFactor_Bounds is R1's formula: clamp(1 - (age_days-3)/27,
+// 0.2, 1) — full weight through day 3, floor of 0.2 from ~day 25 on.
+func TestAgeDecayFactor_Bounds(t *testing.T) {
+	firstSeenAt := base
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt); got != 1 {
+		t.Errorf("ageDecayFactor(age=0) = %v, want 1", got)
+	}
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(3*24*time.Hour)); got != 1 {
+		t.Errorf("ageDecayFactor(age=3d) = %v, want 1", got)
+	}
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(90*24*time.Hour)); got != 0.2 {
+		t.Errorf("ageDecayFactor(age=90d) = %v, want the 0.2 floor", got)
+	}
+	// Never a hard 0: a genuinely established sender still gets SOME
+	// weight from a volume signal, just heavily discounted.
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(365*24*time.Hour)); got != 0.2 {
+		t.Errorf("ageDecayFactor(age=365d) = %v, want the 0.2 floor (never 0)", got)
+	}
+}
+
+// TestBurstFactor_HistoryRelative is R1: the SAME current burst reads as
+// far less unusual for a subject with a substantial prior peak than for
+// one with none.
+func TestBurstFactor_HistoryRelative(t *testing.T) {
+	noHistory := burstFactor(300, 0)
+	establishedHistory := burstFactor(300, 40)
+	if noHistory <= establishedHistory {
+		t.Errorf("burstFactor(300, no history)=%v, burstFactor(300, established)=%v — a subject with real prior volume must read as LESS unusual", noHistory, establishedHistory)
+	}
+	if noHistory != 300 {
+		t.Errorf("burstFactor(300, 0) = %v, want 300 (no history: baseline floors at 1, ratio = current)", noHistory)
+	}
+	if got := burstFactor(300, 40); math.Abs(got-7.5) > 1e-9 {
+		t.Errorf("burstFactor(300, 40) = %v, want 7.5", got)
+	}
+}
+
+// TestSends10mMax_TrailingWindowNotWholeHistory is R1: "Replace
+// sends_10m_max's whole-history maximum with a trailing window, so a
+// burst stops contributing once it leaves the window" — an old burst
+// (more than currentBurstWindow ago) must no longer count toward the
+// CURRENT search, even though it's still within the 30-day history
+// lookback that feeds the baseline.
+func TestSends10mMax_TrailingWindowNotWholeHistory(t *testing.T) {
+	// A burst 2 days ago (well outside the 24h "current" window, but
+	// inside the 30-day history lookback) followed by total silence.
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_count": float64(200), "recipient_domain": "corp.example.test"}),
+	}
+	now := at(48 * time.Hour) // 2 days after the old burst
+	got := sends10mMax(events, now, base)
+	if got != 0 {
+		t.Errorf("sends_10m_max = %v, want 0 (the only burst is outside the 24h current window)", got)
 	}
 }

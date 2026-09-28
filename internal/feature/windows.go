@@ -29,18 +29,6 @@ func isWindowedEventType(t string) bool {
 	return t == "resource.created" || t == "content.sent"
 }
 
-// hasEventType reports whether events contains at least one event of type
-// t (S2b: nextRescoreAt uses this to skip scheduling the young-account
-// cutover for a subject with no content.sent history at all).
-func hasEventType(events []event.Event, t string) bool {
-	for _, e := range events {
-		if e.Type == t {
-			return true
-		}
-	}
-	return false
-}
-
 // withinWindow reports whether at falls in the half-open window
 // (now-window, now] — i.e. strictly newer than window ago, and not newer
 // than now itself. An event exactly window-old is excluded (it has just
@@ -403,24 +391,14 @@ func nextRescoreAt(events []event.Event, now, firstSeenAt time.Time, windows Win
 	if cutover := firstSeenAt.Add(windows.DayHour); cutover.After(now) {
 		candidates = append(candidates, cutover)
 	}
-	// S2b: the young-account cutover (youngAccountWindow) is a second
-	// passive-decay transition alongside the first-day cutover above — the
-	// young-gated send-volume features (Sends10mMax, Sends1h,
-	// WebmailSends1h, DistinctRecipients1h) fall to 0 once the subject
-	// crosses it, even with zero new events, so a rescore must be
-	// scheduled for that instant too or an established sender's score
-	// would stay pinned at its last young-period value indefinitely.
-	// Scheduled only when the subject has EVER recorded a content.sent
-	// event (isWindowedEventType's own event-type scoping, applied here
-	// too) — a subject with no send history at all has every one of
-	// those features already at 0, so the transition changes nothing and
-	// scheduling it anyway would be pure waste (the same reasoning
-	// isWindowedEventType's own doc comment gives).
-	if hasEventType(events, "content.sent") {
-		if cutover := firstSeenAt.Add(youngAccountWindow); cutover.After(now) {
-			candidates = append(candidates, cutover)
-		}
-	}
+	// Round 2 (R1) removed the old hard young-account cutover this
+	// section used to schedule: ageDecayFactor is now a SMOOTH, continuous
+	// function of age with no discontinuity to schedule a rescore for, and
+	// currentBurstWindow (24h) is exactly windows.DayHour, so the
+	// earliestWindowExit(events, now, windows.DayHour) candidate above
+	// already covers the "a burst ages out of the CURRENT window" instant
+	// every history-relative volume feature (sends10mMax, sends1h,
+	// webmailSends1h, distinctRecipients1h) needs.
 	if t, ok := minAt(events, func(e event.Event) bool { return e.At.After(now) }); ok {
 		candidates = append(candidates, t)
 	}
@@ -480,31 +458,128 @@ func earliestWindowExit(events []event.Event, now time.Time, window time.Duratio
 // SUBJECT rather than (or in addition to) the sending resource's own
 // name.
 
-// youngAccountWindow bounds every send-volume feature below to a
-// subject's first 7 days (B1 fix round, proven: an established, months-
-// old paid sender can legitimately burst hundreds of recipients in a
-// single send — volume alone must never read the same for that account
-// as it does for a signup that started blasting on day zero). Sends1h,
-// Sends10mMax, WebmailSends1h and DistinctRecipients1h are all
-// multiplied by youngAccountFactor; SendsFirstDay needs no such gate — it
-// is already permanently anchored to the subject's first day, the same
-// way FirstDayDistinctDomains is, so it can never reflect an established
-// account's CURRENT behaviour in the first place.
-const youngAccountWindow = 7 * 24 * time.Hour
+// currentBurstWindow and historyLookbackWindow are round 2's R1
+// replacement for the hard 7-day calendar-age gate (B1's original fix,
+// proven EVADABLE: a review found an 8-day-old account that sat dormant
+// then blasted still read as fully established, since the gate compared
+// only firstSeenAt to now, never what the subject had actually sent
+// before). currentBurstWindow is what "right now" means for finding a
+// subject's CURRENT burst; historyLookbackWindow is how far back "the
+// subject's own prior sending" reaches when computing a baseline to
+// compare that burst against — with currentBurstWindow itself excluded,
+// so a burst can never serve as its own baseline.
+const (
+	currentBurstWindow    = 24 * time.Hour
+	historyLookbackWindow = 30 * 24 * time.Hour
+)
 
-// youngAccountFactor is 1 while now is within youngAccountWindow of
-// firstSeenAt, else 0 — a hard gate, not a gradual decay: once an
-// account ages out of its first week, every send-volume feature it gates
-// reads 0 from then on, regardless of how much mail it sends. This is
-// what makes those features DECAY rather than remain a permanent,
-// never-reconsidered fact the way a lifetime maximum would (nextRescoreAt
-// schedules the exact instant this flips, so the transition happens even
-// with no new event).
-func youngAccountFactor(firstSeenAt, now time.Time) float64 {
-	if now.Sub(firstSeenAt) <= youngAccountWindow {
-		return 1
+// ageDecayFactor is round 2's R1 replacement for the old hard 0/1
+// youngAccountFactor gate: a SMOOTH, continuous multiplier — full weight
+// (1.0) through a subject's first 3 days, ramping linearly down to a
+// floor of 0.2 by around day 25, and NEVER all the way to 0. Proven by
+// review: the old gate had a cliff (1 -> 0 at exactly 7 days) an operator
+// could evade simply by waiting it out, and it discarded a genuinely
+// established sender's volume signal entirely rather than merely
+// discounting it. Combined multiplicatively with burstFactor (below) —
+// this factor alone answers "how much do we still trust a volume signal
+// at this age", not "is this burst unusual at all".
+//
+// Never a hard 0: even a long-established sender's burst still
+// contributes at the 0.2 floor, so a genuinely history-relative unusual
+// burst (a high burstFactor) can still move the score, just discounted —
+// unlike the old gate, which discarded the signal completely past 7 days
+// regardless of how unusual the burst was relative to that subject's own
+// history.
+func ageDecayFactor(firstSeenAt, now time.Time) float64 {
+	ageDays := now.Sub(firstSeenAt).Hours() / 24
+	v := 1 - (ageDays-3)/27
+	if v > 1 {
+		v = 1
 	}
-	return 0
+	if v < 0.2 {
+		v = 0.2
+	}
+	return v
+}
+
+// burstFactor is round 2's R1 history-relative volume measure: how many
+// times larger current is than the subject's own prior baseline, floored
+// at 1 (a subject with no meaningful prior history — baseline <= 1 —
+// reads current itself, unchanged from a brand-new signup's original
+// behaviour) and capped at sendsVolumeCap (the same ceiling every
+// send-volume feature already uses, so this ratio composes with the
+// existing model scale instead of introducing a new one).
+func burstFactor(current, baseline float64) float64 {
+	if baseline < 1 {
+		baseline = 1
+	}
+	return capAt(current/baseline, sendsVolumeCap)
+}
+
+// maxWindowSum returns the largest content.sent recipient sum within any
+// windowWidth-wide sliding window among events whose At falls in the
+// half-open range (rangeStart, rangeEnd] — self-sends are excluded
+// (isSelfSend's own reasoning applies identically here). Shared by both
+// "the subject's CURRENT burst" (rangeEnd = now, rangeStart = now -
+// currentBurstWindow) and "the subject's PRIOR baseline" (the 30-day
+// history before that, excluding the current window) below. Computed
+// order-independently (a two-pointer sliding-window-sum maximum over
+// events sorted by At), matching sends10mMax's original algorithm.
+func maxWindowSum(events []event.Event, rangeStart, rangeEnd time.Time, windowWidth time.Duration) float64 {
+	type point struct {
+		at time.Time
+		n  float64
+	}
+	var pts []point
+	for _, e := range events {
+		if e.Type != "content.sent" || isSelfSend(e) {
+			continue
+		}
+		if e.At.After(rangeEnd) || !e.At.After(rangeStart) {
+			continue
+		}
+		pts = append(pts, point{e.At, recipientCountOf(e)})
+	}
+	if len(pts) == 0 {
+		return 0
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].at.Before(pts[j].at) })
+
+	var maxSum, sum float64
+	left := 0
+	for right := range pts {
+		sum += pts[right].n
+		for left < right && !pts[left].at.After(pts[right].at.Add(-windowWidth)) {
+			sum -= pts[left].n
+			left++
+		}
+		if sum > maxSum {
+			maxSum = sum
+		}
+	}
+	return maxSum
+}
+
+// currentTenMinuteBurst is the largest content.sent recipient sum within
+// any 10-minute-wide window among events in the subject's trailing
+// currentBurstWindow (24h) — round 2's R1 replacement for sends10mMax's
+// original whole-history search: a burst more than currentBurstWindow
+// old no longer counts as the CURRENT burst (it may still inform the
+// PRIOR baseline below, if it's within historyLookbackWindow).
+func currentTenMinuteBurst(events []event.Event, now time.Time) float64 {
+	return maxWindowSum(events, now.Add(-currentBurstWindow), now, sends10mMaxWindow)
+}
+
+// priorTenMinutePeak is round 2's R1 baseline: the largest content.sent
+// recipient sum within any 10-minute-wide window among the subject's OWN
+// prior sending history — events strictly before currentBurstWindow ago,
+// back to historyLookbackWindow ago — floored at 1 by burstFactor so it
+// always serves as a safe ratio denominator. A subject with no such
+// history (a brand-new signup, or a dormant account with nothing sent
+// before its current burst) reports 0, so burstFactor's own floor takes
+// over and the ratio reduces to the current volume itself.
+func priorTenMinutePeak(events []event.Event, now time.Time) float64 {
+	return maxWindowSum(events, now.Add(-historyLookbackWindow), now.Add(-currentBurstWindow), sends10mMaxWindow)
 }
 
 // sendsVolumeCap bounds every send-volume/recipient-count feature below
@@ -587,15 +662,21 @@ func sendsInWindow(events []event.Event, now time.Time, window time.Duration) fl
 	return sum
 }
 
-// sends1h is Features.Sends1h: sendsInWindow over the trailing window
-// ending at now, capped at sendsVolumeCap and gated by
-// youngAccountFactor (B1 fix round) — decays exactly like
-// resourceCount(events, "", now, window) as the window slides forward
-// with no new event; content.sent is already a windowed event type (see
-// isWindowedEventType), so no rescore-scheduling change is needed for
-// that part of the decay.
+// sends1h is Features.Sends1h: round 2's R1 history-relative measure —
+// burstFactor(current trailing-window sum, the subject's own prior
+// 10-minute peak) times ageDecayFactor, replacing B1's original hard
+// young-account gate (proven evadable by simply waiting past it, and
+// blind to whether an "established" account had ANY real prior volume at
+// all). Still decays as the window slides forward with no new event
+// (content.sent is already a windowed event type — see
+// isWindowedEventType — and priorTenMinutePeak's own 24h exclusion
+// boundary is exactly windows.OneHour's sibling, windows.DayHour, so
+// nextRescoreAt's existing window-exit candidates already cover both
+// transitions with no further code change).
 func sends1h(events []event.Event, now, firstSeenAt time.Time, window time.Duration) float64 {
-	return capAt(sendsInWindow(events, now, window), sendsVolumeCap) * youngAccountFactor(firstSeenAt, now)
+	current := sendsInWindow(events, now, window)
+	baseline := priorTenMinutePeak(events, now)
+	return burstFactor(current, baseline) * ageDecayFactor(firstSeenAt, now)
 }
 
 // sendsFirstDay is Features.SendsFirstDay: the sum of content.sent
@@ -604,9 +685,11 @@ func sends1h(events []event.Event, now, firstSeenAt time.Time, window time.Durat
 // event exactly like firstDayDistinctDomains, not to "now": once past
 // firstSeenAt+window, this feature is permanently fixed, and
 // nextRescoreAt's existing first-day-cutover candidate (feature-agnostic)
-// already covers its one transition with no code change. Deliberately
-// NOT gated by youngAccountFactor — see youngAccountWindow's own doc
-// comment for why this feature needs no such gate at all.
+// already covers its one transition with no code change. Deliberately NOT
+// history-relative or age-decayed like sends1h/sends10mMax/
+// webmailSends1h/distinctRecipients1h are (round 2, R1): it can only ever
+// reflect a subject's OWN first day, when there is by construction no
+// prior history to compare against and no age to decay by.
 func sendsFirstDay(events []event.Event, firstSeenAt, now time.Time, window time.Duration) float64 {
 	cutoff := firstSeenAt.Add(window)
 	var sum float64
@@ -626,48 +709,22 @@ func sendsFirstDay(events []event.Event, firstSeenAt, now time.Time, window time
 // largest recipient-count sum.
 const sends10mMaxWindow = 10 * time.Minute
 
-// sends10mMax is Features.Sends10mMax: the LARGEST sum of content.sent
-// recipient_count within any sends10mMaxWindow-wide window across the
-// subject's history up to now, capped at sendsVolumeCap and gated by
-// youngAccountFactor (B1 fix round: an earlier, lifetime-unbounded
-// version of this search never re-considered account age at all, so an
-// established sender's routine burst read exactly like a new signup's —
-// see youngAccountWindow's own doc comment for why gating, not merely a
-// trailing window, is the actual fix). Future-dated events (N5 fix
-// round) are excluded from the search entirely. Computed order-
-// independently (a standard two-pointer sliding-window-sum maximum over
-// events sorted by At) so out-of-order delivery can never miss the true
-// maximum the way a single forward pass over delivery order could.
+// sends10mMax is Features.Sends10mMax: round 2's R1 history-relative
+// measure — burstFactor(the subject's CURRENT 10-minute peak, within the
+// trailing currentBurstWindow) times ageDecayFactor. Round 1 searched the
+// subject's WHOLE history for its largest-ever 10-minute window and gated
+// the result by calendar age alone; round 2's review found that gate
+// evadable (an account that simply waited past it read as fully
+// established regardless of whether it had ever actually sent anything
+// before) and the whole-history search itself wrong on its own terms —
+// "replace sends_10m_max's whole-history maximum with a trailing window,
+// so a burst stops contributing once it leaves the window" — a burst from
+// 40 days ago should not still register as "the current burst" just
+// because nothing more recent happened to beat it.
 func sends10mMax(events []event.Event, now, firstSeenAt time.Time) float64 {
-	type point struct {
-		at time.Time
-		n  float64
-	}
-	var pts []point
-	for _, e := range events {
-		if e.Type != "content.sent" || isSelfSend(e) || e.At.After(now) {
-			continue
-		}
-		pts = append(pts, point{e.At, recipientCountOf(e)})
-	}
-	if len(pts) == 0 {
-		return 0
-	}
-	sort.Slice(pts, func(i, j int) bool { return pts[i].at.Before(pts[j].at) })
-
-	var maxSum, sum float64
-	left := 0
-	for right := range pts {
-		sum += pts[right].n
-		for left < right && !pts[left].at.After(pts[right].at.Add(-sends10mMaxWindow)) {
-			sum -= pts[left].n
-			left++
-		}
-		if sum > maxSum {
-			maxSum = sum
-		}
-	}
-	return capAt(maxSum, sendsVolumeCap) * youngAccountFactor(firstSeenAt, now)
+	current := currentTenMinuteBurst(events, now)
+	baseline := priorTenMinutePeak(events, now)
+	return burstFactor(current, baseline) * ageDecayFactor(firstSeenAt, now)
 }
 
 // distinctRecipients1h is Features.DistinctRecipients1h: the count of
@@ -677,8 +734,8 @@ func sends10mMax(events []event.Event, now, firstSeenAt time.Time) float64 {
 // all — an event with no hash gives no way to tell its recipients apart,
 // so treating it as "recipient_count more distinct recipients" is closer
 // to the truth than either dropping it or counting it as exactly one.
-// Capped at sendsVolumeCap and gated by youngAccountFactor for the same
-// reason as the send-volume features above.
+// Round 2's R1 history-relative measure applies here too: burstFactor
+// against the subject's own prior 10-minute peak, times ageDecayFactor.
 func distinctRecipients1h(events []event.Event, now, firstSeenAt time.Time, window time.Duration) float64 {
 	seen := make(map[string]struct{})
 	var fallback float64
@@ -692,7 +749,9 @@ func distinctRecipients1h(events []event.Event, now, firstSeenAt time.Time, wind
 		}
 		fallback += recipientCountOf(e)
 	}
-	return capAt(float64(len(seen))+fallback, sendsVolumeCap) * youngAccountFactor(firstSeenAt, now)
+	current := float64(len(seen)) + fallback
+	baseline := priorTenMinutePeak(events, now)
+	return burstFactor(current, baseline) * ageDecayFactor(firstSeenAt, now)
 }
 
 // webmailRecipientShare is Features.WebmailRecipientShare: the LIFETIME
@@ -723,15 +782,21 @@ func webmailRecipientShare(events []event.Event, now time.Time, webmail WebmailS
 
 // webmailSends1h is Features.WebmailSends1h: the sum of content.sent
 // recipient_count within the trailing window ending at now, restricted to
-// events whose recipient_domain is on webmail's loaded list, capped at
-// sendsVolumeCap and gated by youngAccountFactor. Computed DIRECTLY (S7
-// fix round) rather than as webmailRecipientShare(...) * sends1h(...): the
-// share is a LIFETIME ratio and sends1h is a TRAILING sum, so multiplying
-// the two conflates two different timescales and produces a number that
-// tracks neither one correctly (an account whose lifetime share is high
-// but whose recent hour was entirely non-webmail would still report a
-// large "webmail sends" value, and vice versa). Scanning the window
-// directly for webmail-domain recipients has no such mismatch.
+// events whose recipient_domain is on webmail's loaded list. Computed
+// DIRECTLY (S7 fix round) rather than as webmailRecipientShare(...) *
+// sends1h(...): the share is a LIFETIME ratio and sends1h is a TRAILING
+// sum, so multiplying the two conflates two different timescales and
+// produces a number that tracks neither one correctly (an account whose
+// lifetime share is high but whose recent hour was entirely non-webmail
+// would still report a large "webmail sends" value, and vice versa).
+// Scanning the window directly for webmail-domain recipients has no such
+// mismatch. Round 2's R1 history-relative measure applies here too:
+// burstFactor against the subject's own prior 10-minute peak (the SAME
+// peak sends10mMax/sends1h/distinctRecipients1h use, not a webmail-only
+// variant — deliberately: it answers "is this account's OVERALL volume
+// behaviour unusual right now", the same question every sibling feature
+// asks, just restricted to webmail-domain recipients on the CURRENT
+// side), times ageDecayFactor.
 func webmailSends1h(events []event.Event, now, firstSeenAt time.Time, window time.Duration, webmail WebmailSet) float64 {
 	var sum float64
 	for _, e := range events {
@@ -744,7 +809,8 @@ func webmailSends1h(events []event.Event, now, firstSeenAt time.Time, window tim
 		}
 		sum += recipientCountOf(e)
 	}
-	return capAt(sum, sendsVolumeCap) * youngAccountFactor(firstSeenAt, now)
+	baseline := priorTenMinutePeak(events, now)
+	return burstFactor(sum, baseline) * ageDecayFactor(firstSeenAt, now)
 }
 
 // namedBrandNames returns the set of distinct curated brand names matched

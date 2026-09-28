@@ -395,13 +395,25 @@ self-send (`recipient_is_own_identity: true`) — these measure reach to OTHER r
 self-send would otherwise double-count the rehearsal behaviour `self_send_before_external` already
 captures — and all exclude a future-dated event (bounded by `now`, the same as every other feature).
 - **B1 (established senders):** `sends_10m_max`, `sends_1h`, `webmail_sends_1h` and
-  `distinct_recipients_1h` are gated to 0 once a subject is more than 7 days old
-  (`youngAccountFactor`) — proven, a lifetime-unbounded volume search flags a months-old, paid
-  newsletter's routine burst exactly the same as a brand-new signup's, and the flag never decays
-  once set. `sends_first_day` needs no such gate: it is already permanently anchored to the
-  subject's first day, the same way `first_day_distinct_domains` is, so it can never reflect an
-  established account's CURRENT behaviour in the first place. `webmail_recipient_share` is a
-  lifetime ratio (who an account emails, not how much) and is deliberately NOT gated.
+  `distinct_recipients_1h` are each `burstFactor(current, the subject's own prior 10-minute peak
+  over the preceding 30 days, excluding the trailing 24h) × ageDecayFactor(age)` — a
+  HISTORY-RELATIVE measure, not the calendar-age hard gate an earlier round shipped. `burstFactor`
+  floors its denominator at 1, so a subject with no meaningful prior sending reads its current
+  burst at close to full strength (unchanged from a brand-new signup's original behaviour); one
+  with a real prior baseline reads the identical current volume as far less unusual.
+  `ageDecayFactor` is `clamp(1 − (age_days − 3) / 27, 0.2, 1)`: full weight through day 3, ramping
+  smoothly down to a floor of 0.2 by around day 25 — continuous in age, with no cliff, and never a
+  hard 0. **[round 2]** The original hard 7-day gate was proven evadable (an account that simply
+  waited past it read as fully "established" regardless of whether it had ever sent anything
+  before) and blind to whether an "established" account had any real prior volume at all — a
+  lifetime-unbounded whole-history search additionally let a burst from 40 days ago still register
+  as "the current burst" if nothing more recent happened to beat it; `sends_10m_max`'s own current-
+  burst search is now bounded to the trailing 24h for the same reason. `sends_first_day` needs
+  neither burstFactor nor ageDecayFactor: it is already permanently anchored to the subject's
+  first day, the same way `first_day_distinct_domains` is, so it can never reflect an established
+  account's CURRENT behaviour in the first place. `webmail_recipient_share` is a lifetime ratio
+  (who an account emails, not how much) and is deliberately neither history-relative nor
+  age-decayed.
 - **S1 (subject-line matching):** a subject-line brand match is NOT suppressed by an
   integration-adjacent word ("tracking", "api") inside the subject itself — a bulk-phishing subject
   routinely and legitimately contains one on purpose, and gating on the subject's own words silently

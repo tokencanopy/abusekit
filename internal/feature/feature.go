@@ -212,39 +212,50 @@ type Features struct {
 	// for an account with a long, currently-quiet history. 0 when the
 	// subject has no resource/content activity at all.
 	BurstRatio24hVsLifetime float64
-	// Sends10mMax is the LARGEST sum of content.sent recipient_count
-	// within any 10-minute-wide window across the subject's history up to
-	// Windows.Now, capped at sendsVolumeCap and gated by
-	// youngAccountFactor — B1 fix round: an established sender's routine
-	// burst must not read the same as a brand-new signup's; see
-	// youngAccountWindow's own doc comment.
+	// Sends10mMax is burstFactor(the subject's CURRENT 10-minute recipient
+	// peak within the trailing currentBurstWindow, i.e. NOT a whole-history
+	// search) against the subject's own PRIOR 10-minute peak over the
+	// preceding historyLookbackWindow, times ageDecayFactor — round 2's R1
+	// fix round: history-relative, not calendar-age-gated. A subject with
+	// no meaningful prior sending reads its current burst at close to full
+	// strength (unchanged from a brand-new signup's original behaviour);
+	// an established sender with a real prior baseline reads the SAME
+	// current volume as far less unusual. Replaces round 1's hard 7-day
+	// calendar-age cliff, proven evadable (an account that simply waited
+	// past it read as fully "established" regardless of whether it had
+	// ever sent anything before) and blind to a subject's own history.
 	Sends10mMax float64
-	// Sends1h is the sum of content.sent recipient_count in the trailing
-	// Windows.OneHour window, capped at sendsVolumeCap and gated by
-	// youngAccountFactor.
+	// Sends1h is the SAME history-relative measure as Sends10mMax
+	// (burstFactor against the subject's own prior 10-minute peak, times
+	// ageDecayFactor), applied to the trailing Windows.OneHour sum instead
+	// of the 10-minute peak.
 	Sends1h float64
 	// SendsFirstDay is the sum of content.sent recipient_count within the
 	// subject's first 24h (Windows.DayHour) of existence, anchored to
 	// firstSeenAt exactly like FirstDayDistinctDomains — permanently
-	// fixed once that window closes, and deliberately NOT gated by
-	// youngAccountFactor (it can never reflect an established account's
-	// CURRENT behaviour in the first place).
+	// fixed once that window closes, and deliberately NOT history-relative
+	// or age-decayed like its siblings above/below (it can only ever
+	// reflect a subject's OWN first day, when there is by construction no
+	// prior history to compare against and no age to decay by).
 	SendsFirstDay float64
 	// WebmailRecipientShare is the LIFETIME share (0..1) of sent
 	// recipients whose recipient_domain is on the loaded webmail list — a
-	// permanent fact, not a decaying window, and not youngAccountFactor-
-	// gated (it measures WHO an account emails, not how much).
+	// permanent fact, not a decaying window, and not history-relative or
+	// age-decayed (it measures WHO an account emails, not how much).
 	WebmailRecipientShare float64
 	// WebmailSends1h is Sends1h restricted to webmail-domain recipients,
 	// computed directly rather than as WebmailRecipientShare*Sends1h (S7
 	// fix round — see webmailSends1h's own doc comment for why that
-	// product would be wrong), capped at sendsVolumeCap and gated by
-	// youngAccountFactor.
+	// product would be wrong), then run through the SAME history-relative
+	// burstFactor/ageDecayFactor measure as Sends10mMax/Sends1h (round 2,
+	// R1), against the identical prior-peak baseline (not a webmail-only
+	// variant of it).
 	WebmailSends1h float64
 	// DistinctRecipients1h counts distinct content.sent recipient_hash
 	// values in the trailing Windows.OneHour window (falling back to
-	// summing recipient_count for any event with no hash at all), capped
-	// at sendsVolumeCap and gated by youngAccountFactor.
+	// summing recipient_count for any event with no hash at all), then run
+	// through the SAME history-relative burstFactor/ageDecayFactor measure
+	// (round 2, R1).
 	DistinctRecipients1h float64
 	// SubjectBrandMatch counts DISTINCT curated brands matched across
 	// every content.sent subject_line in the trailing Windows.OneHour

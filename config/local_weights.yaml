@@ -170,28 +170,52 @@ weights:
   # reverified to still land at 0.49.
   burst_ratio_24h_vs_lifetime: 0.3
 
-  # S2b: send volume, addressing common bulk-phishing shapes. sends_10m_max
-  # carries the main "burst intensity" signal; sends_1h is a smaller
-  # companion (correlated with sends_10m_max in a genuine burst, the same
-  # velocity/total relationship resource_velocity_1h/resource_total
-  # already have); sends_first_day is a separate time anchor for a
-  # slower first-day ramp the sharper windows don't catch. See PR body's
-  # "which fixture bounded which weight" table for the sensitivity sweep.
-  sends_10m_max: 0.012
-  sends_1h: 0.0008
+  # S2b: send volume, addressing common bulk-phishing shapes. Round 2's R1
+  # fix round replaced the original hard 7-day calendar-age gate with a
+  # history-relative burstFactor (current volume vs. the subject's OWN
+  # prior 10-minute peak, floored at 1) times a smooth ageDecayFactor —
+  # every weight below was retuned against that new mechanism, not the
+  # original one. sends_10m_max carries the main "burst intensity" signal
+  # and is sized large enough, on its own, to carry a NO-PRIOR-HISTORY
+  # burst (dormant_then_blast, dormant_branded_burst_8d — both fixtures
+  # this weight is directly bound by) to `high`; sends_1h and
+  # distinct_recipients_1h are smaller companions (correlated with
+  # sends_10m_max in a genuine burst, the same velocity/total relationship
+  # resource_velocity_1h/resource_total already have — bound by an
+  # isolated synthetic scenario, since no committed fixture is sensitive
+  # to either alone); sends_first_day is a separate, permanent, NOT
+  # history-relative time anchor for a slower first-day ramp the sharper
+  # windows don't catch. See PR body's "which fixture bounded which
+  # weight" table for the sensitivity sweep.
+  #
+  # Deliberately NOT one shared value: sends_10m_max is far larger than
+  # its companions because it is the ONLY signal available to a fixture
+  # like dormant_then_blast (no webmail concentration, no brand) — a large
+  # sends_1h/distinct_recipients_1h weight would ALSO fire on
+  # benign_receipts_fanout's spread-out (not concentrated) hour-long
+  # fan-out, which has a comparable RAW total but a much smaller
+  # 10-minute peak; concentrating the big weight on sends_10m_max
+  # specifically is what keeps that fixture from crossing into `high` too
+  # (it does cross into low `medium` — a documented trade-off, see
+  # internal/worker/replay_test.go's own comment on that fixture).
+  sends_10m_max: 0.08
+  sends_1h: 0.002
   sends_first_day: 0.0008
 
-  # S2b: webmail concentration. webmail_recipient_share is a normalized
+  # S2b: webmail concentration, also retuned for round 2's R1
+  # history-relative mechanism. webmail_recipient_share is a normalized
   # ratio (0..1), so its weight is sized like name_brand_match/upgraded,
-  # not like a raw count; webmail_sends_1h is the main webmail-specific
-  # volume signal (deliberately the LARGEST of the new weights: an
-  # established sender's identical volume is already zeroed by
-  # youngAccountFactor, so this weight only ever fires for a genuinely
-  # young account); distinct_recipients_1h is a smaller companion,
-  # correlated with sends_1h/webmail_sends_1h in most fixtures here.
+  # not like a raw count, and is NOT history-relative or age-decayed (it
+  # measures WHO an account emails, not how much — see its own Features
+  # field doc comment). webmail_sends_1h is bound by webmail_spread_1h (a
+  # fixture whose recipients are spread across a full hour specifically so
+  # sends_10m_max stays modest and can't carry the score on its own,
+  # isolating webmail_sends_1h's own contribution); distinct_recipients_1h
+  # is a smaller companion, correlated with sends_1h/webmail_sends_1h in
+  # most fixtures here (bound by an isolated synthetic scenario).
   webmail_recipient_share: 1.1
-  webmail_sends_1h: 0.014
-  distinct_recipients_1h: 0.0008
+  webmail_sends_1h: 0.006
+  distinct_recipients_1h: 0.002
 
   # S2b: a brand mentioned in the message SUBJECT rather than (or, per S2,
   # in addition to but never double-counted with) the sending resource's

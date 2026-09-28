@@ -78,15 +78,17 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   upgrade; a fast but unremarkable developer onboarding; an org wiring up
   several real SaaS integrations) that must never reach `high`.
 - `dormant_then_blast.jsonl` — a week-old account with no upgrade that
-  suddenly creates ten resources (one brand-impersonating, "PayPal Account
-  Alert" — not "...Bot": round 2's R6 made "bot" an integration-token that
-  would otherwise suppress its own brand match) and sends to twenty
-  distinct external domains within an hour; must reach `high`. The review
-  that asked for this fixture described "300 external domains" — this
-  uses 20, since no v0 feature (`first_day_distinct_domains` doesn't apply
-  this many days after signup; `burst_ratio_24h_vs_lifetime` only cares
-  that recent activity dominates lifetime activity, not the exact count)
-  distinguishes 20 from 300 post-first-day domains.
+  suddenly sends to 100 distinct external (non-webmail) domains within ten
+  minutes; must reach `high`. S2b's own round 2 (R1) fix round stripped
+  the brand-impersonating agent name and the resource-creation burst this
+  fixture originally also carried, and raised its send volume from 20 to
+  100 distinct recipients: the review required proof that volume/recipient
+  signals ALONE — with no brand or resource evidence at all — still carry
+  this shape to `high`, exercising `sends_10m_max`/`sends_1h`/
+  `distinct_recipients_1h`'s history-relative `burstFactor` (see
+  `internal/feature.burstFactor`/`priorTenMinutePeak`) directly: this
+  subject has no prior sending history at all, so its burst reads at
+  close to full strength.
 - `benign_self_send_only.jsonl`, `benign_receipts_fanout.jsonl`,
   `benign_selfsend_brandname.jsonl` (round 2, R1) — three more accounts
   that must never reach `high`: a developer sending 8 test emails to their
@@ -126,9 +128,11 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   - `established_newsletter_burst.jsonl` — a 60-day-old paid newsletter
     with a real periodic sending history whose most recent send happens
     to burst 300 webmail recipients in 10 minutes — stays below `medium`
-    (the young-account gate, B1: volume alone must not flag an
-    established sender, and the flag must decay once an account matures
-    rather than persist as a lifetime fact).
+    (B1: volume alone must not flag an established sender, and the flag
+    must decay once an account matures rather than persist as a lifetime
+    fact — see round 2's R1 fixtures below for the history-relative
+    mechanism that replaced the original hard age gate this fixture was
+    first built against).
   - `day0_marketplace_seller.jsonl` — a brand-new account whose agent is
     named after a fictional shop brand, no integration token, sending to
     30 webmail buyers over its first hour — a plausible day-0 legitimate
@@ -141,6 +145,28 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   never references a real brand name), merged alongside the real,
   public `config/brands.yaml` via `feature.MergeBrandSets` wherever a
   test needs it (`internal/worker/mutation_test.go`'s `loadTestBrands`).
+
+- **S2b's round 2 (R1)** replaced the send-volume features' original hard
+  7-day calendar-age gate with a history-relative measure (`burstFactor`
+  × `ageDecayFactor` — see `config/local_weights.yaml`'s own comments and
+  `internal/feature.burstFactor`/`priorTenMinutePeak`/`ageDecayFactor`),
+  proven evadable by simply waiting past it and blind to whether an
+  "established" account had any real prior volume at all. Three more
+  fixtures exercise the required outcomes directly:
+  - `dormant_branded_burst_8d.jsonl` — an account dormant for 8 days (one
+    day PAST the old gate) then bursting 100 branded webmail recipients
+    within 10 minutes — reaches `high`: a calendar gate must not be
+    evadable by waiting.
+  - `paid_launch_5d.jsonl` — a 5-day-old paid SaaS account with a real
+    (if modest) history of prior sends, pushing a neutral-subject launch
+    announcement to 250 webmail recipients over 15 minutes — stays below
+    `high` on the strength of that real prior history.
+  - `webmail_spread_1h.jsonl` — 80 webmail recipients spread evenly
+    across a full hour (8-minute intervals, deliberately NOT concentrated
+    into any 10-minute window) — isolates `webmail_sends_1h`'s own
+    contribution from `sends_10m_max`'s (which stays modest here), so the
+    mutation sweep can prove `webmail_sends_1h` load-bearing on a REAL
+    fixture rather than only a synthetic scenario (R6).
 
 See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually

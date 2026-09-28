@@ -228,10 +228,17 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		// the exact computed value) — see the PR body's "which fixture
 		// bounds which weight" table and the sensitivity windows recorded
 		// there.
-		{"webmail_blast", extractFixture(t, brands, webmail, "webmail_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.55, 0.85},
+		{"webmail_blast", extractFixture(t, brands, webmail, "webmail_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0}, // round 2, R1: was [0.55, 0.85] — see replay_test.go's own comment
 		{"single_brand_blast_45m", extractFixture(t, brands, webmail, "single_brand_blast_45m.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.95, 1.0},
 		{"established_newsletter_burst", extractFixture(t, brands, webmail, "established_newsletter_burst.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.2},
 		{"day0_marketplace_seller", extractFixture(t, brands, webmail, "day0_marketplace_seller.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.6, 0.78},
+		{"benign_receipts_fanout", extractFixture(t, brands, webmail, "benign_receipts_fanout.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.4, 0.55}, // round 2, R1: was [0.05, 0.4] — see replay_test.go's own comment
+
+		// --- Round 2, R1 fixtures: history-relative volume signal, no
+		// hard calendar-age gate.
+		{"dormant_branded_burst_8d", extractFixture(t, brands, webmail, "dormant_branded_burst_8d.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
+		{"paid_launch_5d", extractFixture(t, brands, webmail, "paid_launch_5d.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.4},
+		{"webmail_spread_1h", extractFixture(t, brands, webmail, "webmail_spread_1h.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.65, 0.78},
 	}
 	return append(scenarios, isolatedWeightScenarios()...)
 }
@@ -307,9 +314,9 @@ func isolatedWeightScenarios() []mutationScenario {
 		// key_total do. All three share an identical base=0.281,
 		// zeroed=0.235 at the sendsVolumeCap (300) — the same cap, the
 		// same weight, and no other new-feature signal present.
-		{"isolated_sends_1h", withTarget("sends_1h", 300), 0.26, 0.32},
+		{"isolated_sends_1h", withTarget("sends_1h", 300), 0.33, 0.39},
 		{"isolated_sends_first_day", withTarget("sends_first_day", 300), 0.26, 0.32},
-		{"isolated_distinct_recipients_1h", withTarget("distinct_recipients_1h", 300), 0.26, 0.32},
+		{"isolated_distinct_recipients_1h", withTarget("distinct_recipients_1h", 300), 0.33, 0.39},
 		// S2b: subject_brand_match at its most common realistic value (a
 		// single mentioned brand) — base=0.579, zeroed=0.235.
 		{"isolated_subject_brand_match", withTarget("subject_brand_match", 1), 0.5, 0.68},
@@ -396,5 +403,71 @@ func TestWeightMutation_EveryWeightIsLoadBearing(t *testing.T) {
 		if !brokeSomething {
 			t.Errorf("zeroing weight %q (was %v) did not push any scenario (replay fixture or isolated) out of its band", name, original)
 		}
+	}
+}
+
+// --- Round 2, R1: no-cliff continuity probe ------------------------------
+
+// TestR1_AgeDecayContinuityProbe is round 2's explicit "probe 6d23h, 7d1h
+// and 8d and show continuity" requirement, at the SCORE level (not just
+// the raw ageDecayFactor unit — see internal/feature's own
+// TestAgeDecayFactor_NoCliff for that): three otherwise-identical
+// accounts (a 100-recipient webmail burst, no prior sending history at
+// all) that differ ONLY in age at the moment of scoring. Old round-1
+// behaviour had a hard cliff exactly at 7 days (score would jump from a
+// young-account value straight to 0 contribution); round 2's
+// history-relative burstFactor + smooth ageDecayFactor must show no such
+// jump — each step's score differs only by the ordinary slope of the age
+// decay ramp.
+func TestR1_AgeDecayContinuityProbe(t *testing.T) {
+	weights, err := local.LoadWeightsFile(filepath.Join(repoRoot(t), "config", "local_weights.yaml"))
+	if err != nil {
+		t.Fatalf("LoadWeightsFile: %v", err)
+	}
+	scorer, err := local.New(weights)
+	if err != nil {
+		t.Fatalf("local.New: %v", err)
+	}
+	brands := loadTestBrands(t)
+	webmail := loadShippedWebmail(t)
+
+	probeBase := time.Date(2031, time.August, 1, 0, 0, 0, 0, time.UTC)
+	riskAt := func(age time.Duration) float64 {
+		burstOffset := age - 10*time.Minute
+		mk := func(id, typ string, offset time.Duration, data map[string]any) event.Event {
+			return event.Event{ID: id, Subject: "acct_probe", Type: typ, At: probeBase.Add(offset), Data: data}
+		}
+		events := []event.Event{
+			mk("s1", "subject.created", 0, map[string]any{"channel": "signup", "email_domain_class": "webmail", "identity_kind": "individual"}),
+			mk("r1", "resource.created", time.Minute, map[string]any{"kind": "agent", "name": "Notifications Agent"}),
+			mk("c1", "content.sent", burstOffset, map[string]any{"subject_line": "Weekly update", "recipient_domain": "gmail.com", "recipient_count": float64(50), "recipient_is_own_identity": false}),
+			mk("c2", "content.sent", burstOffset+5*time.Minute, map[string]any{"subject_line": "Weekly update", "recipient_domain": "gmail.com", "recipient_count": float64(50), "recipient_is_own_identity": false}),
+		}
+		now := probeBase.Add(age)
+		res, err := feature.Extract(context.Background(), testTenant, "acct_probe", events, feature.NoNeighbors, feature.DefaultWindows(now), brands, webmail)
+		if err != nil {
+			t.Fatalf("feature.Extract: %v", err)
+		}
+		sr, err := scorer.Score(context.Background(), model.ScoreRequest{Labels: []string{"benign", "suspicious", "abusive"}, Features: res.Features.Map()})
+		if err != nil {
+			t.Fatalf("Score: %v", err)
+		}
+		return 1 - sr.Probs["benign"]
+	}
+
+	at6d23h := riskAt(6*24*time.Hour + 23*time.Hour)
+	at7d1h := riskAt(7*24*time.Hour + time.Hour)
+	at8d := riskAt(8 * 24 * time.Hour)
+
+	t.Logf("continuity probe: 6d23h=%.4f 7d1h=%.4f 8d=%.4f", at6d23h, at7d1h, at8d)
+
+	// No cliff: consecutive probes must move by a small, continuous
+	// amount, never by anywhere near a hard gate's full swing.
+	const maxStep = 0.03
+	if diff := at6d23h - at7d1h; diff < 0 || diff > maxStep {
+		t.Errorf("score(6d23h)=%.4f -> score(7d1h)=%.4f moved by %.4f, want a small continuous step (<= %v)", at6d23h, at7d1h, diff, maxStep)
+	}
+	if diff := at7d1h - at8d; diff < 0 || diff > maxStep {
+		t.Errorf("score(7d1h)=%.4f -> score(8d)=%.4f moved by %.4f, want a small continuous step (<= %v)", at7d1h, at8d, diff, maxStep)
 	}
 }
