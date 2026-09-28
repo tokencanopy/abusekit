@@ -40,7 +40,7 @@ var integrationAgentNames = []string{
 // self-tests".
 func genFastDevOnboarding(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_fastdev_%03d", idx)
-	start := epoch.AddDate(0, 0, idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -75,7 +75,7 @@ func genFastDevOnboarding(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow
 // plus integration words".
 func genIntegrationHeavy(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_integheavy_%03d", idx)
-	start := epoch.AddDate(0, 0, 3+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 3+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -111,7 +111,7 @@ func genIntegrationHeavy(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow)
 // why the weights were tuned against that one fixed point, not a range).
 func genDay1ReceiptsFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_receipts_%03d", idx)
-	start := epoch.AddDate(0, 0, 6+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 6+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -136,7 +136,7 @@ func genDay1ReceiptsFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRo
 // happens AFTER day 1").
 func genSupportDeskLaterFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_supportdesk_%03d", idx)
-	start := epoch.AddDate(0, 0, 9+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 9+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -165,7 +165,7 @@ func genSupportDeskLaterFanout(rng *rand.Rand, idx int) ([]event.Event, eval.Lab
 // fan-out".
 func genNewsletterLaterFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_newsletter_%03d", idx)
-	start := epoch.AddDate(0, 0, 12+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 12+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -188,7 +188,7 @@ func genNewsletterLaterFanout(rng *rand.Rand, idx int) ([]event.Event, eval.Labe
 // and steady, unremarkable send volume — task brief's "slow upgraders".
 func genSlowUpgrader(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_slowupg_%03d", idx)
-	start := epoch.AddDate(0, 0, 15+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 15+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -222,7 +222,7 @@ func genSlowUpgrader(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 // requires amount_minor > 0, so this correctly reports Upgraded == 0.
 func genTrialZeroDollar(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_trial_%03d", idx)
-	start := epoch.AddDate(0, 0, 18+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 18+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -253,9 +253,22 @@ func genTrialZeroDollar(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) 
 // stolen card is often prepaid), but plenty of genuine customers use one
 // too; this family exists so the corpus doesn't silently teach "prepaid
 // implies abusive" by simply never showing a benign counter-example.
+//
+// Fix round T5: half of this family (idx odd) instead goes through
+// genBenignPrepaidEagerDay0 — a genuinely hard near-miss whose risk
+// straddles config/rules.yaml's 0.6 new_account_velocity threshold
+// (worked out by hand against config/local_weights.yaml's shipped
+// weights: 1-2 agents + 1 key + 1-2 external domains, all same-day,
+// lands ~0.45-0.65 depending on this instance's own jitter) rather than
+// the original mild variant's comfortably-low score, so the gate's
+// precision/recall aren't measured only against corpus subjects that
+// are trivially easy to classify either way.
 func genBenignPrepaid(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	if idx%2 == 1 {
+		return genBenignPrepaidEagerDay0(rng, idx)
+	}
 	subject := fmt.Sprintf("acct_gen_prepaid_%03d", idx)
-	start := epoch.AddDate(0, 0, 36+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 36+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -278,6 +291,55 @@ func genBenignPrepaid(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	return b.events, labelFor(subject, "benign", "", "outcome", b.events)
 }
 
+// genBenignPrepaidEagerDay0: an eager customer — pays with a prepaid card,
+// wires up an agent and a key, and starts sending to a couple of real
+// external domains all within the SAME DAY it signs up. Every one of
+// those is individually a real (if weak) fraud signal in
+// config/local_weights.yaml (first_funding_prepaid, resource_velocity_1h/
+// key_velocity_1h, first_day_distinct_domains, burst_ratio_24h_vs_lifetime
+// all fire), and stacking them together is exactly what an actually
+// abusive account also looks like on day 0 — the honest difference is
+// only that this account keeps behaving ordinarily afterward and this
+// activity is genuinely its own, not a stolen card. Task brief (fix round
+// T5): "benign prepaid subjects with day-0 activity that lands near the
+// rule threshold" — this is a hard case by design, not a bug; some
+// instances will legitimately cross 0.6 and count against precision.
+func genBenignPrepaidEagerDay0(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	subject := fmt.Sprintf("acct_gen_prepaid_%03d", idx)
+	start := epoch.AddDate(0, 0, 36+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
+	b := newBuilder(subject, start)
+	domain := subject + ".example.test"
+
+	b.add(0, "subject.created", event.Links{}, map[string]any{"channel": "signup", "email_domain_class": "corporate", "identity_kind": "individual"})
+	b.add(3*time.Minute, "payment.attempt", event.Links{}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(1900), "currency": "usd"})
+	b.add(4*time.Minute, "subscription.changed", event.Links{}, map[string]any{"plan": "starter", "status": "active", "amount_minor": float64(1900)})
+
+	agents := 1 + rng.Intn(2) // 1..2 — enough to move resource_velocity_1h, not a full blast
+	t := 10*time.Minute + secondJitter(rng)
+	for i := 0; i < agents; i++ {
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+		t += time.Duration(3+rng.Intn(5))*time.Minute + secondJitter(rng)
+	}
+	b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "key", "name": "API Key"})
+	t += time.Duration(2+rng.Intn(4))*time.Minute + secondJitter(rng)
+
+	domains := 1 + rng.Intn(2) // 1..2 distinct domains, same day as signup
+	for i := 0; i < domains; i++ {
+		b.add(t, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(subject, i), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+		t += time.Duration(5+rng.Intn(15))*time.Minute + secondJitter(rng)
+	}
+	// Ordinary usage continues afterward — the honest signal that this
+	// wasn't a blast-and-abandon account, even though day 0 alone reads
+	// as a near-miss.
+	moreSends := 1 + rng.Intn(3) // 1..3, over the following days
+	for i := 0; i < moreSends; i++ {
+		day := 1 + i
+		b.add(time.Duration(day)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(subject, (domains+i)%3), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return b.events, labelFor(subject, "benign", "", "outcome", b.events)
+}
+
 // genBenignDeclineThenSuccess: an ordinary customer who mistypes their
 // card number (or it's briefly expired) once or twice before it goes
 // through, with unremarkable usage afterward — task brief's "benign
@@ -287,7 +349,7 @@ func genBenignPrepaid(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 // feature level; this family is the benign counter-example.
 func genBenignDeclineThenSuccess(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_declinesuccess_%03d", idx)
-	start := epoch.AddDate(0, 0, 37+idx%40).Add(time.Duration(idx) * time.Minute)
+	start := epoch.AddDate(0, 0, 37+idx%40).Add(time.Duration(idx)*time.Minute + secondJitter(rng))
 	b := newBuilder(subject, start)
 	domain := subject + ".example.test"
 
@@ -329,7 +391,7 @@ func genBenignDeclineThenSuccess(rng *rand.Rand, idx int) ([]event.Event, eval.L
 func genBenignSharedCardHousehold(rng *rand.Rand, groupIdx int) []incarnation {
 	sharedCard := linkHash(fmt.Sprintf("household-%d-shared-card", groupIdx))
 	size := 2 + rng.Intn(2) // 2..3 members
-	base := epoch.AddDate(0, 0, 38+groupIdx%40).Add(time.Duration(groupIdx) * time.Hour)
+	base := epoch.AddDate(0, 0, 38+groupIdx%40).Add(time.Duration(groupIdx)*time.Hour + secondJitter(rng))
 
 	members := make([]incarnation, 0, size)
 	for m := 0; m < size; m++ {
@@ -371,7 +433,7 @@ func genBenignSharedCardHousehold(rng *rand.Rand, groupIdx int) []incarnation {
 // neighbour, on its own, is not damning.
 func genBenignLegitResignup(rng *rand.Rand, pairIdx int) []incarnation {
 	sharedEmail := linkHash(fmt.Sprintf("resignup-%d-shared-email", pairIdx))
-	base := epoch.AddDate(0, 0, 39+pairIdx%40).Add(time.Duration(pairIdx) * time.Hour)
+	base := epoch.AddDate(0, 0, 39+pairIdx%40).Add(time.Duration(pairIdx)*time.Hour + secondJitter(rng))
 
 	aSubject := fmt.Sprintf("acct_gen_resignup_%03d_a", pairIdx)
 	aStart := base

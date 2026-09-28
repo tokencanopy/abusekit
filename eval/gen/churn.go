@@ -76,10 +76,10 @@ func genChurnChain(rng *rand.Rand, kind string, chainIdx, length int) []incarnat
 		t := 5 * time.Second
 		declines := rng.Intn(2) // 0..1
 		for i := 0; i < declines; i++ {
-			b.add(t, "payment.attempt", paymentLinks, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "prepaid", "amount_minor": float64(1500), "currency": "usd"})
+			b.add(t, "payment.attempt", paymentLinks, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "credit", "amount_minor": float64(1500), "currency": "usd"})
 			t += time.Duration(5+rng.Intn(10)) * time.Second
 		}
-		b.add(t, "payment.attempt", paymentLinks, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(1500), "currency": "usd"})
+		b.add(t, "payment.attempt", paymentLinks, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(1500), "currency": "usd"})
 		t += time.Duration(5+rng.Intn(10)) * time.Second
 		b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "pro", "status": "active", "amount_minor": float64(1500)})
 		t += time.Duration(5+rng.Intn(10)) * time.Second

@@ -322,3 +322,33 @@ func labelFor(subject, label, category, source string, events []event.Event) eva
 func domainName(slug string, n int) string {
 	return fmt.Sprintf("customer-%d.%s.example.test", n, slug)
 }
+
+// abusiveFunding returns "prepaid" about half the time and "credit"/
+// "debit" otherwise (fix round T5: "jitter the prepaid share in abusive
+// families" — a real operator doesn't EXCLUSIVELY pay with prepaid
+// cards, and a corpus where every single abusive success used one would
+// teach first_funding_prepaid as a near-perfect discriminator it isn't
+// in reality; genBenignPrepaid already proves the converse — a benign
+// customer using one — so this closes the gap from the other side).
+func abusiveFunding(rng *rand.Rand) string {
+	switch rng.Intn(4) {
+	case 0:
+		return "credit"
+	case 1:
+		return "debit"
+	default:
+		return "prepaid"
+	}
+}
+
+// secondJitter returns a small, sub-minute random duration (fix round
+// T5: "give benign families second-grain timing too, so timing
+// granularity doesn't separate classes" — a benign family whose every
+// timestamp lands on a round minute, next to an abusive family whose
+// timestamps are all sub-minute, would let a scorer (or a careless
+// reviewer) separate the two classes by timestamp GRANULARITY alone, a
+// synthetic-corpus artifact with nothing to do with the actual features
+// under test).
+func secondJitter(rng *rand.Rand) time.Duration {
+	return time.Duration(rng.Intn(60)) * time.Second
+}

@@ -44,7 +44,7 @@ func genBurst(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 		t += 10 * time.Second
 	}
 	successHash := linkHash("burst-" + subject + "-card-success")
-	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(4200), "currency": "usd"})
+	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(4200), "currency": "usd"})
 	t += 10 * time.Second
 	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(4200)})
 	t += 10 * time.Second
@@ -83,7 +83,7 @@ func genFast(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 		t += 2 * time.Second
 	}
 	successHash := linkHash("fast-" + subject + "-card-success")
-	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(4200), "currency": "usd"})
+	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(4200), "currency": "usd"})
 	t += 2 * time.Second
 	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(4200)})
 	t += 2 * time.Second
@@ -190,7 +190,7 @@ func genSlowOperator(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 		b.add(t, "payment.attempt", event.Links{CardFingerprintHash: declineHash}, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "credit", "amount_minor": float64(3100), "currency": "usd"})
 		t += 12 * time.Hour
 	}
-	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: declineHash}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(3100), "currency": "usd"})
+	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: declineHash}, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(3100), "currency": "usd"})
 	t += 6 * time.Hour
 	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(3100)})
 
