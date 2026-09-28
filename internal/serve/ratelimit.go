@@ -12,9 +12,11 @@ import (
 // in no rate-limiting library anywhere else) used for three v0 purposes:
 // design §4.4's "evaluate is... rate-limited per subject (1/s)", a
 // generous per-KEY request-rate guard on POST /v1/events (design's
-// enumerated 429 rate_limited response), and a coarse per-IP guard applied
-// BEFORE authentication on every endpoint (S3 fix round — see
-// Server.preAuthLimiter's own doc comment). Fixed-window rather than a
+// enumerated 429 rate_limited response), and a coarse per-IP guard against
+// repeated FAILED authentications (T6, round 3 — see
+// DefaultPreAuthPerIPPerSecond's own doc comment for what this actually
+// bounds, and why "before authentication, to bound HMAC-verification work"
+// was never an accurate description of it). Fixed-window rather than a
 // token bucket: simpler, and the burst-at-window-boundary imprecision a
 // fixed window allows is immaterial at v0's traffic volumes — documented
 // here rather than hidden, since a stricter algorithm would be an easy

@@ -20,21 +20,44 @@ harness/CI gate (S4), vendor adapters (S5), and the e2a integration (S6+) land i
 
 `cmd/abusekit serve` exposes design §4.3/§4.9's API on `--listen` (default `127.0.0.1:8080`; empty
 disables it). Every request is signed (design §4.3, amended §4.2 for the nonce):
-`X-Abusekit-Key: <key id>`, `X-Abusekit-Timestamp: <RFC3339>`, `X-Abusekit-Nonce: <>=16 random bytes,
-hex>`, `X-Abusekit-Signature: hex(hmac-sha256(secret,
+`X-Abusekit-Key: <key id>`, `X-Abusekit-Timestamp: <RFC3339>`, `X-Abusekit-Nonce: <32..128 hex chars,
+16..64 random bytes>`, `X-Abusekit-Signature: hex(hmac-sha256(secret,
 method\npath?query\ntimestamp\nkey_id\nnonce\nsha256(body)))`. The nonce must be fresh per request —
 a client retrying a failed call signs each attempt with its own nonce (`pkg/abusekit` does this
-automatically). Timestamps outside ±5 min are rejected (unless the key has the `backfill` scope); a
-replayed `(key, nonce)` pair is rejected for as long as its timestamp could still independently pass
-the skew check (a backfill-scoped key, which skips that check, is protected for 24h instead). Keys
-and their scopes (`events`/`labels`/`read`/`backfill`) are loaded from `--keys`/`ABUSEKIT_KEYS_CONFIG`
-— **required, no default** — see `config/keys.yaml` for the shape; every secret it ships is prefixed
-`dev-only-` and refused at boot unless `--dev` is passed, and every secret must be ≥32 bytes
-regardless. Production points `--keys` at a file generated from a real secret store, run without
-`--dev`, never a committed one.
+automatically). Timestamps outside ±5 min are rejected; a `backfill`-scoped key gets a wider ±24h
+window instead, but ONLY on `POST /v1/events` — every other endpoint uses the ordinary ±5min window
+even for that key, since there's no legitimate reason for a backdated timestamp anywhere but a
+historical event import. A replayed `(key, nonce)` pair is rejected for as long as its timestamp
+could still independently pass whichever window applied (±5min or the backfill ±24h) — the two share
+one formula so the replay window can never end before the accepted-timestamp window does. A request
+that authenticates but is denied for lacking scope never consumes its nonce (a caller can retry the
+identical nonce once properly scoped). Keys and their scopes (`events`/`labels`/`read`/`backfill`)
+are loaded from `--keys`/`ABUSEKIT_KEYS_CONFIG` — **required, no default** — see `config/keys.yaml`
+for the shape; every secret it ships is prefixed `dev-only-` and refused at boot unless `--dev` is
+passed, and every secret must be ≥32 bytes regardless. Production points `--keys` at a file generated
+from a real secret store, run without `--dev`, never a committed one.
 
-A coarse per-IP rate limit applies before authentication on every route; a tighter per-key limit
-applies to `/v1/events` after a request authenticates (never on the raw, unverified key header).
+A coarse per-IP limit guards against a flood of FAILED authentications (bad signature, unknown key,
+stale timestamp, malformed nonce) from one IP — it is consulted only once a request has already
+failed to authenticate, and a request that authenticates successfully never counts against it no
+matter how many prior failures that IP racked up. It does not bound the cost of verifying a
+signature itself (every request's HMAC is still computed and checked exactly once, pass or fail) —
+that computation is cheap enough (microseconds) not to be the thing worth rate-limiting; what this
+guards against is a shared IP (a NAT gateway, a corporate proxy) getting treated as abusive and
+having its LEGITIMATE traffic blocked, which an earlier "block before checking the signature at all"
+design did. A tighter per-key limit applies to `/v1/events` after a request authenticates (never on
+the raw, unverified key header).
+
+**Replay-cache memory bound:** the server remembers `(key, nonce)` pairs (as a 16-byte hash, not the
+raw nonce string) for as long as a replay of them could still pass the timestamp window above — ~5min
+for an ordinary key, ~24h for a `backfill`-scoped key on `/v1/events`. Each entry costs roughly 63
+bytes (the 16-byte key, a `time.Time` value, and Go map bucket overhead); only VALID, fully
+authenticated AND properly scoped requests ever reach this cache (an invalid signature or an unknown
+key is rejected before the check, and consumes nothing here — see the per-IP limit above for that
+traffic instead). A single backfill-scoped key sending a sustained 50 req/s for the full 24h window
+accumulates on the order of 50 × 86400 ≈ 4.3M entries, ≈ 270MB — a real number to budget for if a
+producer's backfill throughput is expected to run anywhere near that, not an unbounded growth risk
+under normal (or even a hostile-but-unauthenticated) load.
 
 | Method | Path | Scope | Notes |
 | --- | --- | --- | --- |

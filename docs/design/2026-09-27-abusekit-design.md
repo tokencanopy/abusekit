@@ -198,6 +198,30 @@ endpoint requires; a request that authenticates but is denied for lacking scope 
 nonce, so a caller can retry the identical nonce once properly scoped instead of being permanently
 told "replay detected" for an attempt that never actually succeeded at anything.
 
+**[T6, round 3] Replay-cache memory bound:** each entry is keyed on a 16-byte hash of `(key, nonce)`,
+not the raw nonce string, and lives for the window above (±5 min ordinary, ±24 h backfill-on-events)
+— call it ~63 bytes/entry (the hash, a `time.Time` value, and Go map bucket overhead). Only requests
+that pass signature verification AND the scope check ever reach this cache (a bad signature, an
+unknown key, or a scope denial consumes nothing here — see the pre-auth limiter below for THAT
+traffic instead), so its growth is bounded by legitimate, authenticated throughput, not by an
+attacker's own flood. The backfill case is the one actually worth sizing: a single backfill-scoped
+key sustaining 50 req/s for the full ±24 h window accumulates on the order of 50 × 86400 ≈ 4.3M
+entries ≈ 270 MB — real memory to budget for if a producer's backfill throughput could approach that,
+not an unbounded risk under ordinary load.
+
+**[T6, round 3] Pre-auth per-IP limiter — what it actually bounds:** an earlier round's rationale for
+this limiter ("bounds how much HMAC-verification work an unauthenticated flood can force this
+process to do") was never accurate and is corrected here. The limiter does not reduce how much
+signature-verification work the server does — every request's HMAC is still computed and checked
+exactly once, pass or fail, since round 2's own fix moved the limiter to be consulted only AFTER a
+request has already failed to authenticate (never before, and never for one that succeeds). What it
+actually bounds is repeated FAILED-authentication traffic from one IP degrading to a 429 once that IP
+has failed enough times recently — a fail2ban-style guard against a garbage/replay flood, not a
+cost-of-cryptography guard. HMAC-SHA256 itself is cheap enough (microseconds) that verifying it
+unconditionally, even under a flood, was never the actual risk; the real risk the ORIGINAL,
+unconditional-block design introduced was blocking a real producer's LEGITIMATE traffic when it
+shared an IP (a NAT gateway, a corporate proxy) with whatever was generating the failures.
+
 Event: `{id (required, ≤64), subject (≤256), type ([a-z_.]+ ≤64), at (RFC3339 UTC, ±24 h unless
 backfill scope), links? {email_hash?, card_fingerprint_hash?, ip24_hash?, asn?, ua_hash?,
 device_hash?}, data (object ≤8 KiB post-redaction)}`. `id` is required **[r2]**; a replay with the
