@@ -258,12 +258,12 @@ type Features struct {
 	// (round 2, R1).
 	DistinctRecipients1h float64
 	// SubjectBrandMatch counts DISTINCT curated brands matched across
-	// every content.sent subject_line in the trailing Windows.OneHour
-	// window, excluding any brand already counted by NameBrandMatch (S2
-	// fix round) and applying S1 fix round's subject-line-specific
-	// integration exemption (an account whose own resource/agent name
-	// already carries an integration token has every subject line
-	// exempted outright), capped at subjectBrandMatchCap.
+	// every non-self-send content.sent subject_line (round 2, R4) in the
+	// trailing Windows.OneHour window, excluding any brand already
+	// counted by NameBrandMatch (S2 fix round) and any brand exempted by
+	// exemptSubjectBrands (round 2, R2 fix round: only the brand adjacent
+	// to an integration token in a LIVE, agent-kind resource's own name —
+	// not a whole-account exemption), capped at subjectBrandMatchCap.
 	SubjectBrandMatch float64
 }
 

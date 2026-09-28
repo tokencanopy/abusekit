@@ -1131,6 +1131,24 @@ func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
 	}
 }
 
+// TestSubjectBrandMatch_ExcludesSelfSends is round 2's R4: a self-send
+// (recipient_is_own_identity: true) must not count toward
+// subject_brand_match, the same exclusion every other send-volume
+// feature already applies (isSelfSend) — the design's own [S2b] amendment
+// says these features "measure reach to OTHER recipients", and a
+// self-test rehearsal mentioning a brand in its own subject line is not
+// evidence of a lure reaching anyone.
+func TestSubjectBrandMatch_ExcludesSelfSends(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account", "recipient_is_own_identity": true}),
+	}
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
+	if got != 0 {
+		t.Errorf("subject_brand_match (self-send only) = %v, want 0", got)
+	}
+}
+
 // --- Round 2, R2: precise integration-name subject suppression ----------
 
 // TestExemptSubjectBrands_KeyNamedAPIDoesNotSuppress is round 2's R2:
