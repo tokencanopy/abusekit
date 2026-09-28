@@ -788,21 +788,21 @@ func TestRecipientCountOf(t *testing.T) {
 
 func TestSends1h(t *testing.T) {
 	window := time.Hour
-	t.Run("sums recipient_count within the trailing window, log1p-scaled", func(t *testing.T) {
+	t.Run("sums recipient_count within the trailing window", func(t *testing.T) {
 		events := []event.Event{
 			sendEvent("c1", 0, 10, "a.example.test", "", ""),
 			sendEvent("c2", 30*time.Minute, 5, "b.example.test", "", ""),
 		}
 		now := at(45 * time.Minute)
-		want := math.Log1p(15)
-		if got := sends1h(events, now, window); math.Abs(got-want) > 1e-9 {
+		want := 15.0
+		if got := sends1h(events, now, window); got != want {
 			t.Errorf("sends1h = %v, want %v", got, want)
 		}
 	})
 	t.Run("falls back to 1 recipient when recipient_count is absent", func(t *testing.T) {
 		events := []event.Event{sendEvent("c1", 0, 0, "a.example.test", "", "")}
-		want := math.Log1p(1)
-		if got := sends1h(events, at(time.Minute), window); math.Abs(got-want) > 1e-9 {
+		want := 1.0
+		if got := sends1h(events, at(time.Minute), window); got != want {
 			t.Errorf("sends1h = %v, want %v", got, want)
 		}
 	})
@@ -819,8 +819,8 @@ func TestSends1h(t *testing.T) {
 			sendEvent("c1", 0, 10, "", "", ""), // chronologically earlier, delivered second
 		}
 		now := at(45 * time.Minute)
-		want := math.Log1p(15)
-		if got := sends1h(events, now, window); math.Abs(got-want) > 1e-9 {
+		want := 15.0
+		if got := sends1h(events, now, window); got != want {
 			t.Errorf("sends1h (out of order) = %v, want %v", got, want)
 		}
 	})
@@ -835,6 +835,12 @@ func TestSends1h(t *testing.T) {
 			t.Errorf("sends1h = %v, want 0 (only content.sent counts)", got)
 		}
 	})
+	t.Run("capped at sendsVolumeCap so a pathological volume can't swamp the model", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, sendsVolumeCap+500, "", "", "")}
+		if got := sends1h(events, at(time.Minute), window); got != sendsVolumeCap {
+			t.Errorf("sends1h = %v, want the cap %v", got, sendsVolumeCap)
+		}
+	})
 }
 
 func TestSendsFirstDay(t *testing.T) {
@@ -846,8 +852,8 @@ func TestSendsFirstDay(t *testing.T) {
 			sendEvent("c3", day, 3, "", "", ""),               // exactly at the cutover: included
 			sendEvent("c4", day+time.Second, 100, "", "", ""), // just past: excluded
 		}
-		want := math.Log1p(18)
-		if got := sendsFirstDay(events, base, day); math.Abs(got-want) > 1e-9 {
+		want := 18.0
+		if got := sendsFirstDay(events, base, day); got != want {
 			t.Errorf("sendsFirstDay = %v, want %v", got, want)
 		}
 	})
@@ -862,14 +868,20 @@ func TestSendsFirstDay(t *testing.T) {
 			sendEvent("c2", time.Hour, 5, "", "", ""),
 			sendEvent("c1", 0, 10, "", "", ""),
 		}
-		want := math.Log1p(15)
-		if got := sendsFirstDay(events, base, day); math.Abs(got-want) > 1e-9 {
+		want := 15.0
+		if got := sendsFirstDay(events, base, day); got != want {
 			t.Errorf("sendsFirstDay (out of order) = %v, want %v", got, want)
 		}
 	})
 	t.Run("no sends at all is exactly zero", func(t *testing.T) {
 		if got := sendsFirstDay(nil, base, day); got != 0 {
 			t.Errorf("sendsFirstDay(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("capped at sendsVolumeCap so a pathological volume can't swamp the model", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, sendsVolumeCap+500, "", "", "")}
+		if got := sendsFirstDay(events, base, day); got != sendsVolumeCap {
+			t.Errorf("sendsFirstDay = %v, want the cap %v", got, sendsVolumeCap)
 		}
 	})
 }
@@ -885,8 +897,8 @@ func TestSends10mMax(t *testing.T) {
 			// ...then an isolated, much smaller send an hour later.
 			sendEvent("c4", time.Hour, 5, "", "", ""),
 		}
-		want := math.Log1p(100)
-		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+		want := 100.0
+		if got := sends10mMax(events, window); got != want {
 			t.Errorf("sends10mMax = %v, want %v (the dense cluster, not the later isolated send)", got, want)
 		}
 	})
@@ -898,8 +910,8 @@ func TestSends10mMax(t *testing.T) {
 		// The max single-event sum (20) beats any window containing both,
 		// since c1 is not within 10m of c2 (boundary excluded, withinWindow's
 		// own half-open convention).
-		want := math.Log1p(20)
-		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+		want := 20.0
+		if got := sends10mMax(events, window); got != want {
 			t.Errorf("sends10mMax at the boundary = %v, want %v", got, want)
 		}
 	})
@@ -909,8 +921,8 @@ func TestSends10mMax(t *testing.T) {
 			sendEvent("c1", 0, 40, "", "", ""),
 			sendEvent("c2", 3*time.Minute, 30, "", "", ""),
 		}
-		want := math.Log1p(100)
-		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+		want := 100.0
+		if got := sends10mMax(events, window); got != want {
 			t.Errorf("sends10mMax (out of order) = %v, want %v", got, want)
 		}
 	})
@@ -921,8 +933,8 @@ func TestSends10mMax(t *testing.T) {
 	})
 	t.Run("a single event's own count is its own max", func(t *testing.T) {
 		events := []event.Event{sendEvent("c1", 0, 7, "", "", "")}
-		want := math.Log1p(7)
-		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+		want := 7.0
+		if got := sends10mMax(events, window); got != want {
 			t.Errorf("sends10mMax = %v, want %v", got, want)
 		}
 	})
@@ -931,9 +943,15 @@ func TestSends10mMax(t *testing.T) {
 		// from event history, so this is really just documentation that its
 		// signature has no way to make it decay; see its own doc comment.
 		events := []event.Event{sendEvent("c1", 0, 100, "", "", "")}
-		want := math.Log1p(100)
-		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+		want := 100.0
+		if got := sends10mMax(events, window); got != want {
 			t.Errorf("sends10mMax = %v, want %v", got, want)
+		}
+	})
+	t.Run("capped at sendsVolumeCap so a pathological volume can't swamp the model", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, sendsVolumeCap+500, "", "", "")}
+		if got := sends10mMax(events, window); got != sendsVolumeCap {
+			t.Errorf("sends10mMax = %v, want the cap %v", got, sendsVolumeCap)
 		}
 	})
 }
@@ -946,8 +964,8 @@ func TestDistinctRecipients1h(t *testing.T) {
 			sendEvent("c2", time.Minute, 1, "", "hash-a", ""), // same recipient again
 			sendEvent("c3", 2*time.Minute, 1, "", "hash-b", ""),
 		}
-		want := math.Log1p(2)
-		if got := distinctRecipients1h(events, at(3*time.Minute), window); math.Abs(got-want) > 1e-9 {
+		want := 2.0
+		if got := distinctRecipients1h(events, at(3*time.Minute), window); got != want {
 			t.Errorf("distinctRecipients1h = %v, want %v (2 distinct hashes)", got, want)
 		}
 	})
@@ -956,8 +974,8 @@ func TestDistinctRecipients1h(t *testing.T) {
 			sendEvent("c1", 0, 1, "", "hash-a", ""),
 			sendEvent("c2", time.Minute, 5, "", "", ""), // no hash: adds 5, doesn't just count as 1
 		}
-		want := math.Log1p(1 + 5)
-		if got := distinctRecipients1h(events, at(2*time.Minute), window); math.Abs(got-want) > 1e-9 {
+		want := 1.0 + 5.0
+		if got := distinctRecipients1h(events, at(2*time.Minute), window); got != want {
 			t.Errorf("distinctRecipients1h = %v, want %v", got, want)
 		}
 	})
@@ -973,14 +991,20 @@ func TestDistinctRecipients1h(t *testing.T) {
 			sendEvent("c2", time.Minute, 1, "", "hash-b", ""),
 			sendEvent("c1", 0, 1, "", "hash-a", ""),
 		}
-		want := math.Log1p(2)
-		if got := distinctRecipients1h(events, at(2*time.Minute), window); math.Abs(got-want) > 1e-9 {
+		want := 2.0
+		if got := distinctRecipients1h(events, at(2*time.Minute), window); got != want {
 			t.Errorf("distinctRecipients1h (out of order) = %v, want %v", got, want)
 		}
 	})
 	t.Run("empty history is exactly zero", func(t *testing.T) {
 		if got := distinctRecipients1h(nil, at(0), window); got != 0 {
 			t.Errorf("distinctRecipients1h(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("capped at sendsVolumeCap so a pathological volume can't swamp the model", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, sendsVolumeCap+500, "", "", "")} // no hash: falls back to the raw count
+		if got := distinctRecipients1h(events, at(time.Minute), window); got != sendsVolumeCap {
+			t.Errorf("distinctRecipients1h = %v, want the cap %v", got, sendsVolumeCap)
 		}
 	})
 }

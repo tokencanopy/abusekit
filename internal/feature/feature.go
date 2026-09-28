@@ -220,27 +220,31 @@ type Features struct {
 	// subject has no resource/content activity at all.
 	BurstRatio24hVsLifetime float64
 
-	// [S2b] Sends10mMax is log1p of the largest sum of content.sent
-	// recipient_count (falling back to 1 per event when absent/non-positive
-	// — recipientCountOf) within ANY 10-minute window across the subject's
-	// WHOLE HISTORY so far — not a currently-decaying trailing window like
-	// Sends1h below: a maximum over already-elapsed windows can only grow
-	// as a new event arrives, never shrink as time passes with no new
-	// event, so (unlike every *_1h/*_24h feature) it needs no window-exit
-	// rescore of its own.
+	// [S2b] Sends10mMax is the largest sum of content.sent recipient_count
+	// (falling back to 1 per event when absent/non-positive —
+	// recipientCountOf), capped at sendsVolumeCap, within ANY 10-minute
+	// window across the subject's WHOLE HISTORY so far — not a
+	// currently-decaying trailing window like Sends1h below: a maximum
+	// over already-elapsed windows can only grow as a new event arrives,
+	// never shrink as time passes with no new event, so (unlike every
+	// *_1h/*_24h feature) it needs no window-exit rescore of its own. A
+	// plain cap, not log1p (see sendsVolumeCap's own doc comment for why
+	// this feature specifically needs the RAW count preserved, not
+	// compressed).
 	Sends10mMax float64
-	// Sends1h is log1p of the sum of content.sent recipient_count (same
-	// fallback) within the trailing Windows.OneHour window ending at
-	// Windows.Now — decays exactly like ResourceVelocity1h/KeyVelocity1h,
-	// covered by the SAME window-exit rescore scheduling (content.sent is
-	// already a windowed event type — see isWindowedEventType).
+	// Sends1h is the sum of content.sent recipient_count (same fallback),
+	// capped at sendsVolumeCap, within the trailing Windows.OneHour window
+	// ending at Windows.Now — decays exactly like
+	// ResourceVelocity1h/KeyVelocity1h, covered by the SAME window-exit
+	// rescore scheduling (content.sent is already a windowed event type —
+	// see isWindowedEventType).
 	Sends1h float64
-	// SendsFirstDay is log1p of the sum of content.sent recipient_count
-	// (same fallback) within the subject's first Windows.DayHour, anchored
-	// to firstSeenAt like FirstDayDistinctDomains — permanently fixed once
-	// that window closes, and covered by nextRescoreAt's existing
-	// first-day-cutover candidate (feature-agnostic; no code change
-	// needed).
+	// SendsFirstDay is the sum of content.sent recipient_count (same
+	// fallback), capped at sendsVolumeCap, within the subject's first
+	// Windows.DayHour, anchored to firstSeenAt like FirstDayDistinctDomains
+	// — permanently fixed once that window closes, and covered by
+	// nextRescoreAt's existing first-day-cutover candidate
+	// (feature-agnostic; no code change needed).
 	SendsFirstDay float64
 	// WebmailRecipientShare is the LIFETIME share (0..1) of sent recipients
 	// whose recipient_domain is on the configured webmail list
@@ -255,13 +259,13 @@ type Features struct {
 	// COMBINATION directly rather than relying on the product of two
 	// separately-weighted terms.
 	WebmailSends1h float64
-	// DistinctRecipients1h is log1p of the count of distinct
-	// content.sent recipient_hash values seen within the trailing
-	// Windows.OneHour window, falling back to ADDING recipient_count (not
-	// counting the event as one) for any event that carries no
-	// recipient_hash at all — an event with no hash gives no way to tell
-	// its recipients apart, so it's treated as that many additional
-	// distinct recipients rather than silently undercounted as one.
+	// DistinctRecipients1h is the count of distinct content.sent
+	// recipient_hash values seen within the trailing Windows.OneHour
+	// window, falling back to ADDING recipient_count (not counting the
+	// event as one) for any event that carries no recipient_hash at all —
+	// an event with no hash gives no way to tell its recipients apart, so
+	// it's treated as that many additional distinct recipients rather than
+	// silently undercounted as one. Capped at sendsVolumeCap.
 	DistinctRecipients1h float64
 	// SubjectBrandMatch counts DISTINCT curated brands (BrandSet,
 	// config/brands.yaml, canonicalised the same way NameBrandMatch is)

@@ -460,6 +460,30 @@ func earliestWindowExit(events []event.Event, now time.Time, window time.Duratio
 // list swamp the model through this feature alone).
 const subjectBrandMatchCap = 3
 
+// sendsVolumeCap [S2b] bounds Sends10mMax/Sends1h/SendsFirstDay/
+// DistinctRecipients1h — design's "capped or log1p so they can't swamp the
+// model". A plain cap (rather than log1p, D2 round 3's choice for
+// first_day_distinct_domains) is the better fit here: log1p(n) is already
+// a substantial fraction of its own eventual ceiling at very SMALL n (e.g.
+// log1p(3) is already 30% of log1p(100)), so it would give an ordinary
+// handful-of-recipients send nearly as much weight, proportionally, as a
+// genuine mass blast — exactly backwards for a feature whose whole point
+// is separating "a few" from "a hundred". A cap keeps the RAW count (and
+// therefore the true ~30x gap between an ordinary send and a mass blast)
+// intact up to a ceiling comfortably above any volume a legitimate v0
+// fixture reaches, only bounding the pathological case (design's
+// motivating incident: "100 recipients per account... in 3 to 45
+// minutes" — this cap is set well above that).
+const sendsVolumeCap = 300
+
+// capAt caps v at max (v itself if v <= max).
+func capAt(v, max float64) float64 {
+	if v > max {
+		return max
+	}
+	return v
+}
+
 // recipientCountOf [S2b] reads a content.sent event's recipient_count,
 // falling back to 1 (a single recipient) when the field is absent or not a
 // positive number — design's [S2b] amendment: "recipient_count summed,
@@ -489,23 +513,23 @@ func sendsInWindow(events []event.Event, now time.Time, window time.Duration) fl
 	return sum
 }
 
-// sends1h [S2b] is Features.Sends1h: log1p of sendsInWindow over the
-// trailing window ending at now — decays exactly like
+// sends1h [S2b] is Features.Sends1h: sendsInWindow over the trailing
+// window ending at now, capped at sendsVolumeCap — decays exactly like
 // resourceCount(events, "", now, window) as the window slides forward
 // with no new event; content.sent is already a windowed event type (see
 // isWindowedEventType), so no rescore-scheduling change is needed for the
 // decay this introduces.
 func sends1h(events []event.Event, now time.Time, window time.Duration) float64 {
-	return math.Log1p(sendsInWindow(events, now, window))
+	return capAt(sendsInWindow(events, now, window), sendsVolumeCap)
 }
 
-// sendsFirstDay [S2b] is Features.SendsFirstDay: log1p of the sum of
-// content.sent recipient_count within [firstSeenAt, firstSeenAt+window]
-// inclusive on both ends — anchored to the subject's first event exactly
-// like firstDayDistinctDomains, not to "now": once past firstSeenAt+window,
-// this feature is permanently fixed, and nextRescoreAt's existing
-// first-day-cutover candidate (feature-agnostic) already covers its one
-// transition with no code change.
+// sendsFirstDay [S2b] is Features.SendsFirstDay: the sum of content.sent
+// recipient_count within [firstSeenAt, firstSeenAt+window] inclusive on
+// both ends, capped at sendsVolumeCap — anchored to the subject's first
+// event exactly like firstDayDistinctDomains, not to "now": once past
+// firstSeenAt+window, this feature is permanently fixed, and
+// nextRescoreAt's existing first-day-cutover candidate (feature-agnostic)
+// already covers its one transition with no code change.
 func sendsFirstDay(events []event.Event, firstSeenAt time.Time, window time.Duration) float64 {
 	cutoff := firstSeenAt.Add(window)
 	var sum float64
@@ -518,19 +542,19 @@ func sendsFirstDay(events []event.Event, firstSeenAt time.Time, window time.Dura
 		}
 		sum += recipientCountOf(e)
 	}
-	return math.Log1p(sum)
+	return capAt(sum, sendsVolumeCap)
 }
 
-// sends10mMax [S2b] is Features.Sends10mMax: log1p of the LARGEST sum of
+// sends10mMax [S2b] is Features.Sends10mMax: the LARGEST sum of
 // content.sent recipient_count within any window-duration-wide window
-// across the subject's whole history — computed order-independently (a
-// standard two-pointer sliding-window-sum maximum over events sorted by
-// At) so out-of-order delivery can never miss the true maximum the way a
-// single forward pass over delivery order could. Unlike sends1h/
-// sendsFirstDay above, this is a MAXIMUM over already-elapsed windows: it
-// can only grow as a new event arrives, never shrink as time passes with
-// no new event, so it needs no window-exit rescore of its own (see its
-// Features field doc comment).
+// across the subject's whole history, capped at sendsVolumeCap — computed
+// order-independently (a standard two-pointer sliding-window-sum maximum
+// over events sorted by At) so out-of-order delivery can never miss the
+// true maximum the way a single forward pass over delivery order could.
+// Unlike sends1h/sendsFirstDay above, this is a MAXIMUM over
+// already-elapsed windows: it can only grow as a new event arrives, never
+// shrink as time passes with no new event, so it needs no window-exit
+// rescore of its own (see its Features field doc comment).
 func sends10mMax(events []event.Event, window time.Duration) float64 {
 	type point struct {
 		at time.Time
@@ -560,17 +584,18 @@ func sends10mMax(events []event.Event, window time.Duration) float64 {
 			maxSum = sum
 		}
 	}
-	return math.Log1p(maxSum)
+	return capAt(maxSum, sendsVolumeCap)
 }
 
-// distinctRecipients1h [S2b] is Features.DistinctRecipients1h: log1p of
-// the count of distinct content.sent recipient_hash values within the
-// trailing window ending at now, falling back to ADDING recipient_count
-// (not counting the event as a single recipient) for any event with no
+// distinctRecipients1h [S2b] is Features.DistinctRecipients1h: the count
+// of distinct content.sent recipient_hash values within the trailing
+// window ending at now, falling back to ADDING recipient_count (not
+// counting the event as a single recipient) for any event with no
 // recipient_hash at all — an event with no hash gives no way to tell its
 // recipients apart, so treating it as "recipient_count more distinct
 // recipients" is closer to the truth than either dropping it or counting
-// it as exactly one.
+// it as exactly one. Capped at sendsVolumeCap for the same reason as the
+// send-volume features above.
 func distinctRecipients1h(events []event.Event, now time.Time, window time.Duration) float64 {
 	seen := make(map[string]struct{})
 	var fallback float64
@@ -584,7 +609,7 @@ func distinctRecipients1h(events []event.Event, now time.Time, window time.Durat
 		}
 		fallback += recipientCountOf(e)
 	}
-	return math.Log1p(float64(len(seen)) + fallback)
+	return capAt(float64(len(seen))+fallback, sendsVolumeCap)
 }
 
 // webmailRecipientShare [S2b] is Features.WebmailRecipientShare: the
