@@ -93,6 +93,9 @@ type Store interface {
 	ReleaseClaim(ctx context.Context, tenant, subject string) error
 	ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error
 	QueueStats(ctx context.Context, now time.Time) (depth int, oldestDirtyAge time.Duration, err error)
+	// ClaimSubjectForEvaluate backs EvaluateSubject (S3): design §4.4's
+	// synchronous POST .../evaluate.
+	ClaimSubjectForEvaluate(ctx context.Context, tenant, subject string, now time.Time) (store.DirtySubject, error)
 }
 
 // Deps are a Worker's dependencies. Store, Config and Neighbors are
@@ -440,18 +443,110 @@ func safeScoreCall(ctx context.Context, scorer model.Scorer, req model.ScoreRequ
 	return scorer.Score(ctx, req)
 }
 
-// scoreSubject runs one full scoring round for d: load events, extract
-// features, build core.RuleState per rule, Plan, execute each call
-// (honouring rule-level backoff, reusing an input-unchanged prior result,
-// and budgets), Combine, and commit via UpsertVerdicts. Returns (true,
-// nil) on a normal commit, (false, nil) on a stale round (store.ErrStaleRound
-// — not a failure), or a non-nil error for anything else (the caller,
-// Tick, records this as a whole-pass failure via
-// store.RecordSubjectFailure — B3 fix round).
+// scoreSubject runs one full scoring round for d via computeVerdict, then
+// commits it. Returns (true, nil) on a normal commit, (false, nil) on a
+// stale round (store.ErrStaleRound — not a failure), or a non-nil error
+// for anything else (the caller, Tick, records this as a whole-pass
+// failure via store.RecordSubjectFailure — B3 fix round).
 func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now time.Time) (bool, error) {
+	verdict, records, nextRescoreAt, err := w.computeVerdict(ctx, d, now, false)
+	if err != nil {
+		return false, err
+	}
+
+	_, err = w.deps.Store.UpsertVerdicts(ctx, d.Tenant, d.Subject, d.DirtySeq, records, store.SubjectSummary{
+		Tier:          verdict.Tier,
+		Score:         verdict.Score,
+		NextRescoreAt: nextRescoreAt,
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrStaleRound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("upsert verdicts: %w", err)
+	}
+	return true, nil
+}
+
+// EvaluateSubject is design §4.4's POST /v1/subjects/{subject}/evaluate:
+// the same per-subject scoring path scoreSubject runs on the worker's own
+// ticker, invoked synchronously for one named subject instead of a
+// claimed batch. It shares scoreSubject's exact lease (via
+// store.ClaimSubjectForEvaluate, which can never overlap a concurrent
+// worker Tick's own claim on the same subject — see that method's doc
+// comment), timeout, and budget rules.
+//
+// deadline bounds the WHOLE call (design: "{deadline_ms ≤ 3000}"); <= 0
+// means "no additional deadline beyond ctx's own" (a test convenience —
+// internal/serve's handler always supplies a positive deadline). Within
+// that bound, only rules scored by "local" actually run synchronously
+// (see computeVerdict's syncOnly parameter) — v0 has no vendor scorer
+// whose measured p99 latency could ever justify running it inline on a
+// product's send path, so this is the conservative default until one
+// exists; see the S3 PR body for that interpretation.
+//
+// Returns store.ErrNotFound if the subject has never been seen by this
+// tenant, or store.ErrAlreadyClaimed if a worker Tick or another evaluate
+// call is already mid-round for it (the caller, internal/serve, maps
+// this to 429 — design: evaluate is "rate-limited per subject (1/s)").
+func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, deadline time.Duration) (core.Verdict, error) {
+	now := w.deps.now()
+	d, err := w.deps.Store.ClaimSubjectForEvaluate(ctx, tenant, subject, now)
+	if err != nil {
+		return core.Verdict{}, err
+	}
+
+	evalCtx := ctx
+	if deadline > 0 {
+		var cancel context.CancelFunc
+		evalCtx, cancel = context.WithTimeout(ctx, deadline)
+		defer cancel()
+	}
+
+	verdict, records, nextRescoreAt, err := w.computeVerdict(evalCtx, d, now, true)
+	if err != nil {
+		_ = w.deps.Store.ReleaseClaim(ctx, tenant, subject)
+		return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: %w", tenant, subject, err)
+	}
+
+	if _, err := w.deps.Store.UpsertVerdicts(ctx, tenant, subject, d.DirtySeq, records, store.SubjectSummary{
+		Tier:          verdict.Tier,
+		Score:         verdict.Score,
+		NextRescoreAt: nextRescoreAt,
+	}); err != nil {
+		_ = w.deps.Store.ReleaseClaim(ctx, tenant, subject)
+		if errors.Is(err, store.ErrStaleRound) {
+			// Provably unreachable in practice: ClaimSubjectForEvaluate's
+			// exclusive lease means nothing else can be scoring this
+			// subject between our own claim and this commit. Reported as a
+			// real error rather than silently treated as success, since a
+			// caller receiving evaluated_now:true needs it to be true.
+			return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: a concurrent round committed despite the exclusive claim (this should not happen)", tenant, subject)
+		}
+		return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: upsert verdicts: %w", tenant, subject, err)
+	}
+	return verdict, nil
+}
+
+// computeVerdict is scoreSubject/EvaluateSubject's shared computation:
+// load events, extract features, build core.RuleState per rule, Plan,
+// execute each call (honouring rule-level backoff, reusing an
+// input-unchanged prior result, and budgets), and Combine — everything
+// scoreSubject used to do inline, up to but NOT including the
+// UpsertVerdicts commit, which its two callers each do themselves (they
+// commit to different rows — d.Tenant/d.Subject either way, but
+// EvaluateSubject's caller cares about the returned core.Verdict directly,
+// where scoreSubject's doesn't).
+//
+// syncOnly, when true (EvaluateSubject only), restricts execution to
+// rules scored by "local" (see EvaluateSubject's own doc comment for why):
+// any other rule is marked unscored with error_code
+// "sync_scorer_unsupported" rather than invoked, regardless of what a
+// live call or an input-unchanged skip would otherwise have done for it.
+func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now time.Time, syncOnly bool) (core.Verdict, []store.VerdictRecord, time.Time, error) {
 	storedEvents, err := w.deps.Store.EventsForSubject(ctx, d.Tenant, d.Subject)
 	if err != nil {
-		return false, fmt.Errorf("load events: %w", err)
+		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load events: %w", err)
 	}
 	events := make([]event.Event, len(storedEvents))
 	for i, se := range storedEvents {
@@ -461,12 +556,12 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	windows := feature.DefaultWindows(now)
 	fr, err := feature.Extract(ctx, d.Tenant, d.Subject, events, w.deps.Neighbors, windows, w.deps.Brands)
 	if err != nil {
-		return false, fmt.Errorf("extract features: %w", err)
+		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("extract features: %w", err)
 	}
 
 	latest, err := w.deps.Store.LatestVerdicts(ctx, d.Tenant, d.Subject)
 	if err != nil {
-		return false, fmt.Errorf("load latest verdicts: %w", err)
+		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load latest verdicts: %w", err)
 	}
 
 	currentRuleNames := make([]string, len(w.deps.Config.Rules))
@@ -501,7 +596,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	// queried by name a live rule actually has), but there's no reason to
 	// keep it either.
 	if err := w.deps.Store.PruneRuleState(ctx, d.Tenant, d.Subject, currentRuleNames); err != nil {
-		return false, fmt.Errorf("prune rule_state: %w", err)
+		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("prune rule_state: %w", err)
 	}
 
 	calls := core.Plan(fr.Features.Map(), nil, ruleStates) // N1 fix round: nil Text — v0 has no text-input rule registered yet (S5 adds the first one); Plan's own doc comment covers what a non-nil map would do.
@@ -520,6 +615,19 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	for i, call := range calls {
 		r := call.Rule
 
+		// EvaluateSubject's syncOnly restriction (design §4.4: "the local
+		// scorer always can; vendor scorers only if their p99 fits" — v0
+		// has no measured p99 for any vendor scorer, so every non-local
+		// rule is unsupported synchronously until one is). Checked before
+		// the stage/backoff/skip logic below so a staged or backed-off
+		// non-local rule reports the SAME code an evaluate caller would
+		// see for any other non-local rule, rather than a code that leaks
+		// which of those unrelated states it happened to be in.
+		if syncOnly && r.Scorer != "local" {
+			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "sync_scorer_unsupported"}
+			continue
+		}
+
 		if call.Skip && call.SkipReason == core.SkipStageCondition {
 			// A staged rule (e.g. lure_similarity's max_subject_age_h, or a
 			// shadow rule gated on min_local_risk) simply hasn't reached its
@@ -532,7 +640,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 
 		backoff, err := w.deps.Store.GetRuleBackoff(ctx, d.Tenant, d.Subject, r.Name)
 		if err != nil {
-			return false, fmt.Errorf("load rule backoff for %s: %w", r.Name, err)
+			return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load rule backoff for %s: %w", r.Name, err)
 		}
 		if backoff.InBackoff(now) {
 			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "backoff"}
@@ -577,7 +685,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 		if budgeted {
 			allowed, code, berr := w.deps.Budgets.Allow(ctx, r.Scorer, d.Tenant, d.Subject, isElevated, now)
 			if berr != nil {
-				return false, fmt.Errorf("check budget for %s: %w", r.Name, berr)
+				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("check budget for %s: %w", r.Name, berr)
 			}
 			if !allowed {
 				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: code}
@@ -615,7 +723,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 			}
 			retryAt := now.Add(backoffDuration(backoff.Attempts + 1))
 			if rerr := w.deps.Store.RecordRuleError(ctx, d.Tenant, d.Subject, r.Name, retryAt, err.Error()); rerr != nil {
-				return false, fmt.Errorf("record rule error for %s: %w", r.Name, rerr)
+				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("record rule error for %s: %w", r.Name, rerr)
 			}
 			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "adapter_error"}
 			retryCandidates = append(retryCandidates, retryAt)
@@ -624,12 +732,12 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 
 		if budgeted {
 			if berr := w.deps.Budgets.Record(ctx, r.Scorer, d.Tenant, d.Subject, now); berr != nil {
-				return false, fmt.Errorf("record budget usage for %s: %w", r.Name, berr)
+				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("record budget usage for %s: %w", r.Name, berr)
 			}
 		}
 		if backoff.Attempts > 0 {
 			if cerr := w.deps.Store.ClearRuleBackoff(ctx, d.Tenant, d.Subject, r.Name); cerr != nil {
-				return false, fmt.Errorf("clear rule backoff for %s: %w", r.Name, cerr)
+				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("clear rule backoff for %s: %w", r.Name, cerr)
 			}
 		}
 
@@ -654,7 +762,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	}, w.deps.Calibration)
 
 	if len(verdict.Signals) != len(calls) {
-		return false, fmt.Errorf("worker: internal/core.Combine returned %d signals for %d calls", len(verdict.Signals), len(calls))
+		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("worker: internal/core.Combine returned %d signals for %d calls", len(verdict.Signals), len(calls))
 	}
 	if w.deps.Metrics != nil {
 		w.deps.Metrics.IncVerdictsByTier(verdict.Tier)
@@ -664,7 +772,7 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	for i, call := range calls {
 		sig := verdict.Signals[i]
 		if sig.Rule != call.Rule.Name {
-			return false, fmt.Errorf("worker: signal/call order mismatch at index %d: got rule %q, want %q", i, sig.Rule, call.Rule.Name)
+			return core.Verdict{}, nil, time.Time{}, fmt.Errorf("worker: signal/call order mismatch at index %d: got rule %q, want %q", i, sig.Rule, call.Rule.Name)
 		}
 		var probs map[string]float64
 		if results[i] != nil {
@@ -705,16 +813,5 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 		}
 	}
 
-	_, err = w.deps.Store.UpsertVerdicts(ctx, d.Tenant, d.Subject, d.DirtySeq, records, store.SubjectSummary{
-		Tier:          verdict.Tier,
-		Score:         verdict.Score,
-		NextRescoreAt: nextRescoreAt,
-	})
-	if err != nil {
-		if errors.Is(err, store.ErrStaleRound) {
-			return false, nil
-		}
-		return false, fmt.Errorf("upsert verdicts: %w", err)
-	}
-	return true, nil
+	return verdict, records, nextRescoreAt, nil
 }

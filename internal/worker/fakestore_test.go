@@ -84,6 +84,10 @@ func (f *fakeStore) QueueStats(ctx context.Context, now time.Time) (int, time.Du
 	return f.real.QueueStats(ctx, now)
 }
 
+func (f *fakeStore) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject string, now time.Time) (store.DirtySubject, error) {
+	return f.real.ClaimSubjectForEvaluate(ctx, tenant, subject, now)
+}
+
 func (f *fakeStore) setEventsForSubjectErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

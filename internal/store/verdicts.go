@@ -188,6 +188,11 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 // SubjectSignal is one rule's latest recorded verdict for a subject, as
 // SubjectView reports it.
 type SubjectSignal struct {
+	// ID is the verdicts row id this signal came from (S3): the score
+	// API's ETag is a hash of the ids behind one response, so a caller can
+	// tell "the exact same verdicts" from "something changed" via
+	// If-None-Match without re-fetching the body.
+	ID          int64
 	Rule        string
 	Mode        string
 	Status      string
@@ -393,7 +398,7 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 
 	query := `
 		SELECT DISTINCT ON (rule)
-			rule, mode, status, risk, flagged, model, checkpoint, calibration, reason, error_code, scored_at
+			id, rule, mode, status, risk, flagged, model, checkpoint, calibration, reason, error_code, scored_at
 		FROM verdicts
 		WHERE tenant = $1 AND subject = $2`
 	args := []any{tenant, subject}
@@ -417,7 +422,7 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 	for rows.Next() {
 		var sig SubjectSignal
 		var risk *float64
-		if err := rows.Scan(&sig.Rule, &sig.Mode, &sig.Status, &risk, &sig.Flagged, &sig.Model,
+		if err := rows.Scan(&sig.ID, &sig.Rule, &sig.Mode, &sig.Status, &risk, &sig.Flagged, &sig.Model,
 			&sig.Checkpoint, &sig.Calibration, &sig.Reason, &sig.ErrorCode, &sig.ScoredAt); err != nil {
 			return nil, fmt.Errorf("store: scan verdict row: %w", err)
 		}
