@@ -2,14 +2,86 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 
 	"github.com/tokencanopy/abusekit/eval"
+	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/event"
 	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/model"
+	"github.com/tokencanopy/abusekit/internal/model/local"
 )
+
+// repoRootForGenTest mirrors every other package's own repoRoot test
+// helper: this file is <root>/eval/gen/gen_test.go.
+func repoRootForGenTest(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatalf("runtime.Caller failed")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..")
+}
+
+// loadShippedConfigForGenTest builds the real config/{rules,vendors,
+// local_weights,brands}.yaml this repo ships — used by
+// TestGenerate_RecallVariesWithSeed to score against the actual shipped
+// weights, not a hand-rolled stand-in.
+func loadShippedConfigForGenTest(t *testing.T, root string) (*config.Config, feature.BrandSet) {
+	t.Helper()
+	weights, err := local.LoadWeightsFile(filepath.Join(root, "config", "local_weights.yaml"))
+	if err != nil {
+		t.Fatalf("load weights: %v", err)
+	}
+	scorer, err := local.New(weights)
+	if err != nil {
+		t.Fatalf("new local scorer: %v", err)
+	}
+	reg := model.NewRegistry()
+	if err := reg.Register(scorer); err != nil {
+		t.Fatalf("register local: %v", err)
+	}
+	vendorsData, err := os.ReadFile(filepath.Join(root, "config", "vendors.yaml"))
+	if err != nil {
+		t.Fatalf("read vendors.yaml: %v", err)
+	}
+	vendors, err := config.LoadVendors(vendorsData)
+	if err != nil {
+		t.Fatalf("load vendors: %v", err)
+	}
+	rulesData, err := os.ReadFile(filepath.Join(root, "config", "rules.yaml"))
+	if err != nil {
+		t.Fatalf("read rules.yaml: %v", err)
+	}
+	cfg, err := config.Load(rulesData, config.Dependencies{
+		Registry: reg,
+		Features: config.NewFeatureSet(feature.Names...),
+		Vendors:  vendors,
+	})
+	if err != nil {
+		t.Fatalf("load rules.yaml: %v", err)
+	}
+	brands, err := feature.LoadBrandsFile(filepath.Join(root, "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("load brands.yaml: %v", err)
+	}
+	return cfg, brands
+}
+
+func ruleByNameForGenTest(cfg *config.Config, name string) (config.Rule, bool) {
+	for _, r := range cfg.Rules {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return config.Rule{}, false
+}
 
 // TestGenerate_Deterministic proves Generate is a pure function of
 // Options.Seed (task brief: "a seeded generator") — two calls with the
@@ -149,5 +221,57 @@ func TestGenerate_RoundTripsThroughLoadReplayDataset(t *testing.T) {
 	}
 	if !dataset.Replay {
 		t.Fatalf("dataset.Replay = false, want true for an event-replay pair")
+	}
+}
+
+// TestGenerate_RecallVariesWithSeed is fix round S3's own acceptance
+// test: "recall must vary with the seed" — proof the corpus's jitter
+// actually reaches scoring outcomes, not just cosmetic field values. Two
+// different seeds' generated corpora are scored with the real shipped
+// config/local_weights.yaml against config/rules.yaml's
+// new_account_velocity, and their recall values must differ.
+func TestGenerate_RecallVariesWithSeed(t *testing.T) {
+	root := repoRootForGenTest(t)
+	cfg, brands := loadShippedConfigForGenTest(t, root)
+	rule, ok := ruleByNameForGenTest(cfg, "new_account_velocity")
+	if !ok {
+		t.Fatalf("rule not found")
+	}
+	scorer, ok := cfg.ScorerFor(rule)
+	if !ok {
+		t.Fatalf("scorer not found")
+	}
+
+	recallFor := func(seed int64) float64 {
+		res := Generate(Options{Seed: seed})
+		var eventsBuf, labelsBuf bytes.Buffer
+		enc := json.NewEncoder(&eventsBuf)
+		for _, e := range res.Events {
+			if err := enc.Encode(e); err != nil {
+				t.Fatalf("encode event: %v", err)
+			}
+		}
+		lenc := json.NewEncoder(&labelsBuf)
+		for _, l := range res.Labels {
+			if err := lenc.Encode(l); err != nil {
+				t.Fatalf("encode label: %v", err)
+			}
+		}
+		dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, brands, rule.BenignLabel)
+		if err != nil {
+			t.Fatalf("LoadReplayDataset(seed=%d): %v (rowErrs=%v)", seed, err, rowErrs)
+		}
+		run, err := eval.Run(context.Background(), dataset, rule, scorer, eval.Options{Tiers: cfg.Tiers})
+		if err != nil {
+			t.Fatalf("eval.Run(seed=%d): %v", seed, err)
+		}
+		return run.Metrics.Threshold.Recall.Value
+	}
+
+	r1 := recallFor(1)
+	r2 := recallFor(2)
+	r3 := recallFor(20260927)
+	if r1 == r2 && r2 == r3 {
+		t.Fatalf("recall was identical (%v) across three different seeds — the corpus's jitter isn't reaching scoring outcomes", r1)
 	}
 }

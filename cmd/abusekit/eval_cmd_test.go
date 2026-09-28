@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tokencanopy/abusekit/eval"
@@ -64,6 +65,45 @@ floors:
 	}
 	if ec.code != 1 {
 		t.Fatalf("exit code = %d, want 1 (a floor violation)", ec.code)
+	}
+}
+
+// TestRunEval_MutatedWeightsBreaksGate is fix round S2's own required
+// cmd-level test: zeroing a real, load-bearing weight in a MUTATED COPY
+// of the shipped config/local_weights.yaml (never the committed file
+// itself — AGENTS.md/this fix round: "do not tune weights") and running
+// `abusekit eval` through the CLI's own flag parsing and config loading
+// (runEval, not eval.Run directly — see eval/floors_test.go's
+// TestGate_WeightRegressionFailsFloors for the equivalent in-process
+// check) against the real eval/floors.yaml must fail the gate (exit 1).
+// resource_velocity_1h is one of 9 (of 18) weights the PR body's own
+// weight-zeroing sweep found DOES break the gate; the other 9 pass when
+// zeroed, each with a documented reason in the PR body (redundant with
+// an already-gated feature, genuinely small/secondary by design, or
+// simply never exercised by this corpus).
+func TestRunEval_MutatedWeightsBreaksGate(t *testing.T) {
+	root := repoRoot(t)
+	shipped, err := os.ReadFile(filepath.Join(root, "config", "local_weights.yaml"))
+	if err != nil {
+		t.Fatalf("read shipped weights: %v", err)
+	}
+	mutated := strings.Replace(string(shipped), "resource_velocity_1h: 0.35", "resource_velocity_1h: 0.0", 1)
+	if mutated == string(shipped) {
+		t.Fatalf("mutation did not match any line in config/local_weights.yaml — has it been reformatted?")
+	}
+	weightsPath := filepath.Join(t.TempDir(), "mutated_weights.yaml")
+	if err := os.WriteFile(weightsPath, []byte(mutated), 0o644); err != nil {
+		t.Fatalf("write mutated weights: %v", err)
+	}
+
+	args := syntheticCorpusArgs(t, "--weights", weightsPath, "--floors", filepath.Join(root, "eval", "floors.yaml"), "--out", filepath.Join(t.TempDir(), "run.json"))
+	err = runEval(args)
+	if err == nil {
+		t.Fatalf("zeroing resource_velocity_1h did not break the gate")
+	}
+	var ec *exitError
+	if !errors.As(err, &ec) || ec.code != 1 {
+		t.Fatalf("runEval(mutated weights) = %v, want an exitError with code 1", err)
 	}
 }
 

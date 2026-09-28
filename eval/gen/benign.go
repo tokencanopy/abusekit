@@ -244,3 +244,166 @@ func genTrialZeroDollar(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) 
 
 	return b.events, labelFor(subject, "benign", "", "outcome", b.events)
 }
+
+// genBenignPrepaid: an ordinary customer whose card just happens to be
+// prepaid, succeeding on the first attempt with no other signal firing —
+// task brief's "benign prepaid" (fix round S3). first_funding_prepaid
+// (internal/feature) is a real fraud signal in the abusive families
+// (burst/fast/churn all pay with a prepaid card specifically because a
+// stolen card is often prepaid), but plenty of genuine customers use one
+// too; this family exists so the corpus doesn't silently teach "prepaid
+// implies abusive" by simply never showing a benign counter-example.
+func genBenignPrepaid(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	subject := fmt.Sprintf("acct_gen_prepaid_%03d", idx)
+	start := epoch.AddDate(0, 0, 36+idx%40).Add(time.Duration(idx) * time.Minute)
+	b := newBuilder(subject, start)
+	domain := subject + ".example.test"
+
+	b.add(0, "subject.created", event.Links{}, map[string]any{"channel": "signup", "email_domain_class": "corporate", "identity_kind": "individual"})
+	b.add(3*time.Minute, "payment.attempt", event.Links{}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(1900), "currency": "usd"})
+	b.add(4*time.Minute, "subscription.changed", event.Links{}, map[string]any{"plan": "starter", "status": "active", "amount_minor": float64(1900)})
+
+	agents := 1 + rng.Intn(3) // 1..3
+	t := 10 * time.Minute
+	for i := 0; i < agents; i++ {
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+		t += time.Duration(3+rng.Intn(5)) * time.Minute
+	}
+	sends := 2 + rng.Intn(4) // 2..5, over the following days
+	for i := 0; i < sends; i++ {
+		day := 1 + i
+		b.add(time.Duration(day)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(subject, i%3), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return b.events, labelFor(subject, "benign", "", "outcome", b.events)
+}
+
+// genBenignDeclineThenSuccess: an ordinary customer who mistypes their
+// card number (or it's briefly expired) once or twice before it goes
+// through, with unremarkable usage afterward — task brief's "benign
+// decline-then-success" (fix round S3). declines_before_first_success
+// (weight 0.6) is a real fraud signal in burst/fast (repeated stolen-card
+// attempts), but an ordinary fat-fingered retry looks identical at the
+// feature level; this family is the benign counter-example.
+func genBenignDeclineThenSuccess(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	subject := fmt.Sprintf("acct_gen_declinesuccess_%03d", idx)
+	start := epoch.AddDate(0, 0, 37+idx%40).Add(time.Duration(idx) * time.Minute)
+	b := newBuilder(subject, start)
+	domain := subject + ".example.test"
+
+	b.add(0, "subject.created", event.Links{}, map[string]any{"channel": "signup", "email_domain_class": "webmail", "identity_kind": "individual"})
+
+	t := 2 * time.Minute
+	declines := 1 + rng.Intn(2) // 1..2 — a mistyped number or an expired card, not a fraud pattern
+	for i := 0; i < declines; i++ {
+		b.add(t, "payment.attempt", event.Links{}, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "credit", "amount_minor": float64(2400), "currency": "usd"})
+		t += time.Duration(1+rng.Intn(3)) * time.Minute
+	}
+	b.add(t, "payment.attempt", event.Links{}, map[string]any{"outcome": "succeeded", "funding": "debit", "amount_minor": float64(2400), "currency": "usd"})
+	t += time.Minute
+	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "pro", "status": "active", "amount_minor": float64(2400)})
+	t += 5 * time.Minute
+
+	agents := 1 + rng.Intn(3) // 1..3
+	for i := 0; i < agents; i++ {
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+		t += time.Duration(3+rng.Intn(6)) * time.Minute
+	}
+	sends := 1 + rng.Intn(4) // 1..4
+	for i := 0; i < sends; i++ {
+		day := 1 + i
+		b.add(time.Duration(day)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(subject, i%3), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return b.events, labelFor(subject, "benign", "", "outcome", b.events)
+}
+
+// genBenignSharedCardHousehold builds a small group (2..3) of INDEPENDENT
+// benign accounts sharing the same card_fingerprint_hash — task brief's
+// "benign shared-card households" (fix round S3): a family or small team
+// paying with one shared card. fingerprint_seen_on_other_subjects (weight
+// 1.0) fires for every member, exactly as it would for a stolen-card
+// churn ring — this family is the honest counter-example proving the
+// feature alone isn't damning; each member is otherwise unremarkable and
+// never deleted.
+func genBenignSharedCardHousehold(rng *rand.Rand, groupIdx int) []incarnation {
+	sharedCard := linkHash(fmt.Sprintf("household-%d-shared-card", groupIdx))
+	size := 2 + rng.Intn(2) // 2..3 members
+	base := epoch.AddDate(0, 0, 38+groupIdx%40).Add(time.Duration(groupIdx) * time.Hour)
+
+	members := make([]incarnation, 0, size)
+	for m := 0; m < size; m++ {
+		subject := fmt.Sprintf("acct_gen_household_%03d_%d", groupIdx, m+1)
+		start := base.Add(time.Duration(m) * time.Duration(10+rng.Intn(20)) * time.Minute)
+		b := newBuilder(subject, start)
+		domain := subject + ".example.test"
+
+		b.add(0, "subject.created", event.Links{}, map[string]any{"channel": "signup", "email_domain_class": "corporate", "identity_kind": "individual"})
+		b.add(2*time.Minute, "payment.attempt", event.Links{CardFingerprintHash: sharedCard}, map[string]any{"outcome": "succeeded", "funding": "credit", "amount_minor": float64(1500), "currency": "usd"})
+		b.add(3*time.Minute, "subscription.changed", event.Links{}, map[string]any{"plan": "starter", "status": "active", "amount_minor": float64(1500)})
+
+		agents := 1 + rng.Intn(2) // 1..2
+		t := 10 * time.Minute
+		for i := 0; i < agents; i++ {
+			b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+			t += time.Duration(5+rng.Intn(10)) * time.Minute
+		}
+		sends := 1 + rng.Intn(3)
+		for i := 0; i < sends; i++ {
+			day := 1 + i
+			b.add(time.Duration(day)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(subject, i%3), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+		}
+
+		members = append(members, incarnation{events: b.events, label: labelFor(subject, "benign", "shared_card_household", "outcome", b.events)})
+	}
+	return members
+}
+
+// genBenignLegitResignup builds a deleted-then-resignup PAIR sharing an
+// email_hash — task brief's "benign legitimate re-signups" (fix round
+// S3): subject A uses the product for a while, then voluntarily and
+// permanently deletes its account (nothing abusive about it — people
+// leave products); much later subject B signs up again with the SAME
+// email (a returning customer, or a family member sharing an inbox) and
+// behaves completely ordinarily. linked_deleted_n (weight 1.3) fires for
+// B the same way it would for a churn incarnation's second-or-later
+// member — this pair is the honest counter-example: ONE deleted
+// neighbour, on its own, is not damning.
+func genBenignLegitResignup(rng *rand.Rand, pairIdx int) []incarnation {
+	sharedEmail := linkHash(fmt.Sprintf("resignup-%d-shared-email", pairIdx))
+	base := epoch.AddDate(0, 0, 39+pairIdx%40).Add(time.Duration(pairIdx) * time.Hour)
+
+	aSubject := fmt.Sprintf("acct_gen_resignup_%03d_a", pairIdx)
+	aStart := base
+	a := newBuilder(aSubject, aStart)
+	aDomain := aSubject + ".example.test"
+	a.add(0, "subject.created", event.Links{EmailHash: sharedEmail}, map[string]any{"channel": "signup", "email_domain_class": "webmail", "identity_kind": "individual"})
+	a.add(1*time.Hour, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": "Agent 1", "address_domain": aDomain})
+	aUsageDays := 3 + rng.Intn(10) // used it for a while before leaving
+	a.add(time.Duration(aUsageDays)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(aSubject, 0), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	a.add(time.Duration(aUsageDays)*24*time.Hour+time.Hour, "subject.deleted", event.Links{}, map[string]any{"mode": "permanent"}) // voluntary, unremarkable churn
+
+	// B signs up weeks later, sharing A's email, and behaves ordinarily —
+	// never deleted, no other signal.
+	bSubject := fmt.Sprintf("acct_gen_resignup_%03d_b", pairIdx)
+	bStart := aStart.Add(time.Duration(aUsageDays)*24*time.Hour + time.Duration(14+rng.Intn(30))*24*time.Hour)
+	b := newBuilder(bSubject, bStart)
+	bDomain := bSubject + ".example.test"
+	b.add(0, "subject.created", event.Links{EmailHash: sharedEmail}, map[string]any{"channel": "signup", "email_domain_class": "webmail", "identity_kind": "individual"})
+	agents := 1 + rng.Intn(2)
+	t := 10 * time.Minute
+	for i := 0; i < agents; i++ {
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": bDomain})
+		t += time.Duration(5+rng.Intn(10)) * time.Minute
+	}
+	sends := 1 + rng.Intn(3)
+	for i := 0; i < sends; i++ {
+		day := 1 + i
+		b.add(time.Duration(day)*24*time.Hour, "content.sent", event.Links{}, map[string]any{"recipient_domain": domainName(bSubject, i%3), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return []incarnation{
+		{events: a.events, label: labelFor(aSubject, "benign", "legit_resignup", "outcome", a.events)},
+		{events: b.events, label: labelFor(bSubject, "benign", "legit_resignup", "outcome", b.events)},
+	}
+}

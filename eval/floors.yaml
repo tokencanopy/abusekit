@@ -5,29 +5,48 @@
 # `make gate` runs `abusekit eval --dataset eval/fixtures/synthetic/
 # events.jsonl --labels eval/fixtures/synthetic/labels.jsonl --rule
 # new_account_velocity --scorer local --slice full --floors eval/
-# floors.yaml` and fails (exit 1) if any entry below is violated.
+# floors.yaml` and fails (exit 1) if any entry below is violated, or
+# exit 2 if the (rule, scorer, slice) being run has no matching entry at
+# all (fix round S1) or a value here is outside [0,1] (also S1).
 #
-# Values were set from the FIRST real run against the committed synthetic
-# corpus (2026-09-28, local weights as of config/local_weights.yaml at
-# that commit): precision 0.8276 (Wilson 95% low 0.7109), recall 0.8889
-# (Wilson 95% low 0.7781), ECE 0.1733. Each floor below is that run's own
-# number minus a small margin (design: "floor = lower interval bound of
-# the reference run") — precision/recall floors sit at or just below the
-# Wilson lower bound; the ECE ceiling sits a little above the observed
-# value, since ECE has no analogous one-sided interval computed here.
+# Values were set from the fix-round run against the committed synthetic
+# corpus (2026-09-29, post B1/B2/B3/S3 fixes — label-leakage closed,
+# slice chronology enforced, cassette misses fatal, the four new benign
+# counter-example families and per-family churn/burst/dormant jitter
+# added): precision 0.8305, recall 0.9074, ECE 0.1237, AUROC 0.9866,
+# high-tier recall 0.6852; family high-tier recall: burst 1.0 (6/6),
+# churn_incarnation_ge3 1.0 (18/18), dormant_then_blast 0.667 (4/6).
+#
+# Fix round S2: each floor below is that run's own number minus a SMALL
+# ABSOLUTE MARGIN (not the Wilson lower bound this file used before the
+# fix round — small per-family sample sizes, especially burst and
+# dormant_then_blast at n=6, make the Wilson bound alone too tight/noisy
+# a floor to re-derive every run). The margin is wider for the two n=6
+# families than for the corpus-wide metrics (n in the hundreds) for
+# exactly that reason.
 #
 # To raise a floor after a genuine improvement (a real weight retune, a
 # new calibration, a better scorer): re-run the command above, confirm
-# the new numbers, and move each floor up to (new Wilson low - a small
-# margin) / (new ECE + a small margin) — never past what was actually
-# observed, and never as a way to silence a regression rather than fix
-# one. Lowering a floor requires the same PR-review bar as any other
-# config change; it should never happen in the same PR that also
-# regresses the metric it's lowering.
+# the new numbers, and move each floor up to (new value - the same kind
+# of margin) — never past what was actually observed, and never as a way
+# to silence a regression rather than fix one. Lowering a floor requires
+# the same PR-review bar as any other config change; it should never
+# happen in the same PR that also regresses the metric it's lowering.
+#
+# Fix round S2's own weight-zeroing proof (zeroing each of the 18
+# config/local_weights.yaml weights, one at a time, and re-running this
+# exact command) is documented in the PR body, including which weight(s)
+# — if any — this floor set does not catch and why.
 floors:
   - rule: new_account_velocity
     scorer: local
     slice: full
-    min_precision: 0.68
-    min_recall: 0.75
-    max_ece: 0.22
+    min_precision: 0.75
+    min_recall: 0.85
+    max_ece: 0.16
+    min_auroc: 0.95
+    min_high_tier_recall: 0.60
+    family_min_high_tier_recall:
+      burst: 0.80
+      churn_incarnation_ge3: 0.85
+      dormant_then_blast: 0.45

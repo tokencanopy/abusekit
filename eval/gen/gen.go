@@ -102,7 +102,19 @@ var benignFamilies = []struct {
 	{"benign_newsletter_later_fanout", genNewsletterLaterFanout},
 	{"benign_slow_upgrader", genSlowUpgrader},
 	{"benign_trial_zero_dollar", genTrialZeroDollar},
+	// Fix round S3: two more benign counter-examples for features an
+	// abusive-only corpus would otherwise silently teach as damning on
+	// their own (prepaid funding, a decline before success).
+	{"benign_prepaid", genBenignPrepaid},
+	{"benign_decline_then_success", genBenignDeclineThenSuccess},
 }
+
+// benignGroupSize/benignGroupsPerKind size the two MULTI-subject benign
+// counter-example families (fix round S3) — genBenignSharedCardHousehold
+// and genBenignLegitResignup each produce more than one subject per call,
+// so they're driven by their own loop in Generate rather than
+// benignFamilies' one-subject-per-call shape.
+const benignGroupCount = 8
 
 var abusiveFamilies = []struct {
 	name string
@@ -162,6 +174,14 @@ func Generate(opts Options) Result {
 			for _, inc := range genChurnChain(rng, kind, chain, opts.ChurnChainLength) {
 				add("abusive_churn_"+kind, inc.events, inc.label)
 			}
+		}
+	}
+	for g := 0; g < benignGroupCount; g++ {
+		for _, inc := range genBenignSharedCardHousehold(rng, g) {
+			add("benign_shared_card_household", inc.events, inc.label)
+		}
+		for _, inc := range genBenignLegitResignup(rng, g) {
+			add("benign_legit_resignup", inc.events, inc.label)
 		}
 	}
 
