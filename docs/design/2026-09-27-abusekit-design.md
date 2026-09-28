@@ -166,22 +166,37 @@ method \n path?query \n timestamp \n key_id \n nonce \n sha256(body)))` **[S3: n
 signed payload]**. Timestamp within ±5 min; constant-time compare; the same scheme covers every
 endpoint including GET (body hash of the empty string). Key scopes: `events`, `labels`, `read`,
 `backfill`. A producer key has `events` only; label keys are issued to the operator UI; `backfill`
-skips the clock-skew check and never fires webhooks.
+never fires webhooks. **[R5, round 2]** `backfill`'s timestamp-freshness exemption is scoped to POST
+`/v1/events` only, and bounded rather than unconditional: ±24 h there (matching this design's other
+backfill-adjacent tolerances), not "skip the check entirely" — a `backfill`-scoped key calling any
+OTHER endpoint (a read, an evaluate, a label) uses the ordinary ±5 min window like any other key,
+since there is no legitimate reason for a backdated timestamp anywhere but a historical event
+import. An unconditional exemption on every endpoint meant a captured `backfill`-scoped request's
+signature (for whichever endpoint that key could reach) never aged out on timestamp grounds at all —
+nonce-replay protection alone stood between it and reuse forever.
 
 **[S3] Nonce and replay window:** the timestamp alone does not prevent replay — a captured request
-stays valid to resend for the whole ±5 min it remains "fresh" by the check above. The nonce is a
-per-request random value the server remembers per `(key, nonce)` for at least as long as that
-request's own timestamp could still independently pass the freshness check: `max(received_at,
-timestamp) + 5 min` for an ordinary key. This is `received_at`-anchored rather than a fixed window
-from the timestamp alone, because a request signed near the future edge of the ±5 min window (e.g.
-timestamp = now+4 min) would otherwise have its replay record expire only 1 minute after the
-timestamp itself, while the timestamp remained independently acceptable for a further 4 minutes —
-letting the SAME request be replayed again once the record (but not the timestamp's own validity)
-had lapsed. A `backfill`-scoped key skips the timestamp-freshness check entirely, so it has no
-timestamp-derived bound to anchor a replay record to at all; it instead gets a flat 24 h replay
-window from `received_at`, matching this design's own ±24 h backfill-adjacent tolerance elsewhere. A
-caller retrying a request (e.g. after a `5xx`) must sign the retry with a FRESH nonce — reusing the
-original request's nonce makes a legitimate retry indistinguishable from a replay.
+stays valid to resend for the whole freshness window it remains valid under the check above. The
+nonce is a per-request random value the server remembers per `(key, nonce)` for at least as long as
+that request's own timestamp could still independently pass the freshness check: `max(received_at,
+timestamp) + window`, where `window` is the SAME ±5 min (ordinary key) or ±24 h (`backfill`-scoped
+key on `/v1/events` — **[R5, round 2]** amended from a flat, `received_at`-only 24 h window to this
+same `max(...)` form) the timestamp was just checked against. This is `received_at`-anchored rather
+than a fixed window from the timestamp alone, because a request signed near the future edge of its
+window (e.g. timestamp = now+`window`-1 min) would otherwise have its replay record expire only 1
+minute after the timestamp itself, while the timestamp remained independently acceptable for the
+rest of that window — letting the SAME request be replayed again once the record (but not the
+timestamp's own validity) had lapsed; this held for the ordinary ±5 min case from S3 onward, and
+**[R5, round 2]** the previous flat `received_at`-only backfill formula reintroduced exactly this
+gap once backfill's window became bounded rather than unconditional, which is why both cases now
+share one formula. A caller retrying a request (e.g. after a `5xx`) must sign the retry with a FRESH
+nonce — reusing the original request's nonce makes a legitimate retry indistinguishable from a
+replay. **[R5, round 2]** A nonce is also bounded in length now (16–64 hex-encoded bytes, i.e. 32–128
+hex characters) — rejected past the upper bound before any signature verification is attempted — and
+is only recorded into the replay cache once the caller's key is confirmed to hold the scope the
+endpoint requires; a request that authenticates but is denied for lacking scope never consumes its
+nonce, so a caller can retry the identical nonce once properly scoped instead of being permanently
+told "replay detected" for an attempt that never actually succeeded at anything.
 
 Event: `{id (required, ≤64), subject (≤256), type ([a-z_.]+ ≤64), at (RFC3339 UTC, ±24 h unless
 backfill scope), links? {email_hash?, card_fingerprint_hash?, ip24_hash?, asn?, ua_hash?,

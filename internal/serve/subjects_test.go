@@ -254,6 +254,29 @@ func TestEvaluate_TrailingDataRejected(t *testing.T) {
 	}
 }
 
+// TestEvaluate_TrailingCloseBracketRejected is R6 (round 2 fix round):
+// `{"deadline_ms":1000}}` — a stray closing brace tacked on after an
+// otherwise-complete, otherwise-valid value — must be rejected too.
+// json.Decoder.More() (the OLD check) does NOT catch this: More()'s own
+// documented job is "is there another element in the array/object
+// currently being parsed", and its implementation treats a bare `}` or `]`
+// as "the enclosing structure just ended", not as "there is more input" —
+// so this exact shape sailed through undetected before this fix.
+func TestEvaluate_TrailingCloseBracketRejected(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+	postEvents(t, ts, now, eventJSON("evt-td-2", "acct_eval_trailing_brace", "subject.created", now.Format(time.RFC3339), nil))
+
+	body := []byte(`{"deadline_ms": 1000}}`)
+	req := signedRequest(t, ts.TS, "POST", "/v1/subjects/acct_eval_trailing_brace/evaluate", body, ts.Keys.Operator, now)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httpDo(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a trailing `}` after an otherwise-valid JSON value", resp.StatusCode)
+	}
+}
+
 // TestEvaluate_WrongContentTypeWhenBodyPresent is S4: a body actually
 // present with a non-JSON Content-Type is rejected, matching events/
 // labels — but a request with NO body at all needs no Content-Type

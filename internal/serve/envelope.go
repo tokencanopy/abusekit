@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 )
 
 // apiError is design §4.3's one error envelope shape:
@@ -35,6 +37,13 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, messag
 }
 
 func writeAuthError(w http.ResponseWriter, r *http.Request, e *authError) {
+	// R4 (round 2 fix round): a rate-limited (429) authError carries a real
+	// RetryAfter — matches writeRateLimited/writeSubjectBusy's own
+	// Retry-After convention rather than leaving a 429 with no hint at all.
+	if e.RetryAfter > 0 {
+		retryAfter := e.RetryAfter
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds()+0.999)))
+	}
 	writeError(w, r, e.Status, e.Code, e.Message, nil)
 }
 
@@ -90,20 +99,52 @@ var errTrailingData = errors.New("body has trailing data after the JSON value")
 // rejecting unknown fields (json.Decoder.DisallowUnknownFields — api-
 // design's "reject unknown fields on writes") AND any trailing bytes after
 // that value (S4 fix round: `{"a":1}{"a":2}` or `{"a":1}garbage` previously
-// decoded the FIRST value and silently ignored the rest — dec.More()
-// after Decode catches both). Used by every endpoint that accepts a JSON
-// body (events' per-batch decode has its own copy of this same
-// discipline, since it decodes a slice rather than one struct).
+// decoded the FIRST value and silently ignored the rest).
+//
+// R6 (round 2 fix round): checks dec.Token() == io.EOF after Decode, not
+// dec.More() — More()'s own documented job is reporting whether there is
+// another ELEMENT within the array/object currently being parsed (the
+// token-by-token streaming use case), and its implementation treats a bare
+// `}` or `]` as "the enclosing structure just ended", not as "there is
+// more input" — so a body like `{"a":1}}` or `{"a":1}]` (a stray closing
+// bracket tacked on after an otherwise-complete, otherwise-valid value)
+// sailed straight through dec.More()'s check undetected. Token() returning
+// exactly io.EOF is the only way to confirm the stream is genuinely
+// exhausted after the one decoded value; anything else — a real second
+// value, or a lone trailing bracket, or outright garbage — is trailing
+// data. Used by every endpoint that accepts a JSON body (events' per-batch
+// decode has its own copy of this same discipline, since it decodes a
+// slice rather than one struct).
 func decodeStrictJSON(body []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err
 	}
-	if dec.More() {
+	if _, err := dec.Token(); err != io.EOF {
 		return errTrailingData
 	}
 	return nil
+}
+
+// headerTrackingWriter wraps an http.ResponseWriter to record whether a
+// response has already started (an explicit WriteHeader, or an implicit
+// 200 via the first Write) — recoverMiddleware (R8, round 2 fix round)
+// uses this to know whether it's still safe to write the error envelope
+// after a panic.
+type headerTrackingWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+func (w *headerTrackingWriter) WriteHeader(status int) {
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *headerTrackingWriter) Write(b []byte) (int, error) {
+	w.wroteHeader = true
+	return w.ResponseWriter.Write(b)
 }
 
 // recoverMiddleware turns a panicking handler into a clean 500 envelope
@@ -112,15 +153,39 @@ func decodeStrictJSON(body []byte, v any) error {
 // the stack and closes the connection, but sends no body at all). The
 // panic value is logged server-side with the request id for correlation;
 // the response body itself never contains it or a stack trace.
+//
+// R8 (round 2 fix round), two fixes:
+//   - http.ErrAbortHandler re-panics instead of being turned into an
+//     ordinary 500. It's net/http's own sentinel for "abort this handler
+//     without logging or writing anything" — net/http's Server checks for
+//     it BY IDENTITY before deciding whether to log a recovered panic at
+//     all. Swallowing it here and writing a 500 defeated that contract for
+//     any caller relying on it (a hijacked connection, a deliberately
+//     aborted long-lived stream) — it now propagates unchanged to
+//     net/http's own per-connection recovery.
+//   - the error envelope is only written if the handler hadn't already
+//     started a response (headerTrackingWriter, above) — writing it
+//     otherwise would be a silently-dropped superfluous WriteHeader call
+//     at best, or JSON appended after already-sent bytes at worst,
+//     corrupting a response body a client may already be reading.
 func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tw := &headerTrackingWriter{ResponseWriter: w}
 		defer func() {
-			if rec := recover(); rec != nil {
-				s.log().Error("serve: panic recovered", "panic", rec, "request_id", requestID(r), "path", r.URL.Path)
-				writeError(w, r, http.StatusInternalServerError, "internal", "internal error", nil)
+			rec := recover()
+			if rec == nil {
+				return
 			}
+			if rec == http.ErrAbortHandler {
+				panic(rec)
+			}
+			s.log().Error("serve: panic recovered", "panic", rec, "request_id", requestID(r), "path", r.URL.Path)
+			if tw.wroteHeader {
+				return
+			}
+			writeError(tw, r, http.StatusInternalServerError, "internal", "internal error", nil)
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(tw, r)
 	})
 }
 

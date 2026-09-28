@@ -284,30 +284,33 @@ func loadShippedBrands(t *testing.T) feature.BrandSet {
 // endpoint specifically, which a read-only key can't exercise since it'd
 // 403 on scope before ever reaching the tenant check), and a backfill key.
 type testKeys struct {
-	Producer    config.Key // tenant e2a, scope events
-	Operator    config.Key // tenant e2a, scope read+labels
-	Other       config.Key // tenant other-tenant, scope read
-	OtherLabels config.Key // tenant other-tenant, scope labels
-	Backfill    config.Key // tenant e2a, scope events+backfill
+	Producer     config.Key // tenant e2a, scope events
+	Operator     config.Key // tenant e2a, scope read+labels
+	Other        config.Key // tenant other-tenant, scope read
+	OtherLabels  config.Key // tenant other-tenant, scope labels
+	Backfill     config.Key // tenant e2a, scope events+backfill
+	BackfillRead config.Key // tenant e2a, scope events+read+backfill (R5, round 2 fix round: proves the widened backfill timestamp window is events-only, not scope-wide)
 }
 
 func fixedTestKeys() testKeys {
 	return testKeys{
-		Producer:    config.Key{ID: "test_producer", Secret: "test-producer-secret", Tenant: testTenant, Producer: "test-producer", Scopes: map[config.Scope]bool{config.ScopeEvents: true}},
-		Operator:    config.Key{ID: "test_operator", Secret: "test-operator-secret", Tenant: testTenant, Scopes: map[config.Scope]bool{config.ScopeRead: true, config.ScopeLabels: true}},
-		Other:       config.Key{ID: "test_other_tenant", Secret: "test-other-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeRead: true}},
-		OtherLabels: config.Key{ID: "test_other_tenant_labels", Secret: "test-other-labels-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeLabels: true}},
-		Backfill:    config.Key{ID: "test_backfill", Secret: "test-backfill-secret", Tenant: testTenant, Producer: "test-backfiller", Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeBackfill: true}},
+		Producer:     config.Key{ID: "test_producer", Secret: "test-producer-secret", Tenant: testTenant, Producer: "test-producer", Scopes: map[config.Scope]bool{config.ScopeEvents: true}},
+		Operator:     config.Key{ID: "test_operator", Secret: "test-operator-secret", Tenant: testTenant, Scopes: map[config.Scope]bool{config.ScopeRead: true, config.ScopeLabels: true}},
+		Other:        config.Key{ID: "test_other_tenant", Secret: "test-other-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeRead: true}},
+		OtherLabels:  config.Key{ID: "test_other_tenant_labels", Secret: "test-other-labels-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeLabels: true}},
+		Backfill:     config.Key{ID: "test_backfill", Secret: "test-backfill-secret", Tenant: testTenant, Producer: "test-backfiller", Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeBackfill: true}},
+		BackfillRead: config.Key{ID: "test_backfill_read", Secret: "test-backfill-read-secret", Tenant: testTenant, Producer: "test-backfill-read", Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeRead: true, config.ScopeBackfill: true}},
 	}
 }
 
 func (k testKeys) asMap() map[string]config.Key {
 	return map[string]config.Key{
-		k.Producer.ID:    k.Producer,
-		k.Operator.ID:    k.Operator,
-		k.Other.ID:       k.Other,
-		k.OtherLabels.ID: k.OtherLabels,
-		k.Backfill.ID:    k.Backfill,
+		k.Producer.ID:     k.Producer,
+		k.Operator.ID:     k.Operator,
+		k.Other.ID:        k.Other,
+		k.OtherLabels.ID:  k.OtherLabels,
+		k.Backfill.ID:     k.Backfill,
+		k.BackfillRead.ID: k.BackfillRead,
 	}
 }
 

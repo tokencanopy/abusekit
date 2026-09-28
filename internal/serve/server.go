@@ -32,12 +32,23 @@ const MaxOtherBody = 64 << 10
 // defaultPerAdapterDailyBudget/defaultPerTenantDailyBudget).
 const DefaultEventsPerKeyPerSecond = 50
 
-// DefaultPreAuthPerIPPerSecond is S3 fix round's coarse, cheap guard
-// applied to every request BEFORE authentication, keyed on the remote IP —
-// bounding how much HMAC-verification work an unauthenticated flood can
-// force this process to do, independent of (and much more generous than)
+// DefaultPreAuthPerIPPerSecond is S3 fix round's coarse, cheap guard,
+// keyed on the remote IP — independent of (and much more generous than)
 // any per-key limit that only applies once a request actually
 // authenticates.
+//
+// R4 (round 2 fix round): consumed ONLY on a FAILED authentication
+// (authenticate's own 401 path — see authenticate's doc comment), never on
+// a successful one. Proven necessary: gating every request BEFORE
+// authenticate ran at all — this limiter's original S3 shape — meant an
+// IP that had racked up a bucket's worth of garbage/replayed requests
+// could no longer authenticate as a REAL producer sharing that IP (a NAT
+// gateway, a corporate proxy) even with a perfectly valid signed request,
+// since the 429 fired before the signature was ever checked. Counting
+// only failures turns this into a fail2ban-style guard against floods
+// of UNAUTHENTICATED traffic specifically, while a request that would
+// actually authenticate is never touched by it, no matter how exhausted
+// that IP's bucket is.
 const DefaultPreAuthPerIPPerSecond = 200
 
 // EvaluateRateLimit is design §4.4's "rate-limited per subject (1/s)".
@@ -216,8 +227,14 @@ func errRequired(field string) error { return requiredErr(field) }
 // withRequestID (every response, including a 404/429 before any handler
 // runs, gets a resolved X-Request-Id) → recoverMiddleware (S7 fix round: a
 // panicking handler becomes a clean 500 envelope, never a raw stack trace
-// or a bare connection drop) → the coarse per-IP pre-auth limiter (S3 fix
-// round) → the mux itself.
+// or a bare connection drop) → the mux itself.
+//
+// R4 (round 2 fix round): the coarse per-IP pre-auth limiter that used to
+// wrap the mux HERE, gating every request before any handler (and
+// therefore before authenticate ran at all), is gone — see
+// DefaultPreAuthPerIPPerSecond's doc comment for why. It's now consulted
+// from inside authenticate itself, only once a request has already failed
+// to authenticate.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", s.handleEvents)
@@ -227,28 +244,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("/", s.handleNotFound)
 
-	return withRequestID(s.recoverMiddleware(s.preAuthMiddleware(mux)))
-}
-
-// preAuthMiddleware is S3 fix round's coarse, cheap per-IP guard, applied
-// BEFORE any handler (and therefore before any authenticate call spends
-// HMAC-verification work) — proven necessary: without it, an
-// unauthenticated flood of requests (garbage or replayed signatures, any
-// key id) could force unbounded signature-verification work, and a flood
-// carrying a REAL producer's key id in X-Abusekit-Key specifically could
-// exhaust that key's OWN per-key bucket before ever proving it holds the
-// matching secret — starving the real producer without ever authenticating
-// as them. This limiter is deliberately coarse (IP, not key) and generous
-// (DefaultPreAuthPerIPPerSecond) — the precise per-key/per-subject limits
-// in events.go/subjects.go run AFTER authenticate succeeds.
-func (s *Server) preAuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ok, retryAfter := s.preAuthLimiter.Allow(clientIP(r), s.now()); !ok {
-			writeRateLimited(w, r, retryAfter)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return withRequestID(s.recoverMiddleware(mux))
 }
 
 // handleNotFound is the catch-all for any path the mux itself didn't

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,10 +221,13 @@ func TestAuth_FutureTimestampReplayBlockedPastOldExpiry(t *testing.T) {
 	}
 }
 
-// TestAuth_BackfillReplayBlockedWellPastSkewWindow is B1: a backfill-scoped
-// key's replay protection must not depend on TimestampSkew at all (that
-// check is skipped entirely for backfill) — a replay attempt long after
-// the ordinary 5-minute window (here, 5m01s later) must still be rejected.
+// TestAuth_BackfillReplayBlockedWellPastSkewWindow is B1 (updated by R5,
+// round 2 fix round, for BackfillEventsTimestampWindow's now-bounded ±24h
+// backfill window on POST /v1/events, replacing the old "skips the clock-
+// skew check entirely"): a backfill-scoped key's replay protection must
+// not depend on the ORDINARY TimestampSkew at all — a replay attempt long
+// after the ordinary 5-minute window (here, 5m01s later), but still well
+// within the wider backfill window, must still be rejected.
 func TestAuth_BackfillReplayBlockedWellPastSkewWindow(t *testing.T) {
 	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
 	nonce := mustNonce(t)
@@ -251,7 +255,10 @@ func TestAuth_BackfillReplayBlockedWellPastSkewWindow(t *testing.T) {
 	body := []byte(`{"events":[{"id":"evt-backfill-replay","subject":"acct_x","type":"subject.created","at":"2030-01-01T00:00:00Z"}]}`)
 
 	serverNow = now
-	oldTimestamp := now.Add(-72 * time.Hour) // arbitrary, well outside ±5min -- fine, backfill skips that check
+	// Well outside ±5min (the ordinary skew), but within R5's ±24h
+	// BackfillEventsTimestampWindow — a realistic historical-backfill
+	// timestamp, not one so old it would now be rejected outright.
+	oldTimestamp := now.Add(-20 * time.Hour)
 	req1 := signedRequestWithNonce(t, ts, "POST", "/v1/events", body, key, oldTimestamp, nonce)
 	resp1 := httpDo(t, req1)
 	resp1.Body.Close()
@@ -349,5 +356,227 @@ func TestAuth_CrossTenantReadIs404NotForbidden(t *testing.T) {
 	defer resp2.Body.Close()
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("same-tenant read status = %d, want 200", resp2.StatusCode)
+	}
+}
+
+// TestAuth_PreAuthLimiterOnlyCountsFailedAuthentications is R4 (round 2 fix
+// round)'s literal repro: a flood of FAILED-auth requests from one IP must
+// never block a LATER, correctly-signed request from that same IP — the
+// pre-auth bucket only ever consumes on a failure, never a success. Before
+// this fix, the pre-auth limiter consumed a slot for EVERY request
+// (successful or not) BEFORE authenticate ever ran, so exhausting the
+// bucket with garbage also meant a real producer sharing that IP (a NAT
+// gateway, a corporate proxy) got 429'd on a perfectly valid signed
+// request too.
+func TestAuth_PreAuthLimiterOnlyCountsFailedAuthentications(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+
+	// 300 unauthenticated requests (unknown key id) — well past
+	// serve.DefaultPreAuthPerIPPerSecond (200) — from the same IP
+	// (httptest.Server requests are all loopback, so they naturally share
+	// one clientIP). Each is expected to fail auth outright: 401 while the
+	// bucket still has room, 429 once it's been exhausted by this very
+	// flood — both are fine here, this loop is only building up the
+	// failure count the fix must not let leak onto a real request.
+	for i := 0; i < 300; i++ {
+		req, _ := http.NewRequest("GET", ts.TS.URL+"/v1/subjects/acct_1", nil)
+		req.Header.Set("X-Abusekit-Key", "not_a_real_key")
+		req.Header.Set("X-Abusekit-Timestamp", now.Format(time.RFC3339))
+		req.Header.Set("X-Abusekit-Signature", "0000")
+		resp := httpDo(t, req)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d: status = %d, want 401 or 429", i, resp.StatusCode)
+		}
+	}
+
+	// A real, correctly-signed request from the SAME IP right afterward
+	// must NOT be rate-limited — it authenticates and falls through to the
+	// ordinary 404 (the subject just doesn't exist), never a 429.
+	req := signedRequest(t, ts.TS, "GET", "/v1/subjects/never_seen_preauth", nil, ts.Keys.Operator, now)
+	resp := httpDo(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		t.Fatalf("a validly-signed request was rate-limited (429) after 300 failed attempts from the same IP")
+	}
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (authenticated, subject just doesn't exist)", resp.StatusCode)
+	}
+}
+
+// TestAuth_OversizedNonceUnauthenticated is R5 (round 2 fix round): a
+// nonce past MaxNonceHexLen is rejected outright, the same as one too
+// short — bounding the cost of hex-validating/hashing an adversarially
+// oversized header value.
+func TestAuth_OversizedNonceUnauthenticated(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+
+	oversized := strings.Repeat("a", serve.MaxNonceHexLen+2)
+	req := signedRequestWithNonce(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now, oversized)
+	resp := httpDo(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for a nonce past MaxNonceHexLen", resp.StatusCode)
+	}
+}
+
+// TestAuth_BackfillWidenedWindowIsEventsOnly is R5 (round 2 fix round): a
+// backfill-scoped key's widened ±24h timestamp window applies ONLY to POST
+// /v1/events — the SAME key, SAME old timestamp, against a DIFFERENT
+// endpoint it also has scope for, must use the ordinary ±5min skew and be
+// rejected.
+func TestAuth_BackfillWidenedWindowIsEventsOnly(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+
+	// Within BackfillEventsTimestampWindow (24h) but well outside the
+	// ordinary ±5min TimestampSkew.
+	old := now.Add(-20 * time.Hour)
+
+	body, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		eventJSON("evt-backfill-window", "acct_backfill_window", "subject.created", now.Format(time.RFC3339), nil),
+	}})
+	eventsReq := signedRequest(t, ts.TS, "POST", "/v1/events", body, ts.Keys.BackfillRead, old)
+	eventsResp := httpDo(t, eventsReq)
+	defer eventsResp.Body.Close()
+	if eventsResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /v1/events with a %v-old backfill-scoped timestamp: status = %d, want 202 (within the widened events-only window)", now.Sub(old), eventsResp.StatusCode)
+	}
+
+	readReq := signedRequest(t, ts.TS, "GET", "/v1/subjects/acct_backfill_window", nil, ts.Keys.BackfillRead, old)
+	readResp := httpDo(t, readReq)
+	defer readResp.Body.Close()
+	if readResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("GET /v1/subjects with the SAME backfill key and the SAME %v-old timestamp: status = %d, want 401 (ordinary ±5min skew applies outside /v1/events)", now.Sub(old), readResp.StatusCode)
+	}
+}
+
+// TestAuth_ScopeDenialDoesNotBurnNonce is R5 (round 2 fix round): a request
+// rejected for lacking scope (403 — a real, identified key's own mistake,
+// not anonymous flood traffic) must not consume its nonce in the replay
+// cache — the SAME nonce, freshly signed for an endpoint the key DOES have
+// scope for, must still succeed rather than hitting "replay detected".
+func TestAuth_ScopeDenialDoesNotBurnNonce(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+	nonce := mustNonce(t)
+
+	// ts.Keys.Operator has read+labels, NOT events — POST /v1/events must
+	// be forbidden.
+	body, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		eventJSON("evt-scope-denial", "acct_scope_denial", "subject.created", now.Format(time.RFC3339), nil),
+	}})
+	forbiddenReq := signedRequestWithNonce(t, ts.TS, "POST", "/v1/events", body, ts.Keys.Operator, now, nonce)
+	forbiddenResp := httpDo(t, forbiddenReq)
+	forbiddenResp.Body.Close()
+	if forbiddenResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (Operator key lacks events scope)", forbiddenResp.StatusCode)
+	}
+
+	// The SAME nonce, freshly signed for a DIFFERENT request (a different
+	// method+path changes the signature, but the nonce header is reused
+	// verbatim) that Operator DOES have scope for, must authenticate
+	// normally — not "replay detected".
+	readReq := signedRequestWithNonce(t, ts.TS, "GET", "/v1/subjects/never_seen_scope_denial", nil, ts.Keys.Operator, now, nonce)
+	readResp := httpDo(t, readReq)
+	defer readResp.Body.Close()
+	if readResp.StatusCode == http.StatusUnauthorized {
+		t.Fatalf("reusing a nonce from a SCOPE-DENIED (403) attempt was rejected as a replay; scope denials must not burn the nonce")
+	}
+	if readResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (authenticated, subject just doesn't exist)", readResp.StatusCode)
+	}
+}
+
+// TestAuth_UniformMessageForEveryPreScopeFailure is R7 (round 2 fix
+// round): every failure that happens BEFORE the scope check — missing
+// headers, a malformed nonce, an unknown key, a malformed timestamp, a
+// timestamp outside the accepted window, and a bad signature — must return
+// the IDENTICAL 401 message, not a distinct one per cause. Before this
+// fix, a caller probing a request could tell how many of (key id exists,
+// timestamp is well-formed, timestamp is fresh, signature matches) it got
+// right from which distinct message came back.
+func TestAuth_UniformMessageForEveryPreScopeFailure(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	ts := newTestServer(t, now)
+
+	const wantMessage = "invalid key or signature"
+	type envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	decode := func(t *testing.T, resp *http.Response) envelope {
+		t.Helper()
+		var e envelope
+		if err := json.NewDecoder(resp.Body).Decode(&e); err != nil {
+			t.Fatalf("decode error envelope: %v", err)
+		}
+		return e
+	}
+
+	cases := []struct {
+		name string
+		req  *http.Request
+	}{
+		{
+			name: "missing headers",
+			req: func() *http.Request {
+				req, _ := http.NewRequest("GET", ts.TS.URL+"/v1/subjects/acct_1", nil)
+				return req
+			}(),
+		},
+		{
+			name: "malformed nonce (too short)",
+			req:  signedRequestWithNonce(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now, "ab"),
+		},
+		{
+			name: "unknown key",
+			req: func() *http.Request {
+				req := signedRequest(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now)
+				req.Header.Set(serve.HeaderKey, "no_such_key")
+				return req
+			}(),
+		},
+		{
+			name: "malformed timestamp",
+			req: func() *http.Request {
+				req := signedRequest(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now)
+				req.Header.Set(serve.HeaderTimestamp, "not-a-timestamp")
+				return req
+			}(),
+		},
+		{
+			name: "timestamp outside accepted window",
+			req:  signedRequest(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now.Add(-10*time.Minute)),
+		},
+		{
+			name: "bad signature",
+			req: func() *http.Request {
+				req := signedRequest(t, ts.TS, "GET", "/v1/subjects/acct_1", nil, ts.Keys.Operator, now)
+				req.Header.Set(serve.HeaderSignature, "deadbeef")
+				return req
+			}(),
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := httpDo(t, c.req)
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.StatusCode)
+			}
+			e := decode(t, resp)
+			if e.Error.Code != "unauthenticated" {
+				t.Fatalf("code = %q, want unauthenticated", e.Error.Code)
+			}
+			if e.Error.Message != wantMessage {
+				t.Fatalf("message = %q, want uniform %q", e.Error.Message, wantMessage)
+			}
+		})
 	}
 }
