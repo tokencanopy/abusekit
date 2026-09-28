@@ -86,7 +86,17 @@ func (e *ErrClaimAmbiguous) Unwrap() error { return e.Err }
 // real RetryAt) if it exists and is scorable but couldn't be claimed right
 // now.
 func (s *Store) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject string, now time.Time) (DirtySubject, error) {
-	claimedUntil := now.Add(s.claimLeaseOrDefault())
+	// Follow-up (CI red on Linux): truncated to microsecond precision up
+	// front, before it's ever used as a write parameter — timestamptz can
+	// only store microseconds, and this is the ONE value ErrClaimAmbiguous
+	// below has any hope of comparing correctly later (the commit's own
+	// outcome is what's ambiguous, so there is no RETURNING value to read
+	// back in that specific path). Truncating before the write guarantees
+	// this exact Go value is bit-for-bit what Postgres would store if the
+	// commit did land — see ReleaseClaim's own doc comment for the fuller
+	// explanation of why an untruncated nanosecond-bearing value could
+	// mismatch what a later compare-and-clear finds in the row.
+	claimedUntil := now.Add(s.claimLeaseOrDefault()).Truncate(time.Microsecond)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -130,29 +140,43 @@ func (s *Store) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject str
 		return DirtySubject{}, &ErrBusy{RetryAt: retryAt}
 	}
 
-	cmdTag, err := tx.Exec(ctx, `
+	// Follow-up (CI red on Linux): RETURNING the value Postgres actually
+	// stored, rather than trusting the Go-side claimedUntil parameter to
+	// have round-tripped byte-for-byte through its own encoding — see this
+	// function's own comment on claimedUntil, and ReleaseClaim's doc
+	// comment, for the full story. d.ClaimedUntil is set from THIS scanned
+	// value below, not the Go-side one, whenever the UPDATE (and therefore
+	// the RETURNING clause) actually ran.
+	var stored time.Time
+	err = tx.QueryRow(ctx, `
 		UPDATE subjects SET claimed_until = $1
 		WHERE tenant = $2 AND subject = $3
 		  AND (claimed_until IS NULL OR claimed_until < $4)
 		  AND (next_attempt_at IS NULL OR next_attempt_at <= $4)
-	`, claimedUntil, tenant, subject, now)
+		RETURNING claimed_until
+	`, claimedUntil, tenant, subject, now).Scan(&stored)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Lost a race against a concurrent claimant between the SELECT
+			// above and this UPDATE — report busy with a short,
+			// conservative retry rather than failing outright; the exact
+			// remaining lease isn't known at this point (the other
+			// claimant just set it), so a caller retries shortly rather
+			// than being told a stale time.
+			return DirtySubject{}, &ErrBusy{RetryAt: now.Add(time.Second)}
+		}
 		return DirtySubject{}, fmt.Errorf("store: claim subject %s for evaluate: %w", subject, err)
-	}
-	if cmdTag.RowsAffected() == 0 {
-		// Lost a race against a concurrent claimant between the SELECT
-		// above and this UPDATE — report busy with a short, conservative
-		// retry rather than failing outright; the exact remaining lease
-		// isn't known at this point (the other claimant just set it), so a
-		// caller retries shortly rather than being told a stale time.
-		return DirtySubject{}, &ErrBusy{RetryAt: now.Add(time.Second)}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		// R2 (round 2 fix round): wrap distinctly from the other error
-		// paths above — see ErrClaimAmbiguous.
+		// paths above — see ErrClaimAmbiguous. No RETURNING value survives
+		// an uncertain commit (we never got a response either way), so
+		// this uses the truncated Go-side claimedUntil instead of stored —
+		// see claimedUntil's own comment for why that's still safe to
+		// compare against later.
 		return DirtySubject{}, &ErrClaimAmbiguous{Err: fmt.Errorf("store: commit evaluate-claim transaction: %w", err), ClaimedUntil: claimedUntil}
 	}
-	d.ClaimedUntil = claimedUntil
+	d.ClaimedUntil = stored
 	return d, nil
 }

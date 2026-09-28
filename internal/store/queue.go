@@ -130,7 +130,13 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 		limit = DefaultClaimBatchSize
 	}
 	newSubjectCutoff := now.Add(-newSubjectAge)
-	claimedUntil := now.Add(s.claimLeaseOrDefault())
+	// Truncated to microsecond precision (timestamptz's own limit) before
+	// ever being used as a write parameter, matching
+	// ClaimSubjectForEvaluate's own fix for the same class of issue — kept
+	// even though the RETURNING clause below is this method's primary
+	// defense, since it's also the fallback value if that RETURNING result
+	// set ever comes back empty (see below).
+	claimedUntil := now.Add(s.claimLeaseOrDefault()).Truncate(time.Microsecond)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -162,17 +168,43 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 			tenants[i] = d.Tenant
 			subjects[i] = d.Subject
 		}
-		if _, err := tx.Exec(ctx, `
+		// Follow-up (CI red on Linux): RETURNING the value Postgres actually
+		// stored, rather than trusting the Go-side claimedUntil to survive
+		// its own round trip byte-for-byte — timestamptz is microsecond
+		// precision, and a bare time.Time parameter's encoding path isn't
+		// guaranteed to truncate identically on every OS/driver combination
+		// (a Linux CI run surfaced exactly this: the value ReleaseClaim
+		// later compared against didn't match what got stored, even though
+		// both sides used "the same" Go value — see ReleaseClaim's own doc
+		// comment for the full explanation). Every row in one batch shares
+		// the identical claimed_until, so reading it back off any one
+		// returned row is authoritative for all of them.
+		rows, err := tx.Query(ctx, `
 			UPDATE subjects s SET claimed_until = $1
 			FROM unnest($2::text[], $3::text[]) AS c(tenant, subject)
 			WHERE s.tenant = c.tenant AND s.subject = c.subject
-		`, claimedUntil, tenants, subjects); err != nil {
+			RETURNING s.claimed_until
+		`, claimedUntil, tenants, subjects)
+		if err != nil {
 			return nil, fmt.Errorf("store: set claimed_until: %w", err)
 		}
-		// T3 (round 3): stamp the exact value just set so a caller's later
-		// ReleaseClaim call can compare-and-clear against it.
+		storedClaims, err := pgx.CollectRows(rows, pgx.RowTo[time.Time])
+		if err != nil {
+			return nil, fmt.Errorf("store: collect returned claimed_until: %w", err)
+		}
+		// Every row in the batch shares the identical claimed_until (one
+		// $1 parameter for the whole UPDATE) — any one of them is
+		// authoritative for all of out. storedClaims is empty only if
+		// every candidate lost a claim race between being SELECTed above
+		// and this UPDATE (SKIP LOCKED already makes that vanishingly
+		// unlikely, but fall back to the Go-side value rather than panic
+		// if it ever happens).
+		stored := claimedUntil
+		if len(storedClaims) > 0 {
+			stored = storedClaims[0]
+		}
 		for i := range out {
-			out[i].ClaimedUntil = claimedUntil
+			out[i].ClaimedUntil = stored
 		}
 	}
 
@@ -228,6 +260,22 @@ func queryClaimCandidates(ctx context.Context, tx pgx.Tx, query string, now, new
 // from under it. A caller that never actually held a claim (claimedUntil
 // is the zero value, or simply doesn't match what's in the row) safely
 // no-ops here instead.
+//
+// claimedUntil PRECISION (CI red on Linux, follow-up to T3): timestamptz
+// stores microsecond precision; Go's time.Time carries nanoseconds, and a
+// real wall-clock-derived value can carry a nonzero sub-microsecond
+// remainder that a round trip through Postgres silently drops (macOS's
+// own clock reads happened to mask this locally, which is how it first
+// shipped). Both claim methods now hand this method a value that is
+// EITHER read back from Postgres itself via a RETURNING clause
+// (ClaimDirtySubjects, ClaimSubjectForEvaluate's normal success path —
+// see their own comments) OR truncated to time.Microsecond before it was
+// ever used as a write parameter in the first place
+// (ClaimSubjectForEvaluate's ErrClaimAmbiguous path, where no RETURNING
+// value exists to read back because the commit's own outcome is what's
+// uncertain) — either way, guaranteed to be exactly what a matching row
+// would have stored, never a nanosecond-bearing value that could silently
+// fail this WHERE clause's equality check against it.
 func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string, claimedUntil time.Time) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE subjects SET claimed_until = NULL WHERE tenant = $1 AND subject = $2 AND claimed_until = $3

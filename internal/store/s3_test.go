@@ -208,6 +208,57 @@ func TestReleaseClaim_DoesNotClearANewerLease(t *testing.T) {
 	}
 }
 
+// TestClaimSubjectForEvaluate_ClaimedUntilIsMicrosecondPrecise is a
+// follow-up to T3 (CI red on Linux, 4609030): timestamptz stores
+// microsecond precision, but a real wall-clock-derived time.Time commonly
+// carries a nonzero sub-microsecond (nanosecond) remainder on Linux —
+// naively storing that raw, untruncated value as DirtySubject.ClaimedUntil
+// (as this code did before this fix) meant ReleaseClaim's later
+// compare-and-clear could be handed a value that no longer matches
+// whatever the row's own claimed_until actually is by the time a
+// different code path reads it back, since only the ROW is guaranteed
+// microsecond-truncated, not an untruncated Go-side value kept around in
+// memory. This is deterministic given ANY nanosecond-bearing clock, on
+// ANY OS — unlike the real Linux CI failure itself (a narrow, real-timing
+// race in the ambiguous-commit path that a local run doesn't reliably
+// hit), this test doesn't depend on hitting that race: it directly checks
+// the INVARIANT the fix establishes, that ClaimedUntil is always
+// microsecond-aligned by construction, never a raw nanosecond-bearing
+// value.
+func TestClaimSubjectForEvaluate_ClaimedUntilIsMicrosecondPrecise(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// 789 nanoseconds below the microsecond boundary — deliberately NOT a
+	// multiple of 1000ns, so a bug that stores the raw value is caught
+	// regardless of which specific sub-microsecond digits it happens to
+	// use.
+	now := time.Date(2031, time.January, 1, 0, 0, 0, 123456789, time.UTC)
+
+	appendAt(t, ctx, s, "acct_claim_ns", "subject.created", now, nil)
+
+	claimed, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_claim_ns", now)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if claimed.ClaimedUntil.Nanosecond()%1000 != 0 {
+		t.Fatalf("expected ClaimedUntil truncated to microsecond precision, got nanosecond=%d (%v)", claimed.ClaimedUntil.Nanosecond(), claimed.ClaimedUntil)
+	}
+
+	// The exact value handed back must also be what ReleaseClaim's
+	// compare-and-clear needs: releasing with it must actually clear the
+	// row, not silently no-op.
+	if err := s.ReleaseClaim(ctx, testTenant, "acct_claim_ns", claimed.ClaimedUntil); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_claim_ns", now); err != nil {
+		var busy *store.ErrBusy
+		if errors.As(err, &busy) {
+			t.Fatalf("expected the claim to have been released (ClaimedUntil matched the stored row), got *store.ErrBusy: %+v", busy)
+		}
+		t.Fatalf("second claim: %v", err)
+	}
+}
+
 func TestInsertCorpusExample_RoundTrips(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
