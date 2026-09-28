@@ -529,7 +529,7 @@ published JSON Schema.
   secrets, no spend; fails below `eval/floors.yaml` (floor = lower interval bound of the reference
   run) or above the ECE bound. Nightly: live adapters with tolerance bands, cassette refresh.
 - The committed corpus is synthetic (lures written in the style of the incident families, `.test`
-  domains, shifted timelines, fictional ids). The real incident corpus lives in private storage
+  domains, shifted timelines, fictional ids). A corpus reconstructed from confirmed abuse activity lives in private storage
   and feeds only the nightly job via a secret.
 
 ### 4.11 Storage
