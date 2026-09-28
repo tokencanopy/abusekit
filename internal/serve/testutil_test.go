@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -161,6 +162,59 @@ func truncateAll(ctx context.Context, pool *pgxpool.Pool) error {
 		TRUNCATE events, links, subjects, verdicts, rule_state, labels, corpus_examples, calibrations, budget_usage
 	`)
 	return err
+}
+
+// loadFixtureLines parses a JSONL replay fixture (eval/fixtures/*.jsonl)
+// into raw wire objects — exactly the shape POST /v1/events expects for
+// each item, so a contract test can replay a real, already-calibrated
+// fixture over HTTP instead of hand-rolling an event set that might
+// silently diverge from what config/local_weights.yaml was actually tuned
+// against (internal/worker's own replay tests load the same files this
+// way, just straight into event.Event rather than a raw map).
+func loadFixtureLines(t *testing.T, filename string) []map[string]any {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "eval", "fixtures", filename)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", path, err)
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("parse fixture line %q: %v", line, err)
+		}
+		out = append(out, m)
+	}
+	if len(out) == 0 {
+		t.Fatalf("fixture %s parsed to zero lines", path)
+	}
+	return out
+}
+
+// fixtureEventAt parses one fixture line's "at" field.
+func fixtureEventAt(t *testing.T, line map[string]any) time.Time {
+	t.Helper()
+	s, _ := line["at"].(string)
+	at, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("parse fixture event `at` %q: %v", s, err)
+	}
+	return at
+}
+
+// fixtureIsExternalSend reports whether line is a content.sent event with
+// recipient_is_own_identity false.
+func fixtureIsExternalSend(line map[string]any) bool {
+	if line["type"] != "content.sent" {
+		return false
+	}
+	data, _ := line["data"].(map[string]any)
+	own, _ := data["recipient_is_own_identity"].(bool)
+	return !own
 }
 
 func repoRoot(t *testing.T) string {
