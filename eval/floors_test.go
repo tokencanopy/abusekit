@@ -147,6 +147,62 @@ func TestGate_WeightRegressionFailsFloors(t *testing.T) {
 	t.Logf("mutated-weight run correctly failed the gate: %v", violations)
 }
 
+// TestGate_NegativeWeightRegressionCaughtByTightECEFloor is fix round
+// T3's own acceptance test: subject_age_h and upgrade_delay_min are both
+// NEGATIVE-signed weights, so zeroing either one can only ever move
+// recall/high-tier-recall UP, never down — no minimum-recall-shaped
+// floor can catch either going missing. Only ECE (and, in principle,
+// precision) can move the wrong way; eval/floors.yaml's max_ece is set
+// with a deliberately tight margin specifically so it catches both.
+func TestGate_NegativeWeightRegressionCaughtByTightECEFloor(t *testing.T) {
+	cfg, brands := loadShippedRuleConfig(t)
+	rule := ruleByNameT(t, cfg, "new_account_velocity")
+	dataset := loadSyntheticDataset(t, brands)
+	floors, err := LoadFloorsFile(repoRootJoin(t, "eval", "floors.yaml"))
+	if err != nil {
+		t.Fatalf("LoadFloorsFile: %v", err)
+	}
+	entry, ok := floors.For(rule.Name, "local", "full")
+	if !ok {
+		t.Fatalf("no floors entry for (%s, local, full)", rule.Name)
+	}
+	baselineWeights := loadShippedLocalWeights(t)
+
+	for _, weightName := range []string{"subject_age_h", "upgrade_delay_min"} {
+		t.Run(weightName, func(t *testing.T) {
+			mutated := baselineWeights
+			mutated.Weight = make(map[string]float64, len(baselineWeights.Weight))
+			for k, v := range baselineWeights.Weight {
+				mutated.Weight[k] = v
+			}
+			if _, ok := mutated.Weight[weightName]; !ok {
+				t.Fatalf("config/local_weights.yaml has no %s weight — this test needs updating", weightName)
+			}
+			mutated.Weight[weightName] = 0
+
+			scorer, err := local.New(mutated)
+			if err != nil {
+				t.Fatalf("local.New: %v", err)
+			}
+			run, err := Run(context.Background(), dataset, rule, scorer, Options{Tiers: cfg.Tiers})
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			violations := entry.Check(run.Metrics)
+			var sawECE bool
+			for _, v := range violations {
+				if v.Metric == "ece" {
+					sawECE = true
+				}
+			}
+			if !sawECE {
+				t.Fatalf("zeroing %s did not violate the ece floor (got violations=%v, ece=%.4f) — the tight margin no longer catches it",
+					weightName, violations, run.Metrics.ECE.Value)
+			}
+		})
+	}
+}
+
 func repoRootJoin(t *testing.T, parts ...string) string {
 	t.Helper()
 	all := append([]string{repoRoot(t)}, parts...)

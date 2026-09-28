@@ -37,13 +37,28 @@
 # config/local_weights.yaml weights, one at a time, and re-running this
 # exact command) is documented in the PR body, including which weight(s)
 # — if any — this floor set does not catch and why.
+#
+# Fix round T3 (review round 2): a NEGATIVE-signed weight
+# (subject_age_h, upgrade_delay_min) zeroed out can only ever move
+# recall/high-tier-recall/family-recall UP, never down — those floors
+# are all one-sided minimums and structurally cannot catch a negative
+# weight going missing. Only precision and ECE can move the "wrong" way
+# when a negative weight is removed (a small penalty that used to hold a
+# few borderline scores down is gone), so max_ece is set with a
+# deliberately TIGHT margin (baseline 0.1237, floor 0.13 — a 0.0063
+# margin, not the wider ~0.02-0.04 margins used elsewhere in this file)
+# specifically so it — not min_precision, which doesn't move for either
+# of these two weights — is what catches them. Confirmed: zeroing
+# subject_age_h (ECE 0.1451) or upgrade_delay_min (ECE 0.1324) each now
+# fails this floor on their own; see the PR body's corrected weight-sweep
+# table.
 floors:
   - rule: new_account_velocity
     scorer: local
     slice: full
     min_precision: 0.75
     min_recall: 0.85
-    max_ece: 0.16
+    max_ece: 0.13
     min_auroc: 0.95
     min_high_tier_recall: 0.60
     family_min_high_tier_recall:
