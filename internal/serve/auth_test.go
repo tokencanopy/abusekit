@@ -580,3 +580,95 @@ func TestAuth_UniformMessageForEveryPreScopeFailure(t *testing.T) {
 		})
 	}
 }
+
+// TestAuth_ReplayBlockedExactlyAtOrdinaryExpiryBoundary is T2 (round 3): a
+// replay landing EXACTLY at the replay cache's own expiry instant
+// (max(received_at, timestamp)+TimestampSkew — here received_at ==
+// timestamp == now, so that's exactly now+TimestampSkew) must still be
+// rejected. That instant is ALSO exactly the last one the ordinary
+// accepted-window check independently allows on its own (authenticateInner
+// rejects only delta > window, so delta == TimestampSkew is still
+// accepted) — the two checks must agree at that single instant, or a
+// replay slips through it. A strict exp.After(now) treated the cache entry
+// as already expired there, letting checkAndRemember report "not a
+// replay."
+func TestAuth_ReplayBlockedExactlyAtOrdinaryExpiryBoundary(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	nonce := mustNonce(t)
+
+	var serverNow time.Time
+	s := newTestStore(t)
+	cfg := loadShippedConfig(t)
+	nowFn := func() time.Time { return serverNow }
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: nowFn})
+	if err != nil {
+		t.Fatalf("worker.New: %v", err)
+	}
+	key := fixedTestKeys().Operator
+	srv, err := serve.New(serve.Deps{Store: s, Worker: w, Config: cfg, Keys: map[string]config.Key{key.ID: key}, Neighbors: feature.NoNeighbors, Now: nowFn})
+	if err != nil {
+		t.Fatalf("serve.New: %v", err)
+	}
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	serverNow = now
+	req1 := signedRequestWithNonce(t, ts, "GET", "/v1/subjects/never_seen_boundary", nil, key, now, nonce)
+	resp1 := httpDo(t, req1)
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusNotFound {
+		t.Fatalf("first request status = %d, want 404", resp1.StatusCode)
+	}
+
+	serverNow = now.Add(serve.TimestampSkew)
+	req2 := signedRequestWithNonce(t, ts, "GET", "/v1/subjects/never_seen_boundary", nil, key, now, nonce)
+	resp2 := httpDo(t, req2)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("replay AT the exact expiry boundary: status = %d, want 401 (replay detected)", resp2.StatusCode)
+	}
+}
+
+// TestAuth_ReplayBlockedExactlyAtBackfillExpiryBoundary is T2's backfill
+// counterpart: the SAME boundary reasoning against
+// BackfillEventsTimestampWindow (±24h) on POST /v1/events.
+func TestAuth_ReplayBlockedExactlyAtBackfillExpiryBoundary(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	nonce := mustNonce(t)
+
+	var serverNow time.Time
+	s := newTestStore(t)
+	cfg := loadShippedConfig(t)
+	nowFn := func() time.Time { return serverNow }
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: nowFn})
+	if err != nil {
+		t.Fatalf("worker.New: %v", err)
+	}
+	key := fixedTestKeys().Backfill
+	srv, err := serve.New(serve.Deps{Store: s, Worker: w, Config: cfg, Keys: map[string]config.Key{key.ID: key}, Neighbors: feature.NoNeighbors, Now: nowFn})
+	if err != nil {
+		t.Fatalf("serve.New: %v", err)
+	}
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	body := []byte(`{"events":[{"id":"evt-boundary-1","subject":"acct_boundary","type":"subject.created","at":"2030-01-01T00:00:00Z"}]}`)
+
+	serverNow = now
+	req1 := signedRequestWithNonce(t, ts, "POST", "/v1/events", body, key, now, nonce)
+	resp1 := httpDo(t, req1)
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusAccepted {
+		t.Fatalf("first request status = %d, want 202", resp1.StatusCode)
+	}
+
+	serverNow = now.Add(serve.BackfillEventsTimestampWindow)
+	req2 := signedRequestWithNonce(t, ts, "POST", "/v1/events", body, key, now, nonce)
+	resp2 := httpDo(t, req2)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("replay AT the exact backfill expiry boundary: status = %d, want 401 (replay detected)", resp2.StatusCode)
+	}
+}

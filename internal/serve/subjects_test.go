@@ -4,9 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/serve"
+	"github.com/tokencanopy/abusekit/internal/worker"
 )
 
 func postEvents(t *testing.T, ts *testServer, at time.Time, events ...map[string]any) {
@@ -490,5 +498,103 @@ func TestEvaluate_BusySubjectReturns409WithRetryAfter(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&envelope)
 	if envelope.Error.Code != "subject_busy" {
 		t.Fatalf("error code = %q, want subject_busy", envelope.Error.Code)
+	}
+}
+
+// recordingHandler is a slog.Handler that captures every record (T5, round
+// 3) so a test can assert on log LEVEL/message without depending on
+// stderr output — used to prove a client-gone condition is logged at
+// debug, never error.
+type recordingHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingHandler) hasLevelContaining(level slog.Level, substr string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == level && strings.Contains(r.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEvaluate_ClientGoneBeforeSubjectViewIsNotLoggedAsError is T5 (round
+// 3): ctx in handleEvaluate is the REQUEST's own context — a client that
+// already disconnected has it cancelled, and that SAME ctx feeds the
+// SubjectView read right after EvaluateSubject returns. Before this fix, a
+// client-gone condition there was indistinguishable from a genuine
+// internal failure: it logged at ERROR ("serve: subject view after
+// evaluate failed") and returned 500, misrepresenting a routine client
+// disconnect as an operational incident. The context is pre-cancelled and
+// the handler invoked directly (ServeHTTP, bypassing the network) rather
+// than racing a real disconnect's timing — deterministic, not
+// probabilistic, since Go's own http.Server doesn't forcibly abort a
+// handler goroutine just because the client left; only code that itself
+// checks ctx (here, the store's DB calls) observes the cancellation.
+func TestEvaluate_ClientGoneBeforeSubjectViewIsNotLoggedAsError(t *testing.T) {
+	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := newTestStore(t)
+	cfg := loadShippedConfig(t)
+	brands := loadShippedBrands(t)
+	nowFn := func() time.Time { return now }
+
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: brands, Now: nowFn})
+	if err != nil {
+		t.Fatalf("worker.New: %v", err)
+	}
+	logs := &recordingHandler{}
+	keys := fixedTestKeys()
+	srv, err := serve.New(serve.Deps{
+		Store: s, Worker: w, Config: cfg, Keys: keys.asMap(),
+		Neighbors: feature.NoNeighbors, Brands: brands, Now: nowFn,
+		Logger: slog.New(logs),
+	})
+	if err != nil {
+		t.Fatalf("serve.New: %v", err)
+	}
+	t.Cleanup(srv.Close)
+	handler := srv.Handler()
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+
+	// Create the subject for real first, over a normal, uncancelled
+	// request.
+	body, _ := json.Marshal(map[string]any{"events": []map[string]any{
+		eventJSON("evt-cancel-1", "acct_cancel_subjectview", "subject.created", now.Format(time.RFC3339), nil),
+	}})
+	setupResp := httpDo(t, signedRequest(t, ts, "POST", "/v1/events", body, keys.Producer, now))
+	setupResp.Body.Close()
+	if setupResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("setup: status = %d", setupResp.StatusCode)
+	}
+
+	// A properly-signed evaluate request, then swap in an ALREADY-cancelled
+	// context and invoke the handler chain directly.
+	evalReq := signedRequest(t, ts, "POST", "/v1/subjects/acct_cancel_subjectview/evaluate", []byte(`{"deadline_ms":1000}`), keys.Operator, now)
+	evalReq.Header.Set("Content-Type", "application/json")
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	evalReq = evalReq.WithContext(cancelledCtx)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, evalReq)
+
+	if logs.hasLevelContaining(slog.LevelError, "subject view after evaluate failed") {
+		t.Fatalf("expected no ERROR-level log for a client that already disconnected before SubjectView could load")
 	}
 }

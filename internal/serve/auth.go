@@ -230,11 +230,24 @@ func replayCacheKey(id string) [16]byte {
 
 // checkAndRemember returns true (and records id) the first time id is
 // seen; returns false on a repeat before its expiry.
+//
+// T2 (round 3): "before its expiry" is INCLUSIVE of the exact expiry
+// instant (!exp.Before(now), not exp.After(now)) — the boundary case a
+// plain exp.After(now) got wrong. replayExpiry sets exp to EXACTLY the
+// latest instant a replay could still independently pass the timestamp
+// accepted-window check (max(received_at, timestamp)+window, itself
+// inclusive: authenticateInner rejects only delta > window, so delta ==
+// window is accepted) — so at now == exp, a replay of the original
+// request is STILL one the accepted-window check would let through. A
+// strict exp.After(now) treats the entry as already expired at that exact
+// instant, letting checkAndRemember overwrite it and report "not a
+// replay" — the one instant where both checks must agree, and previously
+// didn't.
 func (c *replayCache) checkAndRemember(id string, now, expiry time.Time) bool {
 	key := replayCacheKey(id)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if exp, ok := c.seen[key]; ok && exp.After(now) {
+	if exp, ok := c.seen[key]; ok && !exp.Before(now) {
 		return false
 	}
 	c.seen[key] = expiry

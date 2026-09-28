@@ -116,15 +116,17 @@ func etagMatches(ifNoneMatch, etag string) bool {
 	return v == etag
 }
 
-// currentRuleNames returns s.cfg's rule names, for SubjectView's
-// currentRules filter (S14: excludes a retired rule's stale verdicts from
-// the live view).
-func (s *Server) currentRuleNames() []string {
-	names := make([]string, len(s.cfg.Rules))
+// currentRuleNames returns s.cfg's rules for SubjectView's currentRules
+// filter (S14: excludes a retired rule's stale verdicts from the live
+// view; T4 round 3: also tells SubjectView which of those are advise-mode,
+// so it can flag one that's missing entirely — never scored, not even as
+// unscored — as degraded too).
+func (s *Server) currentRuleNames() []store.CurrentRule {
+	rules := make([]store.CurrentRule, len(s.cfg.Rules))
 	for i, r := range s.cfg.Rules {
-		names[i] = r.Name
+		rules[i] = store.CurrentRule{Name: r.Name, Advise: r.Mode == config.ModeAdvise}
 	}
-	return names
+	return rules
 }
 
 // wireSubjectFromView builds the common response shape GET and evaluate
@@ -290,6 +292,20 @@ func (s *Server) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 			// attempt above and this read (e.g. a concurrent erasure in a
 			// future slice) — 404 is still correct, not a 500.
 			writeError(w, r, http.StatusNotFound, "not_found", "subject not found", nil)
+			return
+		}
+		// T5 (round 3): ctx here is the REQUEST's own context, which a
+		// client disconnecting mid-evaluate already cancelled — reliably
+		// so whenever evalErr above was itself context.Canceled (the exact
+		// same ctx), but also possible on its own in the narrow window
+		// between EvaluateSubject returning and this call starting. A
+		// client that already left is not a server failure: writing a
+		// response is pointless (nothing is listening any more) and
+		// logging it at ERROR level would misrepresent a routine
+		// disconnect as an operational incident an operator needs to look
+		// into.
+		if errors.Is(err, context.Canceled) {
+			s.log().Debug("serve: client disconnected before subject view could load", "request_id", authCtx.RequestID)
 			return
 		}
 		s.log().Error("serve: subject view after evaluate failed", "error", err, "request_id", authCtx.RequestID)
