@@ -46,6 +46,9 @@ func TestLoadWebmailFile_Shipped(t *testing.T) {
 		"hotmail.co.uk", "outlook.fr", "live.co.uk", "yahoo.fr",
 		"yahoo.de", "yahoo.co.jp", "mail.ru", "gmx.de", "t-online.de",
 		"libero.it",
+		// round 2 nit: additional country-variant domains.
+		"hotmail.fr", "hotmail.de", "hotmail.it", "hotmail.es",
+		"outlook.de", "live.fr", "yahoo.es", "yahoo.com.br",
 	} {
 		if !w.Contains(domain) {
 			t.Errorf("config/webmail.yaml must list %q", domain)

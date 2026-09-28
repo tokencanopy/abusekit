@@ -256,6 +256,33 @@ func TestTokenize_SoftHyphenAndInvisibleSeparator(t *testing.T) {
 	}
 }
 
+// TestTokenize_EveryUnicodeCfCharacterStripped is round 2's nit: every
+// prior fix round hand-enumerated one more invisible formatting character
+// as it was found (zero-width space, ZWNJ, ZWJ, BOM, word joiner, soft
+// hyphen, invisible separator) — an allowlist that only ever grows one
+// discovered character at a time. canonicalise now strips every rune in
+// Unicode category Cf ("Format") outright, so a producer/lure using ANY
+// Cf character to split a brand word, including one never specifically
+// enumerated before, is caught — not just the seven already on the list.
+// U+2064 (INVISIBLE PLUS) and U+180E (MONGOLIAN VOWEL SEPARATOR) are two
+// such characters that were never on the old allowlist.
+func TestTokenize_EveryUnicodeCfCharacterStripped(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"invisible plus (U+2064) mid-word", "pay⁤pal"},
+		{"mongolian vowel separator (U+180E) mid-word", "pay᠎pal"},
+	}
+	for _, tt := range tests {
+		got := tokenize(tt.in)
+		want := []string{"paypal"}
+		if !equalStrings(got, want) {
+			t.Errorf("tokenize(%q) = %v, want %v", tt.in, got, want)
+		}
+	}
+}
+
 // TestBrandSet_CaseSensitiveShortToken is S2b's N1 fix round: a brand
 // entry marked CaseSensitive must not fire on the ordinary lower-case
 // English word it collides with, only on its exact-case spelling as a
@@ -274,6 +301,11 @@ func TestBrandSet_CaseSensitiveShortToken(t *testing.T) {
 		{"ordinary lower-case word", "it has its ups and downs", false},
 		{"mixed case does not count as exact", "Ups, wrong address", false},
 		{"substring of a longer word", "startups are hard", false},
+		// round 2 nit: fullwidth Unicode letters (U+FF21-FF3A) NFKC-fold
+		// to their ASCII equivalents WITHOUT losing case — "ＵＰＳ" reads
+		// as visually all-caps "UPS", not the everyday lower-case word,
+		// so it must match exactly like the ASCII spelling does.
+		{"fullwidth exact case, standalone", "Your ＵＰＳ package has shipped", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

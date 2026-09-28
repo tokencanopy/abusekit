@@ -23,17 +23,25 @@ domains:
   - googlemail.com
   # Microsoft, plus common country-variant domains
   - outlook.com
+  - outlook.de
   - outlook.fr
   - hotmail.com
   - hotmail.co.uk
+  - hotmail.de
+  - hotmail.es
+  - hotmail.fr
+  - hotmail.it
   - live.com
   - live.co.uk
+  - live.fr
   - msn.com
   # Yahoo, plus common country-variant domains
   - yahoo.com
   - yahoo.co.uk
-  - yahoo.fr
+  - yahoo.com.br
   - yahoo.de
+  - yahoo.es
+  - yahoo.fr
   - yahoo.co.jp
   - ymail.com
   # Apple

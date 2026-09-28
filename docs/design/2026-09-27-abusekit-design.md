@@ -264,7 +264,11 @@ is exact, so truncating an over-length value first could silently turn an invali
 happens to match); (b) `subject_line` MASKS an email-shaped substring (replacing it with `@`) instead
 of rejecting the whole event the way every other field's embedded-email check still does — a bulk
 lure's subject line is exactly the field most likely to legitimately quote back an address, and
-losing the whole event over it destroys the very evidence the vocabulary exists to capture; (c) a
+losing the whole event over it destroys the very evidence the vocabulary exists to capture (**[round
+2 nit]** the stored value is NFKC-folded unconditionally now, not only on the branch where an
+email-shaped substring was actually found and masked — the two previously diverged, so the identical
+logical subject line could be stored as two different byte sequences depending on whether masking
+happened to trigger); (c) a
 `recipient_hash` paired with `recipient_count > 1` is rejected — design's own contract is that a set
 `recipient_hash` represents exactly one recipient; (d) `recipient_count`, if present, must be a
 positive integer. **[S2b]** `resource.created`/`resource.deleted`'s `kind` also normalizes a small,
@@ -460,7 +464,11 @@ captures — and all exclude a future-dated event (bounded by `now`, the same as
   (B3). A brand entry may be marked case-sensitive, for a short brand token that doubles as an
   ordinary English word or abbreviation (N1). A brand mention inside ordinary community-gathering
   text ("... group meetup", "... fan club") does not match (N2). Soft hyphen (U+00AD) and invisible
-  separator (U+2063) are stripped alongside the existing zero-width characters (N3).
+  separator (U+2063) are stripped alongside the existing zero-width characters (N3). **[round 2
+  nit]** `canonicalise` now strips every rune in Unicode category Cf outright (a strict superset of
+  N3's hand-enumerated list — also catches, e.g., U+2064 INVISIBLE PLUS and U+180E MONGOLIAN VOWEL
+  SEPARATOR), and the case-sensitive check (N1) NFKC-normalizes the candidate text before comparing,
+  so a fullwidth look-alike spelling ("ＵＰＳ") is recognized the same as its plain-ASCII spelling.
 - `config/webmail.yaml` is a public list of major consumer webmail provider domains (public exactly
   like config/brands.yaml is — no different from naming "Gmail" as a company in prose), extended
   with common country-variant domains (`hotmail.co.uk`, `outlook.fr`, `live.co.uk`, `yahoo.fr`,

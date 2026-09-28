@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode"
 
+	"golang.org/x/text/unicode/norm"
 	"gopkg.in/yaml.v3"
 
 	"github.com/tokencanopy/abusekit/internal/event"
@@ -319,14 +320,29 @@ func (b BrandSet) matchedNames(words []string, original string, applyIntegration
 // containsExactCaseToken reports whether text contains word as a
 // case-SENSITIVE standalone token, split the same way tokenize splits its
 // folded copy (any whitespace/punctuation/symbol rune) but on text's
-// ORIGINAL, un-folded casing — S2b's N1 fix round: a short brand token
-// that doubles as an ordinary English word or abbreviation (a shipping
-// brand's all-caps initialism is the common example) should not fire on
-// the word used in everyday lower-case prose; requiring the identical
-// case as a whole token lets the initialism still match while the
-// ordinary word does not.
+// ORIGINAL casing — S2b's N1 fix round: a short brand token that doubles
+// as an ordinary English word or abbreviation (a shipping brand's
+// all-caps initialism is the common example) should not fire on the word
+// used in everyday lower-case prose; requiring the identical case as a
+// whole token lets the initialism still match while the ordinary word
+// does not.
+//
+// text is NFKC-normalized first (round 2's nit), NOT left as fully raw
+// bytes: a Unicode-compatible look-alike letter — a fullwidth Latin
+// capital like "Ｕ" (U+FF35) is the concrete case, used to spell "ＵＰＳ"
+// — is visually and semantically upper-case, but is a completely
+// different code point from ASCII "U" and would otherwise never equal
+// word's plain-ASCII spelling under a byte-exact comparison, letting an
+// impersonation styled in fullwidth caps evade a case-sensitive brand
+// entirely. NFKC maps a compatibility character like this to its
+// canonical form WITHOUT changing case (unlike event.Skeleton's fold,
+// which also lower-cases and therefore can't be reused here — this
+// check's whole point is telling upper-case apart from lower-case), so
+// "ＵＰＳ" normalizes to "UPS" and matches exactly like the plain-ASCII
+// spelling, while a fullwidth lower-case "ｕｐｓ" still normalizes to
+// lower-case "ups" and still correctly does NOT match.
 func containsExactCaseToken(text, word string) bool {
-	for _, tok := range strings.FieldsFunc(text, isWordSeparator) {
+	for _, tok := range strings.FieldsFunc(norm.NFKC.String(text), isWordSeparator) {
 		if tok == word {
 			return true
 		}
@@ -358,7 +374,7 @@ func containsExactCaseToken(text, word string) bool {
 // integrationTokens' literal strings instead of through this shared
 // path) silently reintroduced the exact divergence it was meant to close.
 func tokenize(s string) []string {
-	folded := canonicalise(stripZeroWidth(event.Skeleton(s)))
+	folded := canonicalise(event.Skeleton(s))
 	return strings.FieldsFunc(folded, isWordSeparator)
 }
 
@@ -370,25 +386,49 @@ func isWordSeparator(r rune) bool {
 	return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
 }
 
-// canonicalise folds every remaining lower-case "i" to 'l' (D1 round 3).
-// event.Skeleton already folds an UPPER-case "I" (and dotless "ı") to 'l'
-// pre-lowercase, specifically to catch "PayPaI"-style impersonation — but
-// it never touches an ORDINARY lower-case "i", since by itself that's
-// just a letter, not a lookalike. That asymmetry is exactly the bug this
-// closes: a brand written in its natural mixed-case spelling
-// ("Microsoft", "Netflix", "Coinbase", "Binance", "Bank of America" — all
-// with a lower-case i) tokenizes with that i untouched, while the
-// IDENTICAL brand mentioned in a candidate written in ALL CAPS
-// ("MICROSOFT SUPPORT") has its i already folded to 'l' by Skeleton
-// before this ever runs — so the two sides silently diverged. Folding
-// every remaining i to 'l' here, on BOTH sides (brand definitions via
-// NewBrandSet, candidates via Matches, and integrationTokens via
-// buildIntegrationTokens — all three go through this same function),
-// makes them converge again: "integration" and an all-caps candidate's
-// "INTEGRATION" (which Skeleton already turns into "lntegratlon") now
-// compare equal too.
+// canonicalise strips every rune Unicode classifies as category Cf
+// ("Format" — invisible formatting characters), then folds every
+// remaining lower-case "i" to 'l' (D1 round 3).
+//
+// The Cf strip (round 2's nit) replaces an earlier, hand-enumerated
+// allowlist (stripZeroWidth, since removed) that grew one character at a
+// time as each was found by a specific obfuscation: zero-width space,
+// ZWNJ, ZWJ, the UTF-8 BOM, word joiner, soft hyphen (S2b's N3 fix
+// round), invisible separator (S2b's N3 fix round). Every one of those
+// seven is itself category Cf, so matching the whole category is a
+// strict superset — it also catches a Cf character no round happened to
+// enumerate yet, e.g. U+2064 (INVISIBLE PLUS) or U+180E (MONGOLIAN VOWEL
+// SEPARATOR), without needing a future round to notice and add it by
+// hand. A Cf character embedded inside a brand word ("pay" + U+2064 +
+// "pal") would otherwise defeat both the word-boundary tokenizer above
+// and a naive substring check alike.
+//
+// The "i"->'l' fold closes a second, independent gap: event.Skeleton
+// already folds an UPPER-case "I" (and dotless "ı") to 'l' pre-lowercase,
+// specifically to catch "PayPaI"-style impersonation — but it never
+// touches an ORDINARY lower-case "i", since by itself that's just a
+// letter, not a lookalike. That asymmetry is exactly the bug this closes:
+// a brand written in its natural mixed-case spelling ("Microsoft",
+// "Netflix", "Coinbase", "Binance", "Bank of America" — all with a
+// lower-case i) tokenizes with that i untouched, while the IDENTICAL
+// brand mentioned in a candidate written in ALL CAPS ("MICROSOFT
+// SUPPORT") has its i already folded to 'l' by Skeleton before this ever
+// runs — so the two sides silently diverged. Folding every remaining i to
+// 'l' here, on BOTH sides (brand definitions via NewBrandSet, candidates
+// via Matches, and integrationTokens via buildIntegrationTokens — all
+// three go through this same function), makes them converge again:
+// "integration" and an all-caps candidate's "INTEGRATION" (which Skeleton
+// already turns into "lntegratlon") now compare equal too.
 func canonicalise(s string) string {
-	return strings.ReplaceAll(s, "i", "l")
+	return strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		if r == 'i' {
+			return 'l'
+		}
+		return r
+	}, s)
 }
 
 // tokenizeCamel is tokenize plus one more split point (R6 round 2): a
@@ -434,40 +474,6 @@ func insertCamelBoundaries(s string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
-}
-
-// Zero-width and other invisible formatting characters stripZeroWidth
-// removes, spelled as numeric rune literals (not literal Unicode escapes)
-// so this file's bytes stay unambiguous regardless of editor/tool
-// encoding: zeroWidthSpace (U+200B), zeroWidthNonJoiner (U+200C),
-// zeroWidthJoiner (U+200D), zeroWidthNoBreakSpace (U+FEFF, also the UTF-8
-// BOM), wordJoiner (U+2060), softHyphen (U+00AD, S2b's N3 fix round),
-// invisibleSeparator (U+2063, S2b's N3 fix round).
-const (
-	zeroWidthSpace        = 0x200B
-	zeroWidthNonJoiner    = 0x200C
-	zeroWidthJoiner       = 0x200D
-	zeroWidthNoBreakSpace = 0xFEFF
-	wordJoiner            = 0x2060
-	softHyphen            = 0x00AD
-	invisibleSeparator    = 0x2063
-)
-
-// stripZeroWidth removes the invisible formatting characters listed above
-// that would otherwise silently split a brand name's letters apart (e.g.
-// "pay" + zeroWidthSpace + "pal") and defeat both the word-boundary
-// tokenizer above and a naive substring check alike. Kept local to this
-// package rather than folded into event.Skeleton itself: Skeleton is
-// shared by subject_line matching too, and this fix round's scope is
-// brand matching specifically.
-func stripZeroWidth(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch r {
-		case zeroWidthSpace, zeroWidthNonJoiner, zeroWidthJoiner, zeroWidthNoBreakSpace, wordJoiner, softHyphen, invisibleSeparator:
-			return -1
-		}
-		return r
-	}, s)
 }
 
 // containsSequence reports whether needle appears as a contiguous run

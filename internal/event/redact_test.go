@@ -443,6 +443,21 @@ func TestEvent_Redact(t *testing.T) {
 			},
 		},
 		{
+			// round 2 nit: subject_line must be NFKC-folded consistently
+			// whether or not it was masked — this case has no embedded
+			// email, so the S5 masking path never runs, but the stored
+			// value must still be NFKC-normalized (fullwidth "ＵＰＳ"
+			// folds to ASCII "UPS").
+			name: "subject_line with no email is still NFKC-folded",
+			typ:  "content.sent",
+			data: map[string]any{"subject_line": "Your ＵＰＳ package has shipped"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["subject_line"] != "Your UPS package has shipped" {
+					t.Fatalf("expected the subject line to be NFKC-folded even though nothing was masked, got %#v", out)
+				}
+			},
+		},
+		{
 			name:     "every OTHER field still rejects an embedded email outright (S5 does not widen the exception)",
 			typ:      "content.sent",
 			data:     map[string]any{"first_link_host": "someone@example.com"},

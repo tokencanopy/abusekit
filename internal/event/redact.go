@@ -363,12 +363,25 @@ func (e *Event) Redact() error {
 				if !spec.format.MatchString(s) {
 					return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q does not match the required format", k, s))
 				}
-			case spec.maskEmail && looksLikeEmail(s):
-				// S5: mask rather than reject. maskEmails NFKC-folds s
-				// before replacing (matching looksLikeEmail's own fold),
-				// so the stored value is always the masked text, not the
-				// original bytes, whenever a match is found.
-				s = maskEmails(s)
+			case spec.maskEmail:
+				// S5: mask an embedded email rather than reject. Round 2's
+				// nit: s is NFKC-folded HERE, unconditionally — not only
+				// when looksLikeEmail actually finds something to mask
+				// (maskEmails' own internal NFKC fold, applied only to the
+				// text it replaces into, previously meant subject_line was
+				// folded when masking happened to trigger and left raw,
+				// unfolded bytes otherwise: a Unicode-compatible look-alike
+				// like fullwidth "ＵＰＳ" survived unfolded in the far more
+				// common unmasked case, and the identical logical subject
+				// line could be stored as two different byte sequences
+				// depending on whether an email-shaped substring happened
+				// to also be present). looksLikeEmail/maskEmails each fold
+				// again internally, which is idempotent and therefore
+				// harmless.
+				s = norm.NFKC.String(s)
+				if looksLikeEmail(s) {
+					s = maskEmails(s)
+				}
 				fallthrough
 			default:
 				if !spec.isEnumValue(s) {
