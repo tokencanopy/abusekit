@@ -12,9 +12,9 @@ read the score and decide what to do. It never enforces.
 
 Design: `docs/design/2026-09-27-abusekit-design.md`. Status: S1 (core types, Postgres store, the
 model seam + local scorer, the pure Plan/Combine core, and the rules/vendors config loader), S2
-(feature extraction, same-tenant linking, the worker), and S3 (the HTTP surface + Go client, below)
-are implemented; see `docs/plans/2026-09-27-v0-plan.md` for the full slice plan. The evaluation
-harness/CI gate (S4), vendor adapters (S5), and the e2a integration (S6+) land in later slices.
+(feature extraction, same-tenant linking, the worker), S3 (the HTTP surface + Go client), and S4
+(the evaluation harness + CI gate, below) are implemented; see `docs/plans/2026-09-27-v0-plan.md`
+for the full slice plan. Vendor adapters (S5) and the e2a integration (S6+) land in later slices.
 
 ## HTTP surface
 
@@ -94,6 +94,75 @@ nonce per attempt; decodes a non-2xx response into a typed `*abusekit.APIError` 
 honouring `Retry-After`) apply only to the idempotent calls — `SendEvents`, `Subject` — never to
 `Label` (each call creates a new row) or `Evaluate` (a retry could spend the subject's 1/s
 rate-limit budget on a call that already succeeded). Response bodies are capped at 4 MiB.
+
+## Evaluation harness (`eval`, design §4.10)
+
+`eval` is a pure, importable Go package (`github.com/tokencanopy/abusekit/eval`): it never opens a
+network connection or reads a product database (the one exception, `abusekit corpus export`, lives
+in `cmd/abusekit`, not in `eval` itself). `eval.Run(ctx, Dataset, Rule, Scorer, Options) (RunResult,
+error)` scores every subject in a `Dataset` and reduces the result to `RunResult{Manifest, Verdicts,
+Metrics}` — precision/recall/F1 at the rule's threshold AND at each global tier cut (each with a
+Wilson 95% interval), a confusion matrix, 10-bin ECE, AUROC, latency p50/p95, cost, and — for a
+replay-shaped dataset — a lead-time histogram (the earliest of `first_send`/`early_15m`/`full` each
+positive subject was first flagged at).
+
+Two corpus shapes (design §4.6), both JSONL:
+
+- **Label-snapshot**: `{id, input:{features,text,context}, label, split, source, meta}` — one row
+  per already-resolved decision point. Schema: `eval/schema/corpus-v1.schema.json`.
+- **Event-replay pair**: an events file (`{subject,type,at,data,links?}`, internal/event's own wire
+  shape) plus a labels file (`{subject,label,category?,source,decision_at:{<slice>:<RFC3339>}}`).
+  Each subject's feature vector is rebuilt from events STRICTLY BEFORE its decision_at, using
+  internal/feature with same-tenant neighbour evidence resolved from an in-memory index built from
+  the dataset's own links — evaluated as of each subject's own decision point, never as of the end
+  of the whole dataset (see `eval/neighbors.go`'s `evidenceAsOf`).
+
+```bash
+go build -o abusekit ./cmd/abusekit
+
+# Score the committed synthetic corpus against the shipped local weights.
+./abusekit eval --dataset eval/fixtures/synthetic/events.jsonl \
+  --labels eval/fixtures/synthetic/labels.jsonl \
+  --rule new_account_velocity --scorer local --slice full --out run.json
+
+# Compare every registered scorer side by side (a table on stdout).
+./abusekit eval --dataset ... --labels ... --rule new_account_velocity --scorer all
+
+# CI's gate: exit 0 pass, 1 a floor was violated, 2 bad input.
+./abusekit eval --dataset ... --labels ... --rule new_account_velocity --scorer local \
+  --slice full --floors eval/floors.yaml
+
+# A raw scoring pipe for an external framework — stdin/stdout JSONL, no persistence.
+echo '{"id":"x","input":{"features":{"subject_age_h":0.1}}}' | \
+  ./abusekit score --jsonl --rule new_account_velocity --scorer local
+
+# Export labelled corpus_examples rows (design §4.9) as a corpus-v1 file
+# `abusekit eval` can read straight back in. KNOWN GAP: nothing yet marks
+# a row `gated` (design's "a label enters the gate corpus only after a
+# second source agrees") — every row is exported regardless, with its
+# `gated` column surfaced in `meta.gated` (see corpus_cmd.go).
+./abusekit corpus export --database-url "$ABUSEKIT_DATABASE_URL" --tenant e2a --split all > corpus.jsonl
+```
+
+**The private incident corpus** (the real September 2026 accounts — see design §1/§4.10, plan.md's
+S9) lives in a separate private repository and is never committed here (AGENTS.md: "Never commit
+real customer or operator data"). Run it with the exact same binary and no code changes, pointing
+`--dataset`/`--labels` at that repo's checkout:
+
+```bash
+./abusekit eval --dataset <private-repo>/events.jsonl --labels <private-repo>/labels.jsonl \
+  --rule new_account_velocity --scorer local --slice full --out incident-run.json
+```
+
+**Cassettes** (design §4.10) record/replay a vendor scorer's answers, keyed by `(scorer, model,
+prompt_version, input_hash)`, via `--cassettes <dir>` (`--record` to write; omit it to replay). CI
+always replays — a miss is a loud, wrapped error (`eval.ErrCassetteMiss`), never a silent live call.
+The `local` scorer never needs one (no network to record in the first place); v0 has no other
+scorer registered yet (S5 adds `jev`/`laya`/`gemini`).
+
+**The synthetic corpus** (`eval/fixtures/synthetic/`, generated by the seeded `eval/gen` command —
+see `eval/fixtures/README.md`) is what `make gate`/CI score against; `eval/floors.yaml` documents how
+its floors were set and how to raise them.
 
 ## Development
 

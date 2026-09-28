@@ -7,9 +7,11 @@
 # if the service container above isn't reachable, since a silently-skipped
 # DB suite reporting green here would be worse than a red build.
 #
-# `make gate` (design's CI gate over the eval harness / eval/floors.yaml)
-# is a placeholder until S4; it is deliberately not wired into this
-# workflow yet so adding it later is a Makefile change, not a CI change.
+# S4 adds the `gate` job: `make gate` runs `abusekit eval` against the
+# committed synthetic corpus (eval/fixtures/synthetic/) with the local
+# scorer and fails the build if a floor in eval/floors.yaml is violated
+# (design §4.10 / plan S4's CI gate). It needs no Postgres and no
+# network — the local scorer needs no cassette.
 name: CI
 
 on:
@@ -41,6 +43,18 @@ jobs:
         run: make lint
       - name: unit tests (no DB)
         run: make test
+
+  gate:
+    name: eval harness gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: eval harness gate (synthetic corpus, local scorer)
+        run: make gate
 
   db-test:
     name: DB-backed tests

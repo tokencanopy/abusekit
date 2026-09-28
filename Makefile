@@ -34,8 +34,24 @@ lint:
 fmt:
 	gofmt -w .
 
-# gate is a placeholder until S4 (the eval harness and eval/floors.yaml
-# land there). It exists now so CI and this Makefile already have a
-# stable `make gate` target for S4 to fill in without a CI config change.
+# gate builds abusekit, runs `abusekit eval` against the committed
+# synthetic corpus (eval/fixtures/synthetic/{events,labels}.jsonl) with
+# the shipped local scorer, and fails (exit 1, readable diff on stderr)
+# whenever a floor in eval/floors.yaml is violated — design §4.10 / plan
+# S4's "make gate ... fails below eval/floors.yaml (floor = lower
+# interval bound of the reference run)". Never touches Postgres, a
+# vendor, or the network: the local scorer needs no cassette (S4).
+#
+# `go build ./...` (the `build` target above) deliberately writes no
+# binary when it matches more than one package (Go's own default), so
+# gate builds cmd/abusekit explicitly to a throwaway path instead of
+# depending on `build`.
 gate:
-	@echo "make gate: placeholder — the eval harness and eval/floors.yaml land in S4 (see docs/plans/2026-09-27-v0-plan.md)"
+	go build -o .gate-abusekit ./cmd/abusekit
+	@./.gate-abusekit eval \
+		--dataset eval/fixtures/synthetic/events.jsonl \
+		--labels eval/fixtures/synthetic/labels.jsonl \
+		--rule new_account_velocity --scorer local --slice full \
+		--floors eval/floors.yaml \
+		--out /tmp/abusekit-gate-run.json; \
+	status=$$?; rm -f .gate-abusekit; exit $$status
