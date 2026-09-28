@@ -137,7 +137,7 @@ func TestGenerate_RoundTripsThroughLoadReplayDataset(t *testing.T) {
 		}
 	}
 
-	dataset, rowErrs, err := eval.LoadReplayDataset(&eventsBuf, &labelsBuf, feature.BrandSet{})
+	dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, feature.BrandSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (row errors: %v)", err, rowErrs)
 	}

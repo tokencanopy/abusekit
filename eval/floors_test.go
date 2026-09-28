@@ -14,20 +14,20 @@ func TestFloorEntry_Check(t *testing.T) {
 	entry := FloorEntry{MinPrecision: f64(0.8), MinRecall: f64(0.8), MaxECE: f64(0.1)}
 
 	t.Run("all pass", func(t *testing.T) {
-		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.9}, Recall: Rate{Value: 0.85}}, ECE: ECE{Value: 0.05}}
+		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.9, Defined: true}, Recall: Rate{Value: 0.85, Defined: true}}, ECE: ECE{Value: 0.05, Defined: true}}
 		if v := entry.Check(m); len(v) != 0 {
 			t.Fatalf("Check = %v, want no violations", v)
 		}
 	})
 	t.Run("precision fails", func(t *testing.T) {
-		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.5}, Recall: Rate{Value: 0.85}}, ECE: ECE{Value: 0.05}}
+		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.5, Defined: true}, Recall: Rate{Value: 0.85, Defined: true}}, ECE: ECE{Value: 0.05, Defined: true}}
 		v := entry.Check(m)
 		if len(v) != 1 || v[0].Metric != "precision" {
 			t.Fatalf("Check = %v, want exactly one precision violation", v)
 		}
 	})
 	t.Run("ece is a ceiling not a floor", func(t *testing.T) {
-		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.9}, Recall: Rate{Value: 0.9}}, ECE: ECE{Value: 0.2}}
+		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.9, Defined: true}, Recall: Rate{Value: 0.9, Defined: true}}, ECE: ECE{Value: 0.2, Defined: true}}
 		v := entry.Check(m)
 		if len(v) != 1 || v[0].Metric != "ece" {
 			t.Fatalf("Check = %v, want exactly one ece violation", v)
@@ -35,10 +35,39 @@ func TestFloorEntry_Check(t *testing.T) {
 	})
 	t.Run("unconfigured metric is never checked", func(t *testing.T) {
 		bare := FloorEntry{MinPrecision: f64(0.99)}
-		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.0}, Recall: Rate{Value: 0.0}}, ECE: ECE{Value: 0.99}}
+		m := Metrics{Threshold: PRF{Precision: Rate{Value: 0.0, Defined: true}, Recall: Rate{Value: 0.0, Defined: true}}, ECE: ECE{Value: 0.99, Defined: true}}
 		v := bare.Check(m)
 		if len(v) != 1 || v[0].Metric != "precision" {
 			t.Fatalf("Check = %v, want only the configured precision floor checked", v)
+		}
+	})
+	// Fix round B3: "ECE over an empty set is not 0 ... fail any floor
+	// that references it" — an undefined rate/ECE against a CONFIGURED
+	// floor must always be reported as a violation, never silently pass
+	// just because Value happens to be the Go zero value.
+	t.Run("undefined metric against a configured floor is a violation", func(t *testing.T) {
+		m := Metrics{
+			Threshold: PRF{Precision: Rate{Defined: false}, Recall: Rate{Value: 0.9, Defined: true}},
+			ECE:       ECE{Defined: false},
+		}
+		v := entry.Check(m)
+		var sawPrecision, sawECE bool
+		for _, viol := range v {
+			if viol.Metric == "precision" {
+				if !viol.Undefined {
+					t.Errorf("precision violation = %+v, want Undefined=true", viol)
+				}
+				sawPrecision = true
+			}
+			if viol.Metric == "ece" {
+				if !viol.Undefined {
+					t.Errorf("ece violation = %+v, want Undefined=true", viol)
+				}
+				sawECE = true
+			}
+		}
+		if !sawPrecision || !sawECE {
+			t.Fatalf("Check = %v, want both an undefined precision AND an undefined ece violation", v)
 		}
 	})
 }

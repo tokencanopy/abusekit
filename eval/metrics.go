@@ -2,7 +2,10 @@ package eval
 
 import (
 	"math"
+	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/tokencanopy/abusekit/internal/config"
 )
@@ -81,6 +84,14 @@ type ECEBin struct {
 type ECE struct {
 	Value float64  `json:"value"`
 	Bins  []ECEBin `json:"bins"`
+	// Defined is false when there were zero scored records to bin (fix
+	// round B3: "ECE over an empty set is not 0" — a run that scored
+	// nothing has no calibration error to report, and reporting 0 would
+	// read as "perfectly calibrated", the opposite of "no evidence").
+	// FloorEntry.Check treats an undefined ECE as failing any configured
+	// max_ece floor outright, the same fail-closed direction as every
+	// other undefined Rate in this package.
+	Defined bool `json:"defined"`
 }
 
 // AUROC is the area under the ROC curve, computed via the Mann-Whitney U
@@ -147,8 +158,18 @@ type Metrics struct {
 	// (risk >= medium, risk >= high) — keyed "medium"/"high". Empty when
 	// Options.Tiers wasn't a validly configured Tiers.
 	TierCuts map[string]PRF `json:"tier_cuts,omitempty"`
-	ECE      ECE            `json:"ece"`
-	AUROC    AUROC          `json:"auroc"`
+	// FamilyHighTierRecall is recall at the "high" tier cut for specific
+	// named families the fix round's gate cares about (S2): "burst",
+	// "dormant_then_blast", and the synthetic "churn_incarnation_ge3"
+	// (every churn subject at or past its own chain's 3rd incarnation,
+	// design §1.2(c)'s criterion — parsed from eval/gen's own
+	// acct_gen_churn_<kind>_<chain>_<n> subject-id convention; see
+	// churnIncarnationNumber). Omitted when Options.Tiers wasn't validly
+	// configured; a family with zero positive subjects in this dataset
+	// simply has no entry (never a spurious 0%).
+	FamilyHighTierRecall map[string]Rate `json:"family_high_tier_recall,omitempty"`
+	ECE                  ECE             `json:"ece"`
+	AUROC                AUROC           `json:"auroc"`
 	// LeadTime is nil unless the Dataset was replay-shaped (see Dataset.Replay).
 	LeadTime       *LeadTime    `json:"lead_time,omitempty"`
 	Latency        LatencyStats `json:"latency"`
@@ -175,6 +196,22 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 		tierBuckets["medium"] = struct{ tp, fp, fn int }{}
 		tierBuckets["high"] = struct{ tp, fp, fn int }{}
 	}
+	familyBuckets := map[string]struct{ tp, fn int }{}
+
+	addFamilyOutcome := func(r scoredRecord, flaggedAtHigh bool) {
+		if !haveValidTiers || !r.positive {
+			return
+		}
+		for _, fam := range familyKeysFor(r) {
+			b := familyBuckets[fam]
+			if r.unscored || !flaggedAtHigh {
+				b.fn++
+			} else {
+				b.tp++
+			}
+			familyBuckets[fam] = b
+		}
+	}
 
 	for _, r := range records {
 		if r.truncated {
@@ -192,6 +229,7 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 					}
 				}
 			}
+			addFamilyOutcome(r, false)
 			// design: "exclude [an unscored verdict] from precision" — a
 			// negative-labelled unscored record contributes to neither
 			// TP/FP/TN/FN nor the tier buckets.
@@ -224,6 +262,7 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 				}
 				tierBuckets[cut] = b
 			}
+			addFamilyOutcome(r, r.risk >= tiers.High)
 		}
 	}
 
@@ -242,6 +281,12 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 		m.TierCuts = map[string]PRF{
 			"medium": newPRF(tierBuckets["medium"].tp, tierBuckets["medium"].fp, tierBuckets["medium"].fn),
 			"high":   newPRF(tierBuckets["high"].tp, tierBuckets["high"].fp, tierBuckets["high"].fn),
+		}
+		if len(familyBuckets) > 0 {
+			m.FamilyHighTierRecall = make(map[string]Rate, len(familyBuckets))
+			for fam, b := range familyBuckets {
+				m.FamilyHighTierRecall[fam] = newRate(b.tp, b.tp+b.fn)
+			}
 		}
 	}
 	if replay {
@@ -269,6 +314,43 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 type aurocPoint struct {
 	risk     float64
 	positive bool
+}
+
+// churnSubjectRe matches eval/gen's own churn subject-id convention:
+// acct_gen_churn_<kind>_<chain>_<n>, capturing the trailing incarnation
+// number n.
+var churnSubjectRe = regexp.MustCompile(`^acct_gen_churn_[a-z0-9]+_\d+_(\d+)$`)
+
+// churnIncarnationNumber extracts n from a churn subject id, if it
+// matches eval/gen's convention.
+func churnIncarnationNumber(subjectID string) (int, bool) {
+	m := churnSubjectRe.FindStringSubmatch(subjectID)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// familyKeysFor returns the Metrics.FamilyHighTierRecall keys r belongs
+// to (fix round S2) — 0, 1, or 2 of them (a churn subject contributes to
+// both its literal category-derived family, if any is tracked, i.e.
+// none today, and possibly "churn_incarnation_ge3").
+func familyKeysFor(r scoredRecord) []string {
+	var keys []string
+	switch r.category {
+	case "burst", "dormant_then_blast":
+		keys = append(keys, r.category)
+	}
+	if strings.HasPrefix(r.category, "churn_") {
+		if n, ok := churnIncarnationNumber(r.subjectID); ok && n >= 3 {
+			keys = append(keys, "churn_incarnation_ge3")
+		}
+	}
+	return keys
 }
 
 func computeAUROC(points []aurocPoint) AUROC {
@@ -326,8 +408,9 @@ func computeECE(points []aurocPoint, bins int) ECE {
 		for b := 0; b < bins; b++ {
 			out.Bins[b] = ECEBin{Lo: float64(b) / float64(bins), Hi: float64(b+1) / float64(bins)}
 		}
-		return out
+		return out // Defined stays false: fix round B3, "ECE over an empty set is not 0"
 	}
+	out.Defined = true
 	var value float64
 	for b := 0; b < bins; b++ {
 		bin := ECEBin{Lo: float64(b) / float64(bins), Hi: float64(b+1) / float64(bins), Count: counts[b]}

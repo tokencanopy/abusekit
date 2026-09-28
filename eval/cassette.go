@@ -22,24 +22,32 @@ import (
 // the RESULT's field); a cassette is keyed on what's being ASKED, which
 // is Scorer+Model (usually identical — Model is the scorer's OWN Name(),
 // not a caller-supplied override) + PromptVersion + the request's content
-// hash.
+// hash. Fix round S4 adds ScorerVersion (model.Scorer.Version(),
+// queryable BEFORE a Score call, unlike the result's own Checkpoint): a
+// vendor rotating its model, or a weights/prompt change, must never
+// silently replay a stale cached answer under an otherwise-identical
+// key — the same reasoning internal/core.Plan's own input hash already
+// applies to a WORKER's skip-if-unchanged check.
 type CassetteKey struct {
 	Scorer        string `json:"scorer"`
+	ScorerVersion string `json:"scorer_version"`
 	Model         string `json:"model"`
 	PromptVersion string `json:"prompt_version"`
 	InputHash     string `json:"input_hash"`
 }
 
 func (k CassetteKey) storageKey() string {
-	return k.Scorer + "|" + k.Model + "|" + k.PromptVersion + "|" + k.InputHash
+	return k.Scorer + "|" + k.ScorerVersion + "|" + k.Model + "|" + k.PromptVersion + "|" + k.InputHash
 }
 
 // cassetteFile is the on-disk JSON shape of a saved Cassette: a flat list
 // (not a map) so the file's key order is stable across saves regardless
 // of Go's map iteration — WriteCassette always sorts by storageKey
-// before marshaling.
+// before marshaling. DatasetSHA (fix round S8) records which corpus this
+// cassette's entries were recorded against — see Cassette.VerifyDatasetSHA.
 type cassetteFile struct {
-	Entries []cassetteFileEntry `json:"entries"`
+	DatasetSHA string              `json:"dataset_sha,omitempty"`
+	Entries    []cassetteFileEntry `json:"entries"`
 }
 
 type cassetteFileEntry struct {
@@ -50,10 +58,11 @@ type cassetteFileEntry struct {
 // Cassette is a record/replay store for scorer calls (design §4.10),
 // keyed by CassetteKey. Safe for concurrent use.
 type Cassette struct {
-	mu      sync.Mutex
-	path    string
-	entries map[string]cassetteFileEntry
-	dirty   bool
+	mu         sync.Mutex
+	path       string
+	entries    map[string]cassetteFileEntry
+	datasetSHA string
+	dirty      bool
 }
 
 // LoadCassette reads path's cassette file, or returns an empty, writable
@@ -72,10 +81,40 @@ func LoadCassette(path string) (*Cassette, error) {
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("eval: parse cassette %s: %w", path, err)
 	}
+	c.datasetSHA = f.DatasetSHA
 	for _, e := range f.Entries {
 		c.entries[e.Key.storageKey()] = e
 	}
 	return c, nil
+}
+
+// SetDatasetSHA records which corpus this cassette is being used against
+// (fix round S8) — a no-op (and doesn't mark the cassette dirty) if sha
+// already matches what's on record, so loading and using a cassette
+// read-only never rewrites its file just to restate the same value.
+func (c *Cassette) SetDatasetSHA(sha string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.datasetSHA != sha {
+		c.datasetSHA = sha
+		c.dirty = true
+	}
+}
+
+// VerifyDatasetSHA reports an error if this cassette was previously
+// recorded against a DIFFERENT corpus than expected (fix round S8's CI
+// check: "committed cassettes reference only the committed synthetic
+// corpus sha"). A cassette with no recorded dataset_sha (never run
+// through SetDatasetSHA — every cassette from before this fix round)
+// passes silently: there's nothing to contradict.
+func (c *Cassette) VerifyDatasetSHA(expected string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.datasetSHA != "" && c.datasetSHA != expected {
+		return fmt.Errorf("eval: cassette %s was recorded against dataset_sha %s, but the corpus being scored now hashes to %s (this cassette is stale or belongs to a different corpus)",
+			c.path, c.datasetSHA, expected)
+	}
+	return nil
 }
 
 // Get returns the recorded result for key, if any.
@@ -111,7 +150,7 @@ func (c *Cassette) Save() error {
 		entries = append(entries, e)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key.storageKey() < entries[j].Key.storageKey() })
-	b, err := json.MarshalIndent(cassetteFile{Entries: entries}, "", "  ")
+	b, err := json.MarshalIndent(cassetteFile{DatasetSHA: c.datasetSHA, Entries: entries}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("eval: marshal cassette: %w", err)
 	}
@@ -164,6 +203,7 @@ func (c *CassetteScorer) Version() string                  { return c.Inner.Vers
 func (c *CassetteScorer) Score(ctx context.Context, req model.ScoreRequest) (model.ScoreResult, error) {
 	key := CassetteKey{
 		Scorer:        c.Inner.Name(),
+		ScorerVersion: c.Inner.Version(),
 		Model:         c.Inner.Name(),
 		PromptVersion: c.PromptVersion,
 		InputHash:     hashScoreRequest(req),

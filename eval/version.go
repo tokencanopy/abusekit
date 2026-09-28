@@ -17,10 +17,35 @@
 // not in this package, precisely so eval itself keeps its "no DB" grip.
 package eval
 
+import "runtime/debug"
+
 // AbusekitVersion is recorded on every Manifest (design §4.10: "abusekit
 // version and git sha"). There is no build-time version-injection
-// convention yet in this repo (no ldflags, no VCS-stamped build info
-// wired up) — this is a placeholder string for that eventual wiring, not
-// a real release identifier yet. Manifest.GitSHA (see eval.go) is left
-// empty for the same reason: nothing captures it today.
+// convention yet in this repo (no ldflags) — this is a placeholder
+// string for that eventual wiring, not a real release identifier yet.
 const AbusekitVersion = "v0-s4-dev"
+
+// SchemaVersion identifies run.json's own top-level shape (fix round S5)
+// — independent of AbusekitVersion, which identifies the BINARY, not the
+// wire format it emits. Bump it whenever a field on Manifest/Verdict/
+// Metrics is renamed, removed, or retyped; an addition alone doesn't need
+// a bump (this repo's own additive-change convention).
+const SchemaVersion = "run.v1"
+
+// gitSHA reads the build's VCS revision from Go's own build-info
+// embedding (automatic since Go 1.18 when built from a git checkout via
+// plain `go build`; see `go help buildvcs`) — no ldflags wiring needed.
+// Returns "" when unavailable (go run, a non-git checkout, or
+// -buildvcs=false), same as AbusekitVersion's own placeholder status.
+func gitSHA() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" {
+			return s.Value
+		}
+	}
+	return ""
+}

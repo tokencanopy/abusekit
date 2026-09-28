@@ -3,7 +3,9 @@ package eval
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/tokencanopy/abusekit/internal/config"
@@ -77,6 +79,12 @@ type Subject struct {
 	// Source is the label's provenance (design §4.9: "operator"|
 	// "outcome", or a label-snapshot corpus row's own `source`).
 	Source string
+	// Split is "train", "test", or "" (unknown/unset) — design §4.9's
+	// 80/20 split. A label-snapshot corpus row carries its own `split`
+	// verbatim; a replay-derived subject gets one computed from a keyed
+	// hash of its link cluster (fix round S7 — see replay.go's
+	// computeSplits). FilterSplit uses this field.
+	Split string
 	// Meta is the corpus row's free-form `meta` object, or (for a
 	// replay-derived subject) a small set of derived facts (decision_at
 	// per slice, the events count considered) — carried through to
@@ -140,6 +148,30 @@ type Options struct {
 	// of what was actually scored.
 	DatasetSHA string
 	LabelsSHA  string
+	// SplitFilter is recorded on the manifest verbatim (fix round S5) —
+	// purely informational: Run does not itself filter dataset by split.
+	// A caller applies FilterSplit(dataset, splitFilter) BEFORE calling
+	// Run and passes the same string here so run.json records what was
+	// actually scored.
+	SplitFilter string
+}
+
+// FilterSplit returns the subset of dataset.Subjects whose Split matches
+// split ("" or "all" means every subject, unfiltered) — fix round S7's
+// `--split train|test|all` flag. A subject with Split == "" (unknown —
+// possible if a caller built a Dataset by hand without setting it) never
+// matches a non-"all" filter.
+func FilterSplit(dataset Dataset, split string) Dataset {
+	if split == "" || split == "all" {
+		return dataset
+	}
+	out := Dataset{Replay: dataset.Replay}
+	for _, s := range dataset.Subjects {
+		if s.Split == split {
+			out.Subjects = append(out.Subjects, s)
+		}
+	}
+	return out
 }
 
 func (o Options) slice() Slice {
@@ -170,16 +202,43 @@ func (o Options) now() time.Time {
 // deterministic given the same Dataset/Rule/Scorer/Options except `At`,
 // which is why determinism_test.go compares two runs with At zeroed out.
 type Manifest struct {
-	AbusekitVersion string    `json:"abusekit_version"`
-	DatasetSHA      string    `json:"dataset_sha"`
-	LabelsSHA       string    `json:"labels_sha,omitempty"`
-	RuleSHA         string    `json:"rule_sha"`
-	WeightsSHA      string    `json:"weights_sha"`
-	Scorer          string    `json:"scorer"`
-	Model           string    `json:"model"`
-	PromptVersion   string    `json:"prompt_version"`
-	Slice           string    `json:"slice"`
-	At              time.Time `json:"at"`
+	// SchemaVersion identifies run.json's own top-level shape (fix round
+	// S5) — bump it whenever a field is renamed/removed/retyped (an
+	// addition alone doesn't need a bump, per the repo's own additive-
+	// change convention).
+	SchemaVersion   string `json:"schema_version"`
+	AbusekitVersion string `json:"abusekit_version"`
+	// GitSHA is the build's VCS revision (fix round S5), read from
+	// runtime/debug's build info — empty when the binary wasn't built
+	// from a git checkout (e.g. `go run`, or GOFLAGS=-buildvcs=false).
+	GitSHA     string `json:"git_sha,omitempty"`
+	DatasetSHA string `json:"dataset_sha"`
+	LabelsSHA  string `json:"labels_sha,omitempty"`
+	RuleSHA    string `json:"rule_sha"`
+	WeightsSHA string `json:"weights_sha"`
+	Scorer     string `json:"scorer"`
+	Model      string `json:"model"`
+	// Checkpoint is the scorer's own ScoreResult.Checkpoint from the
+	// first successfully scored subject this run (fix round S5) — empty
+	// if nothing was ever scored (e.g. every subject was unscored).
+	Checkpoint    string `json:"checkpoint,omitempty"`
+	PromptVersion string `json:"prompt_version"`
+	// Labels is the rule's own label vocabulary (fix round S5) — what
+	// every Verdict.Label and Subject.Label is validated against (see
+	// validateSubjectLabels).
+	Labels []string `json:"labels"`
+	// Threshold is the rule's own configured threshold (fix round S5),
+	// duplicated onto the manifest so a reader of run.json alone (no
+	// rules.yaml in hand) can tell what "flagged" meant for this run.
+	Threshold float64 `json:"threshold"`
+	// TierCuts is {"medium":.., "high":..} when Options.Tiers was validly
+	// configured (fix round S5); omitted otherwise.
+	TierCuts map[string]float64 `json:"tier_cuts,omitempty"`
+	Slice    string             `json:"slice"`
+	// SplitFilter is Options.SplitFilter verbatim (fix round S5/S7) — ""
+	// or "all" means unfiltered.
+	SplitFilter string    `json:"split_filter,omitempty"`
+	At          time.Time `json:"at"`
 	// CalibrationApplied reports whether Options.Calibration was non-nil
 	// for this run — design §4.10 calls for a calibration id on every
 	// verdict; S4's Options takes a bare core.Calibrator (no id — that
@@ -213,6 +272,8 @@ type RunResult struct {
 // smaller, metrics-focused view than Verdict (which is run.json's own
 // wire shape).
 type scoredRecord struct {
+	subjectID string
+	category  string
 	label     string
 	positive  bool // label != rule.BenignLabel
 	unscored  bool
@@ -223,11 +284,48 @@ type scoredRecord struct {
 	haveLead  bool
 }
 
+// validateSubjectLabels rejects (fix round S6) any subject whose ground-
+// truth Label isn't in rule.Labels — a corpus authored for one rule's
+// vocabulary silently scored against a different rule (e.g. a "phishing"/
+// "brand_impersonation"/"scam" corpus meant for `lure_similarity` run
+// against `new_account_velocity`, whose vocabulary is "benign"/
+// "suspicious"/"abusive") previously scored every subject as an
+// unrecognized-but-accepted label, silently miscounting positives.
+func validateSubjectLabels(subjects []Subject, rule config.Rule) error {
+	allowed := make(map[string]bool, len(rule.Labels))
+	for _, l := range rule.Labels {
+		allowed[l] = true
+	}
+	var bad []string
+	for _, s := range subjects {
+		if !allowed[s.Label] {
+			bad = append(bad, fmt.Sprintf("%s (label %q)", s.ID, s.Label))
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	sort.Strings(bad)
+	return fmt.Errorf("eval: %d subject(s) have a label outside rule %q's vocabulary %v: %s", len(bad), rule.Name, rule.Labels, strings.Join(bad, ", "))
+}
+
 // Run scores every Subject in dataset at rule using scorer, per Options,
 // and reduces the result to metrics (design §4.10). Run is pure: it does
 // no I/O beyond calling scorer.Score, which callers control (a
 // CassetteScorer for CI, a real adapter for a live/nightly run, the local
 // scorer for neither).
+//
+// Run returns a non-nil error — aborting before any metrics are computed
+// — in two cases: a subject's ground-truth label isn't in rule.Labels
+// (fix round S6), or a scorer call misses its cassette
+// (errors.Is(err, ErrCassetteMiss) — fix round B3: this must never be
+// silently folded into an "unscored" verdict, since that's exactly the
+// "CI quietly called a vendor, or quietly pretended a subject scored
+// low" failure mode a cassette exists to prevent). Every OTHER scorer
+// error (a live adapter's genuine timeout/5xx) stays a soft per-subject
+// "unscored" verdict, unchanged from before this fix round — Run keeps
+// scoring the rest of the dataset rather than aborting over one flaky
+// call.
 //
 // Run never mutates dataset, rule, or opts.
 func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Scorer, opts Options) (RunResult, error) {
@@ -238,6 +336,9 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 	if !validSlice(slice) {
 		return RunResult{}, errors.New("eval: invalid slice " + string(slice) + " (want first_send, early_15m, or full)")
 	}
+	if err := validateSubjectLabels(dataset.Subjects, rule); err != nil {
+		return RunResult{}, err
+	}
 
 	subjects := make([]Subject, len(dataset.Subjects))
 	copy(subjects, dataset.Subjects)
@@ -247,12 +348,13 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 	records := make([]scoredRecord, 0, len(subjects))
 	var totalCostMicro int64
 	var latenciesMS []float64
+	var checkpoint string
 
 	for _, subj := range subjects {
-		rec := scoredRecord{label: subj.Label, positive: subj.Label != rule.BenignLabel}
+		rec := scoredRecord{subjectID: subj.ID, category: subj.Category, label: subj.Label, positive: subj.Label != rule.BenignLabel}
 
 		pt, ok := subj.Points[slice]
-		v := Verdict{Subject: subj.ID, Label: subj.Label}
+		v := Verdict{Subject: subj.ID, Label: subj.Label, Tier: "unknown"} // nit: an unscored verdict's tier is "unknown", never the Go zero value ""
 		if !ok {
 			v.Unscored = true
 			v.ErrorCode = "missing_slice"
@@ -260,6 +362,8 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 		} else {
 			risk, flagged, unscored, res, errCode, callErr := scoreOne(ctx, rule, scorer, opts, pt)
 			switch {
+			case callErr != nil && errors.Is(callErr, ErrCassetteMiss):
+				return RunResult{}, fmt.Errorf("eval: run aborted scoring subject %s: %w", subj.ID, callErr)
 			case callErr != nil:
 				v.Unscored = true
 				v.ErrorCode = "scorer_error"
@@ -277,14 +381,23 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 				rec.truncated = res.Truncated
 				totalCostMicro += res.CostMicro
 				latenciesMS = append(latenciesMS, float64(res.LatencyMS))
+				if checkpoint == "" {
+					checkpoint = res.Checkpoint
+				}
 			}
 		}
 
 		if dataset.Replay && rec.positive {
-			if lt, ok := computeLeadTime(ctx, rule, scorer, opts, subj, slice, v); ok {
+			lt, haveLead, leadCostMicro, leadLatenciesMS, err := computeLeadTime(ctx, rule, scorer, opts, subj, slice, v)
+			if err != nil {
+				return RunResult{}, fmt.Errorf("eval: run aborted computing lead time for subject %s: %w", subj.ID, err)
+			}
+			if haveLead {
 				rec.leadTime = lt
 				rec.haveLead = true
 			}
+			totalCostMicro += leadCostMicro
+			latenciesMS = append(latenciesMS, leadLatenciesMS...)
 		}
 
 		verdicts = append(verdicts, v)
@@ -293,16 +406,28 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 
 	metrics := computeMetrics(records, opts.Tiers, dataset.Replay, totalCostMicro, latenciesMS)
 
+	var tierCuts map[string]float64
+	if validTiers(opts.Tiers) {
+		tierCuts = map[string]float64{"medium": opts.Tiers.Medium, "high": opts.Tiers.High}
+	}
+
 	manifest := Manifest{
+		SchemaVersion:      SchemaVersion,
 		AbusekitVersion:    AbusekitVersion,
+		GitSHA:             gitSHA(),
 		DatasetSHA:         datasetSHA(opts.DatasetSHA, dataset),
 		LabelsSHA:          opts.LabelsSHA,
 		RuleSHA:            ruleSHA(rule),
 		WeightsSHA:         scorer.Version(),
 		Scorer:             scorer.Name(),
 		Model:              scorer.Name(),
+		Checkpoint:         checkpoint,
 		PromptVersion:      opts.promptVersion(),
+		Labels:             rule.Labels,
+		Threshold:          rule.Threshold,
+		TierCuts:           tierCuts,
 		Slice:              string(slice),
+		SplitFilter:        opts.SplitFilter,
 		At:                 opts.now(),
 		CalibrationApplied: opts.Calibration != nil,
 	}
@@ -314,8 +439,20 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 // was flagged, reusing selectedVerdict for slice itself (no duplicate
 // scorer call) and scoring subj's other available Points fresh. Returns
 // ok=false when subj has no Points at all beyond the selected slice AND
-// the selected slice itself was unscored — i.e. truly nothing to bucket.
-func computeLeadTime(ctx context.Context, rule config.Rule, scorer model.Scorer, opts Options, subj Subject, selected Slice, selectedVerdict Verdict) (leadTimeBucket, bool) {
+// the selected slice itself was unscored — i.e. truly nothing to bucket
+// (a "never" bucket, by contrast, means every available slice WAS
+// scored, just never flagged).
+//
+// A cassette miss during one of these extra scoring calls aborts the
+// whole Run, exactly like the main scoring loop (fix round B3) — err is
+// non-nil only for that case. Any other scorer error for one slice is
+// treated as "couldn't tell, keep checking the other slices" (fix round,
+// nit: "computeLeadTime surfaces scorer errors" — it no longer silently
+// swallows one without at least trying the remaining slices). costMicro/
+// latenciesMS accumulate every extra call actually made, successful or
+// not, so Metrics.CostTotalMicro/Latency reflect the true number of
+// scorer calls a lead-time computation makes (nit: previously discarded).
+func computeLeadTime(ctx context.Context, rule config.Rule, scorer model.Scorer, opts Options, subj Subject, selected Slice, selectedVerdict Verdict) (bucket leadTimeBucket, ok bool, costMicro int64, latenciesMS []float64, err error) {
 	haveAny := false
 	for _, s := range sliceOrder {
 		var flagged bool
@@ -326,24 +463,32 @@ func computeLeadTime(ctx context.Context, rule config.Rule, scorer model.Scorer,
 			haveAny = true
 			flagged = selectedVerdict.Flagged
 		} else {
-			pt, ok := subj.Points[s]
-			if !ok {
+			pt, ptOK := subj.Points[s]
+			if !ptOK {
 				continue
 			}
 			haveAny = true
-			risk, fl, unscored, _, _, callErr := scoreOne(ctx, rule, scorer, opts, pt)
-			if callErr != nil || unscored {
+			risk, fl, unscored, res, _, callErr := scoreOne(ctx, rule, scorer, opts, pt)
+			_ = risk
+			if callErr != nil {
+				if errors.Is(callErr, ErrCassetteMiss) {
+					return "", false, costMicro, latenciesMS, callErr
+				}
+				continue // a non-cassette-miss error for this slice: can't tell, try the others
+			}
+			costMicro += res.CostMicro
+			latenciesMS = append(latenciesMS, float64(res.LatencyMS))
+			if unscored {
 				continue
 			}
-			_ = risk
 			flagged = fl
 		}
 		if flagged {
-			return bucketForSlice(s), true
+			return bucketForSlice(s), true, costMicro, latenciesMS, nil
 		}
 	}
 	if !haveAny {
-		return "", false
+		return "", false, costMicro, latenciesMS, nil
 	}
-	return leadTimeNever, true
+	return leadTimeNever, true, costMicro, latenciesMS, nil
 }

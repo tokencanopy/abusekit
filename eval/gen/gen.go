@@ -248,12 +248,27 @@ func decisionAtMap(events []event.Event) map[string]string {
 			}
 		}
 	}
+	// Fix round B2: the loader now rejects any row whose resolved slices
+	// are out of order (first_send <= early_15m <= full) — clamp here so
+	// the generator never produces one. A family whose real first
+	// external send lands days after the fixed +15m window (most benign
+	// families) simply gets a first_send equal to early_15m: still a
+	// valid, if less distinctive, decision point, never an invalid one.
+	full := last.Add(time.Nanosecond)
+	early15 := first.Add(15 * time.Minute)
+	if early15.After(full) {
+		early15 = full
+	}
 	m := map[string]string{
-		"full":      last.Add(time.Nanosecond).UTC().Format(time.RFC3339Nano),
-		"early_15m": first.Add(15 * time.Minute).UTC().Format(time.RFC3339Nano),
+		"full":      full.UTC().Format(time.RFC3339Nano),
+		"early_15m": early15.UTC().Format(time.RFC3339Nano),
 	}
 	if haveExternal {
-		m["first_send"] = firstExternal.UTC().Format(time.RFC3339Nano)
+		firstSend := firstExternal
+		if firstSend.After(early15) {
+			firstSend = early15
+		}
+		m["first_send"] = firstSend.UTC().Format(time.RFC3339Nano)
 	}
 	return m
 }

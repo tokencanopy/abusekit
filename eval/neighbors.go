@@ -61,12 +61,28 @@ type linkRef struct {
 // inflating linked_deleted_n for a case design §1.2(c) specifically
 // expects to be hard for exactly the first two.
 //
-// labelledAbusive is deliberately NOT time-filtered the same way —
-// design's replay-labels shape carries a ground-truth `label`, not a
-// separately-timestamped operator label EVENT the way production's real
-// labels table would; treating "labelled abusive" as always-visible
-// (once the dataset says so at all) is a documented simplification, not
-// an oversight — see this type's own field comment.
+// labelledAt holds every "label" event (see LoadReplayDataset's own doc
+// comment on this convention) seen for one subject, each paired with the
+// instant it was recorded — evidenceAsOf only counts one whose `at`
+// precedes the asked-for asOf, and only when its value is "positive"
+// relative to whichever rule is being scored (see labelledAsOf).
+//
+// Fix round B1: this is DELIBERATELY never derived from labels.jsonl's
+// ground truth (the ANSWER being evaluated) — only from `label`-typed
+// rows in the EVENTS file, the same way a real deployment would only
+// ever see a neighbour's history through events/labels it actually
+// recorded, never through the corpus's own held-out answer key. Reading
+// the evaluated ground truth here would let one subject's neighbour
+// evidence "know" a fact (another subject IS abusive) that no real
+// scoring pass could have known at that same wall-clock instant, quietly
+// inflating recall on every densely-linked family (worst on churn, where
+// every incarnation in a chain would trivially see every other
+// incarnation's held-out answer).
+type labelledAt struct {
+	at    time.Time
+	value string
+}
+
 type datasetNeighbors struct {
 	// byKindHash holds every (kind, hash) -> every linkRef that ever
 	// touched it, UNDEDUPED: a subject that used the same link key twice
@@ -79,20 +95,22 @@ type datasetNeighbors struct {
 	// possible in this vocabulary, but defensive either way — would keep
 	// the first).
 	permanentlyDeletedAt map[string]time.Time
-	// labelledAbusive is NOT time-filtered — see the type's own doc
-	// comment above.
-	labelledAbusive map[string]bool
+	// labelEvents is keyed by subject; see labelledAt's own doc comment.
+	labelEvents map[string][]labelledAt
 }
 
-// newDatasetNeighbors indexes eventsBySubject's link keys and permanent
-// subject.deleted events, and labelBySubject's "abusive" values.
-// labelBySubject may be nil (a label-snapshot corpus has no
-// event-replay-shaped Neighbors need at all — see dataset.go).
-func newDatasetNeighbors(eventsBySubject map[string][]event.Event, labelBySubject map[string]string) *datasetNeighbors {
+// newDatasetNeighbors indexes eventsBySubject's link keys, permanent
+// subject.deleted events, and "label"-typed events (fix round B1 — see
+// labelledAt's doc comment). eventsBySubject must NOT include "label"
+// events themselves (LoadReplayDataset routes them separately — a
+// label-posting action was never a real account-activity event, and
+// leaving it in the slice feature.Extract reads would let it corrupt
+// e.g. subject_age_h's first-seen anchor).
+func newDatasetNeighbors(eventsBySubject map[string][]event.Event, labelEventsBySubject map[string][]labelledAt) *datasetNeighbors {
 	n := &datasetNeighbors{
 		byKindHash:           map[string]map[string][]linkRef{},
 		permanentlyDeletedAt: map[string]time.Time{},
-		labelledAbusive:      map[string]bool{},
+		labelEvents:          labelEventsBySubject,
 	}
 	for subject, events := range eventsBySubject {
 		for _, e := range events {
@@ -110,11 +128,24 @@ func newDatasetNeighbors(eventsBySubject map[string][]event.Event, labelBySubjec
 				}
 			}
 		}
-		if labelBySubject[subject] == "abusive" {
-			n.labelledAbusive[subject] = true
-		}
 	}
 	return n
+}
+
+// labelledAsOf reports whether subject has a "label" event, recorded
+// strictly before asOf, whose value is "positive" — i.e. not
+// benignLabel (fix round B1: "take the positive/negative class from the
+// rule's labels, not the hardcoded 'abusive'" — a rule's own vocabulary
+// need not even contain the literal string "abusive" at all, design
+// §4.5's `lure_similarity` example uses "phishing"/"brand_impersonation"/
+// "scam" instead).
+func (n *datasetNeighbors) labelledAsOf(subject string, asOf time.Time, benignLabel string) bool {
+	for _, le := range n.labelEvents[subject] {
+		if le.at.Before(asOf) && le.value != benignLabel {
+			return true
+		}
+	}
+	return false
 }
 
 // neighborsByKinds returns subject's same-tenant neighbours sharing any
@@ -189,8 +220,10 @@ func (n *datasetNeighbors) neighborsByKinds(subject string, kinds []string, asOf
 }
 
 // evidenceAsOf resolves NeighborEvidence for subject as of asOf (see this
-// type's own doc comment for why "as of" matters).
-func (n *datasetNeighbors) evidenceAsOf(subject string, asOf time.Time) (feature.NeighborEvidence, error) {
+// type's own doc comment for why "as of" matters). benignLabel is
+// whichever rule is currently being scored's BenignLabel (fix round B1
+// — see labelledAsOf).
+func (n *datasetNeighbors) evidenceAsOf(subject string, asOf time.Time, benignLabel string) (feature.NeighborEvidence, error) {
 	general, generalTruncated := n.neighborsByKinds(subject, defaultNeighborKinds, asOf)
 	fingerprintNeighbors, fpTruncated := n.neighborsByKinds(subject, []string{fingerprintKind}, asOf)
 
@@ -199,7 +232,7 @@ func (n *datasetNeighbors) evidenceAsOf(subject string, asOf time.Time) (feature
 		if t, ok := n.permanentlyDeletedAt[s]; ok && t.Before(asOf) {
 			deleted++
 		}
-		if n.labelledAbusive[s] {
+		if n.labelledAsOf(s, asOf, benignLabel) {
 			labelled++
 		}
 	}
@@ -211,17 +244,21 @@ func (n *datasetNeighbors) evidenceAsOf(subject string, asOf time.Time) (feature
 	}, nil
 }
 
-// asOfNeighbors adapts a fixed (datasetNeighbors, asOf) pair to
-// feature.Neighbors' interface (Evidence has no cutoff parameter of its
-// own) — replay.go constructs one of these per (subject, slice) pair,
-// all sharing the same underlying datasetNeighbors index.
+// asOfNeighbors adapts a fixed (datasetNeighbors, asOf, benignLabel)
+// triple to feature.Neighbors' interface (Evidence has no cutoff
+// parameter of its own) — replay.go constructs one of these per
+// (subject, slice) pair, all sharing the same underlying
+// datasetNeighbors index. benignLabel is threaded through from whichever
+// rule the CALLER (LoadReplayDataset, via its own benignLabel parameter)
+// is building features for — see fix round B1.
 type asOfNeighbors struct {
-	n    *datasetNeighbors
-	asOf time.Time
+	n           *datasetNeighbors
+	asOf        time.Time
+	benignLabel string
 }
 
 func (a asOfNeighbors) Evidence(_ context.Context, _, subject string) (feature.NeighborEvidence, error) {
-	return a.n.evidenceAsOf(subject, a.asOf)
+	return a.n.evidenceAsOf(subject, a.asOf, a.benignLabel)
 }
 
 // dataStringField reads a possibly-absent, possibly-wrong-typed string

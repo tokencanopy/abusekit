@@ -104,18 +104,22 @@ func ruleByNameT(t *testing.T, cfg *config.Config, name string) config.Rule {
 func loadSyntheticDataset(t *testing.T, brands feature.BrandSet) Dataset {
 	t.Helper()
 	root := repoRoot(t)
-	eventsF, err := os.Open(filepath.Join(root, "eval", "fixtures", "synthetic", "events.jsonl"))
+	eventsPath := filepath.Join(root, "eval", "fixtures", "synthetic", "events.jsonl")
+	labelsPath := filepath.Join(root, "eval", "fixtures", "synthetic", "labels.jsonl")
+	eventsF, err := os.Open(eventsPath)
 	if err != nil {
 		t.Fatalf("open synthetic events: %v", err)
 	}
 	defer eventsF.Close()
-	labelsF, err := os.Open(filepath.Join(root, "eval", "fixtures", "synthetic", "labels.jsonl"))
+	labelsF, err := os.Open(labelsPath)
 	if err != nil {
 		t.Fatalf("open synthetic labels: %v", err)
 	}
 	defer labelsF.Close()
 
-	ds, rowErrs, err := LoadReplayDataset(eventsF, labelsF, brands)
+	// "benign" matches config/rules.yaml's new_account_velocity.benign_label
+	// — every test using this helper scores that rule.
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: eventsPath, Events: eventsF, LabelsPath: labelsPath, Labels: labelsF}, brands, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset(synthetic corpus): %v (rowErrs=%v)", err, rowErrs)
 	}

@@ -27,7 +27,7 @@ func TestLoadReplayDataset_StrictlyBeforeDecisionAt(t *testing.T) {
 	labels := strings.NewReader(`
 {"subject":"acct_1","label":"benign","source":"operator","decision_at":{"early_15m":"2031-01-01T00:02:00Z"}}
 `)
-	ds, rowErrs, err := LoadReplayDataset(events, labels, feature.BrandSet{})
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -70,12 +70,16 @@ func TestLoadReplayDataset_NeighborEvidenceRespectsChronology(t *testing.T) {
 {"subject":"subject_late","type":"subject.created","at":"2031-01-01T00:10:00Z","links":{"email_hash":"` + hash64("shared-email") + `"},"data":{"channel":"signup"}}
 {"subject":"subject_late","type":"resource.created","at":"2031-01-01T00:11:00Z","data":{"kind":"agent","name":"Y"}}
 `)
+	// "neighbor" deliberately has NO labels-file row at all: the
+	// neighbour index is built from the EVENTS file alone (see
+	// newDatasetNeighbors), so its permanent deletion is visible to
+	// subject_early/subject_late regardless of whether "neighbor" itself
+	// is ever scored.
 	labels := strings.NewReader(`
-{"subject":"neighbor","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T00:06:00Z"}}
 {"subject":"subject_early","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T00:03:00Z"}}
 {"subject":"subject_late","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T00:12:00Z"}}
 `)
-	ds, rowErrs, err := LoadReplayDataset(events, labels, feature.BrandSet{})
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -104,7 +108,7 @@ func TestLoadReplayDataset_TextFieldExtraction(t *testing.T) {
 {"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:01:00Z","data":{"subject_line":"Account Verification Required","recipient_domain":"customer.example.test","recipient_is_own_identity":false,"first_link_host":"verify.example.test"}}
 `)
 	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
-	ds, rowErrs, err := LoadReplayDataset(events, labels, feature.BrandSet{})
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}

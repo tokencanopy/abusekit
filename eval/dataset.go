@@ -16,13 +16,27 @@ const maxJSONLLineBytes = 1 << 20 // 1 MiB
 
 // RowError is one line's schema-validation failure (task brief: "report
 // per-row errors with the line number"). Line is 1-based, matching what
-// an editor or `sed -n '<n>p'` would show.
+// an editor or `sed -n '<n>p'` would show. Source names the actual file
+// the row came from (a real path when the CLI supplied one; a
+// caller-chosen label like "events"/"labels" otherwise) — fix round P1:
+// a replay pair's two files were previously collapsed into one bogus
+// concatenated label with the WRONG file's line numbers reported against
+// it. Code is a short, stable, machine-readable identifier (P2: `--skip-
+// invalid` reports these in run.json's `skipped_rows`); Err carries the
+// full human-readable detail.
 type RowError struct {
-	Line int
-	Err  error
+	Source string
+	Line   int
+	Code   string
+	Err    error
 }
 
-func (e RowError) Error() string { return fmt.Sprintf("line %d: %v", e.Line, e.Err) }
+func (e RowError) Error() string {
+	if e.Source != "" {
+		return fmt.Sprintf("%s:%d: %v", e.Source, e.Line, e.Err)
+	}
+	return fmt.Sprintf("line %d: %v", e.Line, e.Err)
+}
 
 // SchemaError collects every RowError found while loading a dataset or
 // labels file — LoadX returns every violation at once (rather than
@@ -97,11 +111,17 @@ var validSplits = map[string]bool{"": true, "train": true, "test": true}
 // schema in eval/schema/corpus-v1.schema.json (mirrored here in Go, not
 // re-read from that file at runtime — see the schema file's own header
 // comment); a row that fails is reported as a RowError with its 1-based
-// line number, collected into rowErrs, and excluded from the returned
-// Dataset. A malformed JSON line, an empty id, an empty label, or a
-// features+text both empty are all row-level failures; scanJSONL itself
-// only returns a genuine I/O error (rowErrs is nil in that case, since
-// nothing was validated at all).
+// line number, collected into rowErrs. A malformed JSON line, an empty
+// id, an empty label, or a features+text both empty are all row-level
+// failures; scanJSONL itself only returns a genuine I/O error (rowErrs
+// is nil in that case, since nothing was validated at all).
+//
+// The returned Dataset always contains every row that DID parse
+// successfully, even when rowErrs is non-empty (fix round P2: `--skip-
+// invalid` needs a usable partial Dataset to go with the reported
+// errors) — a caller that wants the S4-default strict behavior simply
+// treats a non-nil error as fatal and never looks at the Dataset, same
+// as before this change.
 //
 // Every row lands under SliceFull — a label-snapshot corpus captures
 // exactly one decision point per row, already resolved by whoever wrote
@@ -114,33 +134,31 @@ func LoadSnapshotCorpus(r io.Reader) (Dataset, []RowError, error) {
 	seenIDs := map[string]int{}
 
 	err := scanJSONL(r, func(line int, raw []byte) error {
+		fail := func(code, format string, args ...any) error {
+			rowErrs = append(rowErrs, RowError{Source: "corpus", Line: line, Code: code, Err: fmt.Errorf(format, args...)})
+			return nil
+		}
 		var row snapshotRow
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&row); err != nil {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("invalid JSON or unknown field: %w", err)})
-			return nil
+			return fail("bad_json", "invalid JSON or unknown field: %w", err)
 		}
 		if row.ID == "" {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("id is required")})
-			return nil
+			return fail("missing_id", "id is required")
 		}
 		if prev, dup := seenIDs[row.ID]; dup {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("duplicate id %q (first seen at line %d)", row.ID, prev)})
-			return nil
+			return fail("duplicate_id", "duplicate id %q (first seen at line %d)", row.ID, prev)
 		}
 		seenIDs[row.ID] = line
 		if row.Label == "" {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("label is required")})
-			return nil
+			return fail("missing_label", "label is required")
 		}
 		if !validSplits[row.Split] {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("split %q must be \"train\", \"test\", or omitted", row.Split)})
-			return nil
+			return fail("bad_split", "split %q must be \"train\", \"test\", or omitted", row.Split)
 		}
 		if len(row.Input.Features) == 0 && len(row.Input.Text) == 0 {
-			rowErrs = append(rowErrs, RowError{Line: line, Err: fmt.Errorf("input.features and input.text are both empty")})
-			return nil
+			return fail("empty_input", "input.features and input.text are both empty")
 		}
 
 		meta := row.Meta
@@ -153,6 +171,7 @@ func LoadSnapshotCorpus(r io.Reader) (Dataset, []RowError, error) {
 			ID:     row.ID,
 			Label:  row.Label,
 			Source: row.Source,
+			Split:  row.Split,
 			Meta:   meta,
 			Points: map[Slice]Point{SliceFull: {Features: row.Input.Features, Text: row.Input.Text, Context: row.Input.Context}},
 		})
@@ -161,8 +180,9 @@ func LoadSnapshotCorpus(r io.Reader) (Dataset, []RowError, error) {
 	if err != nil {
 		return Dataset{}, nil, fmt.Errorf("eval: read snapshot corpus: %w", err)
 	}
+	dataset := Dataset{Subjects: subjects, Replay: false}
 	if len(rowErrs) > 0 {
-		return Dataset{}, rowErrs, &SchemaError{Rows: rowErrs}
+		return dataset, rowErrs, &SchemaError{Rows: rowErrs}
 	}
-	return Dataset{Subjects: subjects, Replay: false}, nil, nil
+	return dataset, nil, nil
 }
