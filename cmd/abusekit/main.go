@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -60,6 +62,7 @@ func run(args []string) error {
 
 type serveConfig struct {
 	check         bool
+	dev           bool
 	databaseURL   string
 	rulesPath     string
 	vendorsPath   string
@@ -70,25 +73,71 @@ type serveConfig struct {
 	listenAddr    string
 }
 
+// minKeySecretBytes and devSecretPrefix are the fix round's B2 guards
+// against booting with a fail-open default credential set: config/keys.yaml
+// (this repo's own shipped dev/test file) names every secret with
+// devSecretPrefix specifically so validateKeySecrets can recognize and
+// refuse it outside --dev, and every one of those shipped secrets is
+// already >= minKeySecretBytes so --dev alone is enough to run locally
+// against the shipped file.
+const (
+	minKeySecretBytes = 32
+	devSecretPrefix   = "dev-only-"
+)
+
 func parseServeFlags(args []string) (serveConfig, error) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var c serveConfig
 	fs.BoolVar(&c.check, "check", false, "boot store and config, then exit 0 without serving")
+	fs.BoolVar(&c.dev, "dev", false, "allow key secrets prefixed \"dev-only-\" (config/keys.yaml ships these) -- refused otherwise (B2 fix round)")
 	fs.StringVar(&c.databaseURL, "database-url", os.Getenv("ABUSEKIT_DATABASE_URL"), "Postgres connection string (env ABUSEKIT_DATABASE_URL)")
 	fs.StringVar(&c.rulesPath, "rules", envOr("ABUSEKIT_RULES_CONFIG", "config/rules.yaml"), "path to rules.yaml")
 	fs.StringVar(&c.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&c.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
 	fs.StringVar(&c.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
-	fs.StringVar(&c.keysPath, "keys", envOr("ABUSEKIT_KEYS_CONFIG", "config/keys.yaml"), "path to keys.yaml (design §4.3's per-producer/operator credentials)")
+	// B2 fix round: NO default keys path. A silently-defaulted
+	// config/keys.yaml is exactly the fail-open behavior this guards
+	// against -- every deployment must say explicitly where its keys live.
+	fs.StringVar(&c.keysPath, "keys", os.Getenv("ABUSEKIT_KEYS_CONFIG"), "path to keys.yaml (design §4.3's per-producer/operator credentials) -- required, no default (env ABUSEKIT_KEYS_CONFIG)")
 	fs.StringVar(&c.metricsListen, "metrics-listen", envOr("ABUSEKIT_METRICS_LISTEN", "127.0.0.1:9099"), "loopback address to serve worker.Metrics on via expvar's /debug/vars (env ABUSEKIT_METRICS_LISTEN; empty disables it — R8 round 2)")
-	fs.StringVar(&c.listenAddr, "listen", envOr("ABUSEKIT_LISTEN", ":8080"), "address to serve the /v1/* HTTP API on (env ABUSEKIT_LISTEN; empty disables it — S3)")
+	// B2 fix round: loopback by default, not every interface -- an
+	// operator has to opt into a wider bind explicitly.
+	fs.StringVar(&c.listenAddr, "listen", envOr("ABUSEKIT_LISTEN", "127.0.0.1:8080"), "address to serve the /v1/* HTTP API on (env ABUSEKIT_LISTEN; empty disables it — S3)")
 	if err := fs.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
 	if c.databaseURL == "" {
 		return serveConfig{}, errors.New("a database URL is required: pass --database-url or set ABUSEKIT_DATABASE_URL")
 	}
+	if c.keysPath == "" {
+		return serveConfig{}, errors.New("a keys config is required: pass --keys or set ABUSEKIT_KEYS_CONFIG (no default — B2 fix round)")
+	}
 	return c, nil
+}
+
+// validateKeySecrets is the B2 fix round's boot-time guard against a
+// fail-open credential set: every secret must be at least
+// minKeySecretBytes long (regardless of --dev — a short secret is weak
+// however it got there), and none may carry devSecretPrefix unless dev is
+// true (config/keys.yaml, this repo's own shipped dev/test file, names
+// every secret this way specifically so it can never boot silently
+// outside --dev).
+func validateKeySecrets(keys map[string]config.Key, dev bool) error {
+	ids := make([]string, 0, len(keys))
+	for id := range keys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic error ordering, not map iteration
+	for _, id := range ids {
+		k := keys[id]
+		if len(k.Secret) < minKeySecretBytes {
+			return fmt.Errorf("key %q: secret is %d bytes, want >= %d", id, len(k.Secret), minKeySecretBytes)
+		}
+		if !dev && strings.HasPrefix(k.Secret, devSecretPrefix) {
+			return fmt.Errorf("key %q: secret is prefixed %q (config/keys.yaml's own dev/test credentials) -- pass --dev to allow this, or point --keys at a real credential file", id, devSecretPrefix)
+		}
+	}
+	return nil
 }
 
 func envOr(key, fallback string) string {
@@ -366,6 +415,9 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 	keys, err := config.LoadKeys(keysData)
 	if err != nil {
 		return nil, nil, bootDeps{}, fmt.Errorf("load keys config: %w", err)
+	}
+	if err := validateKeySecrets(keys, c.dev); err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("validate keys config: %w", err)
 	}
 
 	pool, err := pgxpool.New(ctx, c.databaseURL)

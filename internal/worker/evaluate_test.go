@@ -8,6 +8,7 @@ import (
 
 	"github.com/tokencanopy/abusekit/internal/event"
 	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/fake"
 	"github.com/tokencanopy/abusekit/internal/store"
 )
@@ -23,6 +24,11 @@ import (
 // operator scenario reaches `high` on the call a product makes before its
 // first external send, and records the call's own latency as the "fast"
 // criterion's evidence against design's <=3000ms deadline ceiling.
+//
+// EvaluateSubject itself only reports whether a fresh round committed (S1
+// fix round: the caller always finishes with its own store.SubjectView
+// read, exactly like GET /v1/subjects/{subject} does) — so this test reads
+// the committed view back the same way internal/serve's handler will.
 func TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -56,16 +62,13 @@ func TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend(t *testing.T) {
 	}
 
 	start := time.Now()
-	verdict, err := w.EvaluateSubject(ctx, testTenant, "acct_example_fast_1", 3*time.Second)
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "acct_example_fast_1", 3*time.Second)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("EvaluateSubject: %v", err)
 	}
-	if verdict.Tier != "high" {
-		t.Errorf("fast.jsonl evaluate (before first external send): tier = %q (score %v), want high\nsignals: %+v", verdict.Tier, verdict.Score, verdict.Signals)
-	}
-	if verdict.Degraded {
-		t.Errorf("fast.jsonl evaluate: degraded = true, want false (the local rule should always answer)")
+	if !evaluatedNow {
+		t.Fatalf("expected evaluatedNow=true")
 	}
 	// "the design's latency target": the local scorer is a pure in-process
 	// computation with no network call, so a synchronous evaluate call
@@ -81,7 +84,10 @@ func TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend(t *testing.T) {
 		t.Fatalf("SubjectView: %v", err)
 	}
 	if view.Tier != "high" {
-		t.Fatalf("expected the committed verdict to also read back as high, got %q", view.Tier)
+		t.Fatalf("expected the committed verdict to read back as high, got %q\nsignals: %+v", view.Tier, view.Signals)
+	}
+	if view.Degraded {
+		t.Errorf("fast.jsonl evaluate: degraded = true, want false (the local rule should always answer)")
 	}
 }
 
@@ -120,11 +126,39 @@ func TestEvaluateSubject_NotFoundForUnseenSubject(t *testing.T) {
 	}
 }
 
-// TestEvaluateSubject_AlreadyClaimedSurfacesError proves a subject the
-// worker's own Tick has already claimed cannot also be claimed by a
-// concurrent evaluate call (design: evaluate shares "the same lease...
-// rules" as the worker's own scoring pass).
-func TestEvaluateSubject_AlreadyClaimedSurfacesError(t *testing.T) {
+// TestEvaluateSubject_SyntheticSubjectIsNotScorable is S1: e2a's own
+// prober accounts are synthetic — evaluate must report ErrNotScorable
+// (never a generic/500-shaped error) so internal/serve can fall back to
+// the stored view instead of failing the request.
+func TestEvaluateSubject_SyntheticSubjectIsNotScorable(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	cfg := loadShippedConfig(t)
+	now := time.Date(2031, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	appendEvent(t, ctx, s, "mon-a", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
+	appendEvent(t, ctx, s, "mon-a", "subject.class", now.Add(time.Second), event.Links{}, map[string]any{"class": "synthetic"})
+
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "mon-a", 3*time.Second)
+	if !errors.Is(err, store.ErrNotScorable) {
+		t.Fatalf("expected store.ErrNotScorable, got %v", err)
+	}
+	if evaluatedNow {
+		t.Fatalf("expected evaluatedNow=false")
+	}
+}
+
+// TestEvaluateSubject_AlreadyClaimedSurfacesBusyWithRealRetryAfter proves a
+// subject the worker's own Tick has already claimed cannot also be claimed
+// by a concurrent evaluate call (design: evaluate shares "the same
+// lease... rules" as the worker's own scoring pass), and that the
+// returned *store.ErrBusy carries a REAL retry time (S1 fix round), not a
+// fixed guess.
+func TestEvaluateSubject_AlreadyClaimedSurfacesBusyWithRealRetryAfter(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	cfg := loadShippedConfig(t)
@@ -140,19 +174,94 @@ func TestEvaluateSubject_AlreadyClaimedSurfacesError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	_, err = w.EvaluateSubject(ctx, testTenant, "acct_eval_claimed", 3*time.Second)
-	if !errors.Is(err, store.ErrAlreadyClaimed) {
-		t.Fatalf("expected store.ErrAlreadyClaimed, got %v", err)
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_claimed", 3*time.Second)
+	var busy *store.ErrBusy
+	if !errors.As(err, &busy) {
+		t.Fatalf("expected *store.ErrBusy, got %v", err)
+	}
+	if evaluatedNow {
+		t.Fatalf("expected evaluatedNow=false")
+	}
+	if wait := busy.RetryAt.Sub(now); wait < 90*time.Second {
+		t.Fatalf("RetryAt implies only %v, want close to the ~2min worker claim lease", wait)
 	}
 }
 
-// TestEvaluateSubject_SyncOnlySkipsNonLocalScorer proves the syncOnly
-// restriction (design: "the local scorer always can; vendor scorers only
-// if their p99 fits" — v0 has no measured p99 for any vendor scorer): a
-// rule scored by anything other than "local" is reported unscored with
-// "sync_scorer_unsupported" from EvaluateSubject, even though the SAME
-// rule scores normally from Tick.
-func TestEvaluateSubject_SyncOnlySkipsNonLocalScorer(t *testing.T) {
+// TestEvaluateSubject_SyncOnlyCarriesForwardVendorVerdict is B4: a non-local
+// advise rule's LAST scored (high) result must still count toward the
+// round's tier under evaluate, never be overwritten with "unscored".
+func TestEvaluateSubject_SyncOnlyCarriesForwardVendorVerdict(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2031, time.January, 1, 0, 0, 0, 0, time.UTC)
+
+	appendEvent(t, ctx, s, "acct_eval_carry", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
+
+	// A fake non-local advise rule pinned to a HIGH risk (benign
+	// probability near 0) so the fixture's own local rule (which stays low
+	// for a bare signup with nothing else) can never explain a `high` tier
+	// on its own — only the carried-forward vendor rule can.
+	vendor := fake.New()
+	vendor.ScoreFunc = func(ctx context.Context, req model.ScoreRequest) (model.ScoreResult, error) {
+		return model.ScoreResult{Probs: map[string]float64{"benign": 0.02, "abusive": 0.98}, Model: "vendor", Checkpoint: "v1"}, nil
+	}
+	cfg := newFakeRuleConfig(t, vendor)
+
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// First, a normal Tick scores the vendor rule for real (not syncOnly),
+	// landing its high risk as the LATEST verdict.
+	result, err := w.Tick(ctx)
+	if err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if result.Scored != 1 || len(result.Errors) != 0 {
+		t.Fatalf("Tick result = %+v, want exactly one subject scored with no errors", result)
+	}
+	before, err := s.SubjectView(ctx, testTenant, "acct_eval_carry", nil)
+	if err != nil {
+		t.Fatalf("SubjectView (before): %v", err)
+	}
+	if before.Tier != "high" {
+		t.Fatalf("setup assumption broken: expected Tick to land tier=high via the vendor rule, got %q", before.Tier)
+	}
+
+	// A later, unrelated event makes the subject dirty again WITHOUT
+	// changing anything the vendor rule would score differently.
+	appendEvent(t, ctx, s, "acct_eval_carry", "resource.created", now.Add(time.Minute), event.Links{}, map[string]any{"kind": "agent", "name": "a"})
+
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_carry", 3*time.Second)
+	if err != nil {
+		t.Fatalf("EvaluateSubject: %v", err)
+	}
+	if !evaluatedNow {
+		t.Fatalf("expected evaluatedNow=true")
+	}
+
+	after, err := s.SubjectView(ctx, testTenant, "acct_eval_carry", nil)
+	if err != nil {
+		t.Fatalf("SubjectView (after): %v", err)
+	}
+	if after.Tier != "high" {
+		t.Fatalf("expected evaluate to KEEP tier=high by carrying the vendor rule's last verdict forward, got %q\nsignals: %+v", after.Tier, after.Signals)
+	}
+	for _, sig := range after.Signals {
+		if sig.Rule == "fake_rule" {
+			if sig.Status != "scored" || sig.ErrorCode == "sync_scorer_unsupported" {
+				t.Fatalf("expected the vendor rule's signal to still read as scored (carried forward), got %+v", sig)
+			}
+		}
+	}
+}
+
+// TestEvaluateSubject_SyncOnlyReportsUnsupportedWithNoPriorResult proves
+// the fallback still applies when there's genuinely nothing to carry
+// forward: a non-local rule NEVER scored before is unscored/
+// sync_scorer_unsupported under evaluate, exactly as before B4.
+func TestEvaluateSubject_SyncOnlyReportsUnsupportedWithNoPriorResult(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	now := time.Date(2031, time.January, 1, 0, 0, 0, 0, time.UTC)
@@ -167,24 +276,27 @@ func TestEvaluateSubject_SyncOnlySkipsNonLocalScorer(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	verdict, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_nonlocal", 3*time.Second)
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_nonlocal", 3*time.Second)
 	if err != nil {
 		t.Fatalf("EvaluateSubject: %v", err)
 	}
-	if len(verdict.Signals) != 1 {
-		t.Fatalf("expected exactly one signal, got %+v", verdict.Signals)
+	if !evaluatedNow {
+		t.Fatalf("expected evaluatedNow=true")
 	}
-	sig := verdict.Signals[0]
+	view, err := s.SubjectView(ctx, testTenant, "acct_eval_nonlocal", nil)
+	if err != nil {
+		t.Fatalf("SubjectView: %v", err)
+	}
+	if len(view.Signals) != 1 {
+		t.Fatalf("expected exactly one signal, got %+v", view.Signals)
+	}
+	sig := view.Signals[0]
 	if sig.Status != "unscored" || sig.ErrorCode != "sync_scorer_unsupported" {
-		t.Fatalf("expected unscored/sync_scorer_unsupported for a non-local rule under evaluate, got %+v", sig)
+		t.Fatalf("expected unscored/sync_scorer_unsupported with no prior result, got %+v", sig)
 	}
 
 	// The SAME rule DOES score normally via the ordinary Tick path (not
-	// syncOnly) — proving the restriction is evaluate-specific, not a
-	// config or scorer problem. EvaluateSubject's own successful commit
-	// above already consumed the dirty_seq bump from the setup event, so a
-	// second event is needed to make the subject dirty again before Tick
-	// has anything to claim.
+	// syncOnly) — proving the restriction is evaluate-specific.
 	appendEvent(t, ctx, s, "acct_eval_nonlocal", "resource.created", now.Add(time.Minute), event.Links{}, map[string]any{"kind": "agent", "name": "a"})
 	result, err := w.Tick(ctx)
 	if err != nil {
@@ -193,22 +305,23 @@ func TestEvaluateSubject_SyncOnlySkipsNonLocalScorer(t *testing.T) {
 	if result.Scored != 1 || len(result.Errors) != 0 {
 		t.Fatalf("Tick result = %+v, want exactly one subject scored with no errors", result)
 	}
-	view, err := s.SubjectView(ctx, testTenant, "acct_eval_nonlocal", nil)
+	after, err := s.SubjectView(ctx, testTenant, "acct_eval_nonlocal", nil)
 	if err != nil {
 		t.Fatalf("SubjectView: %v", err)
 	}
-	if len(view.Signals) != 1 || view.Signals[0].Status != "scored" {
-		t.Fatalf("expected the fake rule to score normally via Tick, got %+v", view.Signals)
+	if len(after.Signals) != 1 || after.Signals[0].Status != "scored" {
+		t.Fatalf("expected the fake rule to score normally via Tick, got %+v", after.Signals)
 	}
 }
 
 // delayingStore wraps a real Store and sleeps for delay before every
-// EventsForSubject call — a deterministic way to prove EvaluateSubject's
-// deadline bounds the WHOLE synchronous call (design: "scores the subject
-// now using rules whose scorer can answer within the deadline"), not just
-// an individual scorer.Score invocation, without depending on real
-// Postgres latency (which is normally far too fast, and never reliably
-// slow, to exercise a deadline test deterministically).
+// EventsForSubject call — a deterministic way to prove the ELAPSED WALL
+// TIME during computeVerdict's DB-read phase can still exhaust
+// EvaluateSubject's own scoreCtx (created before that phase runs) even
+// though the DB reads themselves are no longer bounded by it (S1 fix
+// round: "the caller deadline applies to scorer calls only, not DB
+// reads") — without depending on real Postgres latency (normally far too
+// fast, and never reliably slow, to exercise this deterministically).
 type delayingStore struct {
 	Store
 	delay time.Duration
@@ -224,8 +337,10 @@ func (d delayingStore) EventsForSubject(ctx context.Context, tenant, subject str
 }
 
 // TestEvaluateSubject_RespectsDeadline proves a deadline shorter than the
-// round's own latency surfaces an error rather than blocking past it, and
-// that a deadline comfortably longer than that latency succeeds.
+// round's own latency surfaces context.DeadlineExceeded (S1: not a 500-
+// shaped generic error) rather than blocking past it or committing a
+// verdict, and that a deadline comfortably longer than that latency
+// succeeds normally.
 func TestEvaluateSubject_RespectsDeadline(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
@@ -238,8 +353,12 @@ func TestEvaluateSubject_RespectsDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if _, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_deadline_exceeded", 20*time.Millisecond); err == nil {
-		t.Fatalf("expected a 20ms deadline against a 200ms-delayed store to fail, got no error")
+	evaluatedNow, err := w.EvaluateSubject(ctx, testTenant, "acct_eval_deadline_exceeded", 20*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded for a 20ms deadline against a 200ms-delayed store, got %v", err)
+	}
+	if evaluatedNow {
+		t.Fatalf("expected evaluatedNow=false")
 	}
 
 	appendEvent(t, ctx, s, "acct_eval_deadline_ok", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
@@ -247,11 +366,54 @@ func TestEvaluateSubject_RespectsDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	verdict, err := w2.EvaluateSubject(ctx, testTenant, "acct_eval_deadline_ok", 3*time.Second)
+	evaluatedNow2, err := w2.EvaluateSubject(ctx, testTenant, "acct_eval_deadline_ok", 3*time.Second)
 	if err != nil {
 		t.Fatalf("expected a 3s deadline against a 200ms-delayed store to succeed, got %v", err)
 	}
-	if len(verdict.Signals) != 1 {
-		t.Fatalf("expected exactly one signal, got %+v", verdict.Signals)
+	if !evaluatedNow2 {
+		t.Fatalf("expected evaluatedNow=true")
+	}
+}
+
+// TestEvaluateSubject_ReleasesClaimOnCancelledContext is B3's proven
+// trigger: a cancelled/timed-out caller context must not leave the subject
+// leased for the full ~2-minute claim lease — the NEXT evaluate call
+// (with a fresh, uncancelled context) must succeed immediately rather than
+// hitting *store.ErrBusy.
+func TestEvaluateSubject_ReleasesClaimOnCancelledContext(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Date(2031, time.January, 1, 0, 0, 0, 0, time.UTC)
+	cfg := loadShippedConfig(t)
+
+	appendEvent(t, context.Background(), s, "acct_eval_cancelled", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
+
+	slow := delayingStore{Store: s, delay: 50 * time.Millisecond}
+	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// An 800µs context: expires long before the 50ms-delayed EventsForSubject
+	// call returns, so computeVerdict's DB read itself fails with
+	// context.DeadlineExceeded (ctx, not scoreCtx, is what EventsForSubject
+	// uses — this cancellation is real, not just scoreCtx's own budget).
+	cancelledCtx, cancel := context.WithTimeout(context.Background(), 800*time.Microsecond)
+	defer cancel()
+	if _, err := w.EvaluateSubject(cancelledCtx, testTenant, "acct_eval_cancelled", 3*time.Second); err == nil {
+		t.Fatalf("expected an error from an 800µs context against a 50ms-delayed store")
+	}
+
+	// The claim must already be released — a fresh call succeeds
+	// immediately rather than hitting *store.ErrBusy.
+	evaluatedNow, err := w.EvaluateSubject(context.Background(), testTenant, "acct_eval_cancelled", 3*time.Second)
+	var busy *store.ErrBusy
+	if errors.As(err, &busy) {
+		t.Fatalf("expected the claim to have been released after the cancelled call, got *store.ErrBusy: %+v", busy)
+	}
+	if err != nil {
+		t.Fatalf("expected the next evaluate to succeed, got %v", err)
+	}
+	if !evaluatedNow {
+		t.Fatalf("expected evaluatedNow=true")
 	}
 }

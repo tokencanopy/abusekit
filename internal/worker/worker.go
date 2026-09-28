@@ -449,7 +449,7 @@ func safeScoreCall(ctx context.Context, scorer model.Scorer, req model.ScoreRequ
 // for anything else (the caller, Tick, records this as a whole-pass
 // failure via store.RecordSubjectFailure — B3 fix round).
 func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now time.Time) (bool, error) {
-	verdict, records, nextRescoreAt, err := w.computeVerdict(ctx, d, now, false)
+	verdict, records, nextRescoreAt, err := w.computeVerdict(ctx, ctx, d, now, false)
 	if err != nil {
 		return false, err
 	}
@@ -468,6 +468,12 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 	return true, nil
 }
 
+// releaseClaimTimeout bounds EvaluateSubject's best-effort claim release
+// (B3 fix round) — long enough to comfortably complete a single UPDATE
+// under normal load, short enough never to hang a request whose own
+// caller has already given up.
+const releaseClaimTimeout = 5 * time.Second
+
 // EvaluateSubject is design §4.4's POST /v1/subjects/{subject}/evaluate:
 // the same per-subject scoring path scoreSubject runs on the worker's own
 // ticker, invoked synchronously for one named subject instead of a
@@ -476,56 +482,128 @@ func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now tim
 // worker Tick's own claim on the same subject — see that method's doc
 // comment), timeout, and budget rules.
 //
-// deadline bounds the WHOLE call (design: "{deadline_ms ≤ 3000}"); <= 0
-// means "no additional deadline beyond ctx's own" (a test convenience —
-// internal/serve's handler always supplies a positive deadline). Within
-// that bound, only rules scored by "local" actually run synchronously
-// (see computeVerdict's syncOnly parameter) — v0 has no vendor scorer
-// whose measured p99 latency could ever justify running it inline on a
-// product's send path, so this is the conservative default until one
-// exists; see the S3 PR body for that interpretation.
+// deadline bounds ONLY the scorer calls (S1 fix round: "the caller
+// deadline applies to scorer calls only, not DB reads" — the claim,
+// EventsForSubject, LatestVerdicts and PruneRuleState calls all run
+// against ctx directly, never artificially shortened by deadline_ms, so a
+// slow DB under load degrades gracefully instead of spuriously reporting
+// "deadline exceeded" for a delay that had nothing to do with any
+// scorer). <= 0 means "no additional deadline beyond ctx's own" (a test
+// convenience — internal/serve's handler always supplies a positive
+// deadline). Within that bound, only rules scored by "local" actually run
+// synchronously (see computeVerdict's syncOnly parameter) — v0 has no
+// vendor scorer whose measured p99 latency could ever justify running it
+// inline on a product's send path, so this is the conservative default
+// until one exists; see the S3 PR body for that interpretation.
 //
-// Returns store.ErrNotFound if the subject has never been seen by this
-// tenant, or store.ErrAlreadyClaimed if a worker Tick or another evaluate
-// call is already mid-round for it (the caller, internal/serve, maps
-// this to 429 — design: evaluate is "rate-limited per subject (1/s)").
-func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, deadline time.Duration) (core.Verdict, error) {
+// Returns (false, err) for every case that did NOT produce a fresh
+// verdict — the caller (internal/serve) is expected to fall back to
+// store.SubjectView for its response body in each of these instead of
+// failing the whole request:
+//   - store.ErrNotFound: the subject has never been seen by this tenant
+//     (maps to 404 — there is no stored view to fall back to either).
+//   - store.ErrNotScorable: the subject is class internal/synthetic
+//     (design §4.3: "stored but never scored") — S1 fix round: e2a's own
+//     prober accounts are synthetic, so this must be a normal 200 with
+//     the stored (likely tier "unknown") view, never a 500.
+//   - *store.ErrBusy: already claimed (a worker Tick, or a concurrent
+//     evaluate call) or in whole-pass failure backoff — carries a REAL
+//     RetryAt (S1 fix round) derived from the actual lease/backoff still
+//     remaining, not a guess.
+//   - context.DeadlineExceeded / context.Canceled: the scorer-call
+//     deadline (or the caller's own ctx) elapsed before any rule could be
+//     attempted (S1 fix round) — the round is abandoned rather than
+//     committing whatever partial result existed, and the caller falls
+//     back to the last known-good stored view.
+//   - anything else: a genuine internal failure (maps to 500).
+//
+// Returns (true, nil) once a fresh round has actually committed —
+// including the case where a concurrent round committed a NEWER one first
+// (store.ErrStaleRound): the subject's current score IS fresh, just not
+// from bytes this exact call produced, so the caller's stored-view
+// fallback still reports evaluated_now correctly either way.
+func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, deadline time.Duration) (evaluatedNow bool, err error) {
 	now := w.deps.now()
 	d, err := w.deps.Store.ClaimSubjectForEvaluate(ctx, tenant, subject, now)
 	if err != nil {
-		return core.Verdict{}, err
+		return false, err
 	}
 
-	evalCtx := ctx
+	// B3 fix round: whatever happens next, release the claim unless we
+	// actually commit — using a context INDEPENDENT of ctx's own
+	// cancellation (context.WithoutCancel) so a caller that already
+	// disconnected or timed out doesn't also prevent its own cleanup from
+	// running, bounded by releaseClaimTimeout so a release attempt can
+	// never hang indefinitely either. Proven necessary: a bare `defer
+	// ReleaseClaim(ctx, ...)` using the caller's own (already-cancelled)
+	// ctx makes the release call itself fail immediately, leaving the
+	// subject claimed for the full ~2-minute lease.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseClaimTimeout)
+		defer cancel()
+		if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject); rerr != nil {
+			w.deps.logger().Error("worker: release evaluate claim failed", "tenant", tenant, "error", rerr)
+		}
+	}()
+
+	// S1 fix round: the deadline bounds ONLY scoreCtx, passed to
+	// computeVerdict as the context scorer calls (safeScore) use — ctx
+	// itself (unmodified) is what DB reads use. See this method's own doc
+	// comment for why.
+	scoreCtx := ctx
 	if deadline > 0 {
 		var cancel context.CancelFunc
-		evalCtx, cancel = context.WithTimeout(ctx, deadline)
+		scoreCtx, cancel = context.WithTimeout(ctx, deadline)
 		defer cancel()
 	}
 
-	verdict, records, nextRescoreAt, err := w.computeVerdict(evalCtx, d, now, true)
-	if err != nil {
-		_ = w.deps.Store.ReleaseClaim(ctx, tenant, subject)
-		return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: %w", tenant, subject, err)
+	verdict, records, nextRescoreAt, cvErr := w.computeVerdict(ctx, scoreCtx, d, now, true)
+	if cvErr != nil {
+		// A context error here means the round couldn't even get through
+		// its DB-read/plan phase before ctx itself (the caller's own,
+		// never deadline_ms-shortened) gave up — propagate it as-is so the
+		// caller can recognize it via errors.Is rather than a wrapped
+		// opaque failure.
+		if errors.Is(cvErr, context.DeadlineExceeded) || errors.Is(cvErr, context.Canceled) {
+			return false, cvErr
+		}
+		return false, fmt.Errorf("worker: evaluate %s/%s: %w", tenant, subject, cvErr)
+	}
+	// S1 fix round: checked AFTER computeVerdict (which only spends
+	// scoreCtx on the scorer-call phase, always the last thing it does)
+	// rather than before it — scoreCtx cannot be "already" expired the
+	// instant it's created (its deadline is relative to creation), so the
+	// only way it's expired here is real elapsed time during the DB-read
+	// phase eating the whole budget before scoring ever got a chance. When
+	// that happens, no rule was genuinely "evaluated now": abandon the
+	// round (never commit a verdict built against a blown budget) and let
+	// the caller fall back to the stored view.
+	if err := scoreCtx.Err(); err != nil {
+		return false, err
 	}
 
-	if _, err := w.deps.Store.UpsertVerdicts(ctx, tenant, subject, d.DirtySeq, records, store.SubjectSummary{
+	if _, upErr := w.deps.Store.UpsertVerdicts(ctx, tenant, subject, d.DirtySeq, records, store.SubjectSummary{
 		Tier:          verdict.Tier,
 		Score:         verdict.Score,
 		NextRescoreAt: nextRescoreAt,
-	}); err != nil {
-		_ = w.deps.Store.ReleaseClaim(ctx, tenant, subject)
-		if errors.Is(err, store.ErrStaleRound) {
-			// Provably unreachable in practice: ClaimSubjectForEvaluate's
-			// exclusive lease means nothing else can be scoring this
-			// subject between our own claim and this commit. Reported as a
-			// real error rather than silently treated as success, since a
-			// caller receiving evaluated_now:true needs it to be true.
-			return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: a concurrent round committed despite the exclusive claim (this should not happen)", tenant, subject)
+	}); upErr != nil {
+		if errors.Is(upErr, store.ErrStaleRound) {
+			// A concurrent round (astonishing under ClaimSubjectForEvaluate's
+			// exclusive lease, but UpsertVerdicts' compare-and-clear is the
+			// authoritative guard, not the claim) already committed a
+			// NEWER summary — the subject's current score is still fresh,
+			// just not from this call; report success, not failure.
+			committed = true
+			return true, nil
 		}
-		return core.Verdict{}, fmt.Errorf("worker: evaluate %s/%s: upsert verdicts: %w", tenant, subject, err)
+		return false, fmt.Errorf("worker: evaluate %s/%s: upsert verdicts: %w", tenant, subject, upErr)
 	}
-	return verdict, nil
+	committed = true
+	return true, nil
 }
 
 // computeVerdict is scoreSubject/EvaluateSubject's shared computation:
@@ -538,12 +616,22 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 // EvaluateSubject's caller cares about the returned core.Verdict directly,
 // where scoreSubject's doesn't).
 //
-// syncOnly, when true (EvaluateSubject only), restricts execution to
+// ctx and scoreCtx are deliberately separate (S1 fix round): every DB call
+// in here (EventsForSubject, LatestVerdicts, PruneRuleState, rule_state
+// reads/writes, budget checks) uses ctx; only the scorer call itself
+// (safeScore) uses scoreCtx, which EvaluateSubject shortens to its
+// deadline_ms budget — a slow DB never gets mistaken for "the deadline was
+// too short." scoreSubject (the worker's own Tick path) passes the SAME
+// context for both, so this split changes nothing for it.
+//
+// syncOnly, when true (EvaluateSubject only), restricts LIVE execution to
 // rules scored by "local" (see EvaluateSubject's own doc comment for why):
-// any other rule is marked unscored with error_code
-// "sync_scorer_unsupported" rather than invoked, regardless of what a
-// live call or an input-unchanged skip would otherwise have done for it.
-func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now time.Time, syncOnly bool) (core.Verdict, []store.VerdictRecord, time.Time, error) {
+// a non-local rule with a prior SCORED result carries it forward exactly
+// as an input-unchanged skip would (B4 fix round: never overwrite an
+// existing vendor verdict with "unscored" just because evaluate can't
+// synchronously refresh it); only a non-local rule with NO prior scored
+// result at all is marked unscored/"sync_scorer_unsupported".
+func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubject, now time.Time, syncOnly bool) (core.Verdict, []store.VerdictRecord, time.Time, error) {
 	storedEvents, err := w.deps.Store.EventsForSubject(ctx, d.Tenant, d.Subject)
 	if err != nil {
 		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load events: %w", err)
@@ -612,19 +700,44 @@ func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now t
 	var retryCandidates []time.Time
 	costCapped := false
 
+	// inputHashOverride carries, per call index, the STORED input_hash to
+	// record instead of this round's freshly-computed call.InputHash (B4
+	// fix round) — set only for a syncOnly-carried-forward non-local rule
+	// (below). Recording the OLD hash rather than the new one is load-
+	// bearing: it means the round's own bookkeeping never claims this rule
+	// was validated against the CURRENT inputs, so the next real (non-
+	// syncOnly) round still sees a hash mismatch and genuinely re-invokes
+	// the vendor scorer — recording the fresh hash instead would falsely
+	// look like "already validated," permanently starving it of a real
+	// re-score. "" means no override (use call.InputHash as normal).
+	inputHashOverride := make([]string, len(calls))
+
 	for i, call := range calls {
 		r := call.Rule
 
 		// EvaluateSubject's syncOnly restriction (design §4.4: "the local
 		// scorer always can; vendor scorers only if their p99 fits" — v0
-		// has no measured p99 for any vendor scorer, so every non-local
-		// rule is unsupported synchronously until one is). Checked before
-		// the stage/backoff/skip logic below so a staged or backed-off
-		// non-local rule reports the SAME code an evaluate caller would
-		// see for any other non-local rule, rather than a code that leaks
-		// which of those unrelated states it happened to be in.
+		// has no measured p99 for any vendor scorer). B4 fix round: this
+		// must NOT overwrite an existing vendor verdict with "unscored" —
+		// doing so silently dropped that rule's risk from THIS round's
+		// score/tier computation even though nothing about the rule's own
+		// last real answer changed. Instead, carry the rule's latest
+		// SCORED result forward exactly as SkipInputUnchanged already does
+		// below, so its risk still counts toward this round's tier. Only a
+		// rule with no prior scored result at all falls back to
+		// "sync_scorer_unsupported" (nothing to carry forward). Checked
+		// before the stage/backoff/skip logic below so a staged or
+		// backed-off non-local rule is handled identically to any other
+		// non-local rule under evaluate.
 		if syncOnly && r.Scorer != "local" {
-			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "sync_scorer_unsupported"}
+			if lv, ok := latest[r.Name]; ok && lv.Status == "scored" {
+				res := model.ScoreResult{Probs: lv.Probs, Model: lv.Model, Checkpoint: lv.Checkpoint, Render: call.Request.RenderVersion}
+				results[i] = &res
+				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason}
+				inputHashOverride[i] = lv.InputHash
+			} else {
+				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "sync_scorer_unsupported"}
+			}
 			continue
 		}
 
@@ -713,7 +826,7 @@ func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now t
 		if w.deps.Metrics != nil {
 			w.deps.Metrics.IncAdapterCalls(r.Scorer)
 		}
-		res, err := safeScore(ctx, scorer, call.Request, w.deps.ScoreTimeout)
+		res, err := safeScore(scoreCtx, scorer, call.Request, w.deps.ScoreTimeout)
 		if w.deps.Metrics != nil {
 			w.deps.Metrics.ObserveAdapterLatency(r.Scorer, w.deps.now().Sub(start))
 		}
@@ -725,7 +838,16 @@ func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now t
 			if rerr := w.deps.Store.RecordRuleError(ctx, d.Tenant, d.Subject, r.Name, retryAt, err.Error()); rerr != nil {
 				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("record rule error for %s: %w", r.Name, rerr)
 			}
-			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "adapter_error"}
+			// S1 fix round: a scorer call cut short by scoreCtx's own
+			// deadline (evaluate's deadline_ms, or the caller's outer ctx)
+			// is reported distinctly from a genuine adapter failure — a
+			// caller can tell "my own deadline was too tight for this rule"
+			// from "the adapter itself errored."
+			errorCode := "adapter_error"
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				errorCode = "deadline_exceeded"
+			}
+			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: errorCode}
 			retryCandidates = append(retryCandidates, retryAt)
 			continue
 		}
@@ -783,6 +905,13 @@ func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now t
 			r := sig.Risk
 			risk = &r
 		}
+		inputHash := call.InputHash
+		if inputHashOverride[i] != "" {
+			// B4 fix round: a syncOnly-carried-forward vendor rule records
+			// its OLD input_hash, not this round's freshly-computed one —
+			// see inputHashOverride's own doc comment above.
+			inputHash = inputHashOverride[i]
+		}
 		records[i] = store.VerdictRecord{
 			Rule:        sig.Rule,
 			Mode:        string(sig.Mode),
@@ -795,7 +924,7 @@ func (w *Worker) computeVerdict(ctx context.Context, d store.DirtySubject, now t
 			Risk:        risk,
 			Flagged:     sig.Flagged,
 			Reason:      sig.Reason,
-			InputHash:   call.InputHash,
+			InputHash:   inputHash,
 			Status:      sig.Status,
 			ErrorCode:   sig.ErrorCode,
 		}

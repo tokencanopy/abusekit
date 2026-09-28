@@ -278,30 +278,36 @@ func loadShippedBrands(t *testing.T) feature.BrandSet {
 }
 
 // testKeys is a small, fixed key set for contract tests: one events-scoped
-// producer key, one all-scopes operator key (labels/read/erase), and a
-// second tenant's read-scoped key (for cross-tenant-denial tests).
+// producer key, one all-scopes operator key (labels/read), a second
+// tenant's read-scoped key (for cross-tenant-denial tests), a second
+// tenant's LABELS-scoped key (S6: cross-tenant denial on the labels
+// endpoint specifically, which a read-only key can't exercise since it'd
+// 403 on scope before ever reaching the tenant check), and a backfill key.
 type testKeys struct {
-	Producer config.Key // tenant e2a, scope events
-	Operator config.Key // tenant e2a, scope read+labels+erase
-	Other    config.Key // tenant other-tenant, scope read
-	Backfill config.Key // tenant e2a, scope events+backfill
+	Producer    config.Key // tenant e2a, scope events
+	Operator    config.Key // tenant e2a, scope read+labels
+	Other       config.Key // tenant other-tenant, scope read
+	OtherLabels config.Key // tenant other-tenant, scope labels
+	Backfill    config.Key // tenant e2a, scope events+backfill
 }
 
 func fixedTestKeys() testKeys {
 	return testKeys{
-		Producer: config.Key{ID: "test_producer", Secret: "test-producer-secret", Tenant: testTenant, Producer: "test-producer", Scopes: map[config.Scope]bool{config.ScopeEvents: true}},
-		Operator: config.Key{ID: "test_operator", Secret: "test-operator-secret", Tenant: testTenant, Scopes: map[config.Scope]bool{config.ScopeRead: true, config.ScopeLabels: true, config.ScopeErase: true}},
-		Other:    config.Key{ID: "test_other_tenant", Secret: "test-other-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeRead: true}},
-		Backfill: config.Key{ID: "test_backfill", Secret: "test-backfill-secret", Tenant: testTenant, Producer: "test-backfiller", Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeBackfill: true}},
+		Producer:    config.Key{ID: "test_producer", Secret: "test-producer-secret", Tenant: testTenant, Producer: "test-producer", Scopes: map[config.Scope]bool{config.ScopeEvents: true}},
+		Operator:    config.Key{ID: "test_operator", Secret: "test-operator-secret", Tenant: testTenant, Scopes: map[config.Scope]bool{config.ScopeRead: true, config.ScopeLabels: true}},
+		Other:       config.Key{ID: "test_other_tenant", Secret: "test-other-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeRead: true}},
+		OtherLabels: config.Key{ID: "test_other_tenant_labels", Secret: "test-other-labels-secret", Tenant: "other-tenant", Scopes: map[config.Scope]bool{config.ScopeLabels: true}},
+		Backfill:    config.Key{ID: "test_backfill", Secret: "test-backfill-secret", Tenant: testTenant, Producer: "test-backfiller", Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeBackfill: true}},
 	}
 }
 
 func (k testKeys) asMap() map[string]config.Key {
 	return map[string]config.Key{
-		k.Producer.ID: k.Producer,
-		k.Operator.ID: k.Operator,
-		k.Other.ID:    k.Other,
-		k.Backfill.ID: k.Backfill,
+		k.Producer.ID:    k.Producer,
+		k.Operator.ID:    k.Operator,
+		k.Other.ID:       k.Other,
+		k.OtherLabels.ID: k.OtherLabels,
+		k.Backfill.ID:    k.Backfill,
 	}
 }
 
@@ -342,6 +348,7 @@ func newTestServer(t *testing.T, now time.Time) *testServer {
 
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
+	t.Cleanup(srv.Close)
 
 	return &testServer{Store: s, Worker: w, Server: srv, TS: ts, Keys: keys, Now: nowFn}
 }
@@ -360,32 +367,55 @@ func httpDo(t *testing.T, req *http.Request) *http.Response {
 }
 
 // signBody replicates internal/serve's own (unexported) HMAC signing
-// scheme (design §4.3) independently, deliberately NOT by calling into
-// the package under test — a contract test proves the WIRE contract, so
-// it signs the same way an external producer would, from this package's
-// own implementation of the documented scheme.
-func signBody(secret, method, requestURI, timestamp, keyID string, body []byte) string {
+// scheme (design §4.3, B1 fix round's nonce) independently, deliberately
+// NOT by calling into the package under test — a contract test proves the
+// WIRE contract, so it signs the same way an external producer would,
+// from this package's own implementation of the documented scheme.
+func signBody(secret, method, requestURI, timestamp, keyID, nonce string, body []byte) string {
 	bodyHash := sha256.Sum256(body)
-	canonical := method + "\n" + requestURI + "\n" + timestamp + "\n" + keyID + "\n" + hex.EncodeToString(bodyHash[:])
+	canonical := method + "\n" + requestURI + "\n" + timestamp + "\n" + keyID + "\n" + nonce + "\n" + hex.EncodeToString(bodyHash[:])
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(canonical))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+func mustNonce(t *testing.T) string {
+	t.Helper()
+	n, err := serve.GenerateNonce()
+	if err != nil {
+		t.Fatalf("GenerateNonce: %v", err)
+	}
+	return n
+}
+
 // signedRequest builds an http.Request against ts, signed as key would
 // sign it at instant `at` (design §4.3's whole scheme, "including GET" —
-// a nil body signs the empty string, matching every non-events endpoint).
+// a nil body signs the empty string, matching every non-events endpoint),
+// with a FRESH random nonce (B1 fix round) — the common case for a test
+// that just wants an independently-valid request. A test that needs to
+// control or reuse a nonce (replay tests) uses signedRequestWithNonce
+// directly.
 func signedRequest(t *testing.T, ts *httptest.Server, method, path string, body []byte, key config.Key, at time.Time) *http.Request {
+	t.Helper()
+	return signedRequestWithNonce(t, ts, method, path, body, key, at, mustNonce(t))
+}
+
+// signedRequestWithNonce is signedRequest with an explicit nonce — used by
+// replay-protection tests that need TWO requests sharing the same nonce
+// (a genuine replay) versus two independently fresh ones (two legitimate
+// calls that happen to land in the same wall-clock second).
+func signedRequestWithNonce(t *testing.T, ts *httptest.Server, method, path string, body []byte, key config.Key, at time.Time, nonce string) *http.Request {
 	t.Helper()
 	req, err := http.NewRequest(method, ts.URL+path, bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("http.NewRequest: %v", err)
 	}
 	timestamp := at.UTC().Format(time.RFC3339)
-	sig := signBody(key.Secret, method, req.URL.RequestURI(), timestamp, key.ID, body)
+	sig := signBody(key.Secret, method, req.URL.RequestURI(), timestamp, key.ID, nonce, body)
 	req.Header.Set(serve.HeaderKey, key.ID)
 	req.Header.Set(serve.HeaderTimestamp, timestamp)
 	req.Header.Set(serve.HeaderSignature, sig)
+	req.Header.Set(serve.HeaderNonce, nonce)
 	if len(body) > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
