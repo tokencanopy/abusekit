@@ -14,9 +14,20 @@ import (
 
 // BrandEntry is one curated brand name plus optional spelling aliases
 // (e.g. "Pay Pal" for PayPal) — config/brands.yaml's shape (S3 fix round).
+//
+// CaseSensitive (S2b's N1 fix round) is for the narrow case of a short
+// brand token that also happens to be an ordinary English word or
+// abbreviation (a shipping brand's all-caps initialism is the common
+// example): when true, a match additionally requires the ORIGINAL
+// candidate text to spell this brand's Name with the identical case as a
+// standalone token, not merely fold-equal to it — see
+// containsExactCaseToken. Meaningful only for a single-word Name; a
+// multi-word brand should rely on the ordinary word-boundary match
+// instead.
 type BrandEntry struct {
-	Name    string
-	Aliases []string
+	Name          string
+	Aliases       []string
+	CaseSensitive bool
 }
 
 // BrandSet is a loaded, ready-to-match set of brand names (config/brands.yaml).
@@ -31,33 +42,52 @@ type BrandEntry struct {
 // dictionary entries because a real display name has a space the entry
 // didn't). A candidate string and every brand name/alias are both folded
 // through internal/event.Skeleton (NFKC, confusables, lower-case) and then
-// split into words on whitespace and common separators (-, _, .) — so
-// "Wells Fargo", "wells-fargo" and "WELLS FARGO" all tokenize to the same
-// ["wells","fargo"], and "PAYPAL SUPPORT" tokenizes to ["paypal",
-// "support"]. A brand's word sequence must appear as a CONTIGUOUS run of
-// the candidate's words; a single-word brand must match a whole word, not
-// a substring of one — "Pineapple" is one token that is never equal to
-// "apple", so it never matches even if "apple" were still in the list.
+// split into words on whitespace and any Unicode punctuation/symbol rune
+// (S2b's B3 fix round widened this from a hand-picked separator list —
+// see tokenize) — so "Wells Fargo", "wells-fargo" and "WELLS FARGO" all
+// tokenize to the same ["wells","fargo"], and "PAYPAL SUPPORT" tokenizes
+// to ["paypal", "support"]. A brand's word sequence must appear as a
+// CONTIGUOUS run of the candidate's words; a single-word brand must match
+// a whole word, not a substring of one — "Pineapple" is one token that is
+// never equal to "apple", so it never matches even if "apple" were still
+// in the list.
 //
 // This does not catch every obfuscation (e.g. "paypalsupport" glued into
 // one word with no separator tokenizes as a single word that doesn't
 // equal "paypal"): trading a little recall for the word-boundary safety
 // two independent reviews required is the deliberate v0 choice.
+//
+// brandWords is one pre-tokenized name/alias word sequence, tagged with
+// the CANONICAL brand name (BrandEntry.Name) it belongs to — S2b:
+// subject_brand_match needs to count DISTINCT brands, so a match has to
+// be traceable back to which brand identity fired, not just "something
+// matched" (the original bool-only Matches contract).
+type brandWords struct {
+	words         []string
+	name          string
+	caseSensitive bool
+}
+
 type BrandSet struct {
-	entries [][]string // one pre-tokenized word sequence per name/alias
+	entries []brandWords
 }
 
 // NewBrandSet builds a BrandSet from entries, pre-tokenizing every name and
 // alias once rather than per Matches call.
 func NewBrandSet(entries []BrandEntry) BrandSet {
-	var all [][]string
+	var all []brandWords
 	for _, e := range entries {
 		if words := tokenize(e.Name); len(words) > 0 {
-			all = append(all, words)
+			all = append(all, brandWords{words, e.Name, e.CaseSensitive})
 		}
 		for _, a := range e.Aliases {
+			// CaseSensitive is deliberately NOT propagated to an alias:
+			// every shipped case-sensitive entry so far is a single bare
+			// word with no alias of its own: extending the case check to
+			// an alias nobody has defined yet is speculative complexity
+			// with nothing to verify it against.
 			if words := tokenize(a); len(words) > 0 {
-				all = append(all, words)
+				all = append(all, brandWords{words, e.Name, false})
 			}
 		}
 	}
@@ -91,6 +121,17 @@ func NewBrandSet(entries []BrandEntry) BrandSet {
 // deliberately, since the same rule can't special-case one brand without
 // reopening the false positive it exists to close for every other one.
 //
+// S2b's S1 fix round narrows where this gate applies: it still governs a
+// resource/agent NAME match (MatchedBrandNames), but a subject_line match
+// (MatchedBrandNamesForSubject) is no longer gated by words inside the
+// SUBJECT LINE itself — an ordinary bulk-phishing subject routinely
+// contains "tracking" or "api" on purpose ("Your package tracking update
+// failed"), and gating subject-line matching on the subject's own words
+// silently defeated the very rule meant to catch that shape. Whether a
+// subject line should be exempted at all is now decided once, from the
+// SENDING ACCOUNT's own onboarding evidence (see accountHasIntegrationName
+// in windows.go), not from words the phishing subject itself supplies.
+//
 // integrationTokenWords lists each word in its natural spelling;
 // integrationTokens (built by buildIntegrationTokens, below) canonicalises
 // every one of them the IDENTICAL way tokenize() canonicalises brand
@@ -123,34 +164,151 @@ func hasIntegrationToken(words []string) bool {
 	return false
 }
 
-// Matches reports whether text contains any brand's word sequence, per the
-// word/token-boundary rule documented on BrandSet, gated by
-// integrationTokens (R6 round 2). Tries both the plain (separator-only)
-// tokenization and the camelCase-aware one (see tokenizeCamel) — a brand
-// whose own correctly-cased spelling already contains an internal
-// lower->upper transition (PayPal, FedEx) still matches its plain
-// single-token form via the FIRST pass; a glued compound written with
-// each component capitalized but no separator (WellsFargo, PayPalSupport)
-// only tokenizes into the right words via the SECOND. Checking both
-// independently — rather than only ever using the camelCase-aware one —
-// is deliberate: camelCase-splitting a brand's OWN canonical spelling at
-// definition time (NewBrandSet never does this) would turn "PayPal" into
-// a needle of ["pay","pal"], which would stop matching a candidate that
-// simply writes it in plain lower-case ("paypal") with no case transition
-// to split on at all.
-func (b BrandSet) Matches(text string) bool {
-	if len(b.entries) == 0 {
-		return false
-	}
-	return b.matchesWords(tokenize(text)) || b.matchesWords(tokenizeCamel(text))
+// communityTokenWords are words whose presence anywhere in a candidate
+// text mean it is very likely naming an ordinary community/social
+// gathering ("<brand> group meetup", "<brand> fan club") rather than
+// impersonating the brand it mentions — S2b's N2 fix round, the
+// subject-line analogue of integrationTokens: a social-media brand
+// mentioned in the course of describing a real community event around it
+// is common, unremarkable text, not a lure. Applied uniformly to both
+// name and subject-line matching (unlike integrationTokens, S1's fix
+// round does not exempt subject-line matching from this gate — it is a
+// distinct guard against a distinct false-positive shape).
+var communityTokenWords = []string{
+	"group", "meetup", "community", "fans", "chat", "club",
 }
 
-func (b BrandSet) matchesWords(words []string) bool {
-	if len(words) == 0 || hasIntegrationToken(words) {
-		return false
+var communityTokens = buildCommunityTokens()
+
+func buildCommunityTokens() map[string]struct{} {
+	out := make(map[string]struct{}, len(communityTokenWords))
+	for _, w := range communityTokenWords {
+		out[canonicalise(w)] = struct{}{}
 	}
+	return out
+}
+
+func hasCommunityToken(words []string) bool {
+	for _, w := range words {
+		if _, ok := communityTokens[w]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Matches reports whether text contains any brand's word sequence, per the
+// word/token-boundary rule documented on BrandSet, gated by
+// integrationTokens (R6 round 2) and communityTokens (S2b's N2 fix round).
+// Tries both the plain (separator-only) tokenization and the camelCase-
+// aware one (see tokenizeCamel) — a brand whose own correctly-cased
+// spelling already contains an internal lower->upper transition (PayPal,
+// FedEx) still matches its plain single-token form via the FIRST pass; a
+// glued compound written with each component capitalized but no separator
+// (WellsFargo, PayPalSupport) only tokenizes into the right words via the
+// SECOND. Checking both independently — rather than only ever using the
+// camelCase-aware one — is deliberate: camelCase-splitting a brand's OWN
+// canonical spelling at definition time (NewBrandSet never does this)
+// would turn "PayPal" into a needle of ["pay","pal"], which would stop
+// matching a candidate that simply writes it in plain lower-case
+// ("paypal") with no case transition to split on at all.
+func (b BrandSet) Matches(text string) bool {
+	return len(b.MatchedBrandNames(text)) > 0
+}
+
+// MatchedBrandNames returns the set of DISTINCT curated brand names
+// (BrandEntry.Name — an entry matched via an alias still reports its
+// canonical name, never the alias text) whose word sequence appears in
+// text, applying BOTH the integration-token gate and the community-token
+// gate (S2b's N2 fix round). This is the matcher name_brand_match uses
+// against a resource/agent's raw name — see MatchedBrandNamesForSubject
+// for the subject-line-specific variant S1's fix round introduces.
+//
+// Returns nil (never a non-nil empty map) when nothing matched, matching
+// Go's normal "ranging over a nil map is a no-op, len(nil map) is 0"
+// idiom — callers never need a special nil check before iterating.
+func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
+	return b.matched(text, true)
+}
+
+// MatchedBrandNamesForSubject is subject_brand_match's matcher (S2b's S1
+// fix round): accountHasIntegrationName is whether the SENDING ACCOUNT's
+// own onboarding evidence (a resource/agent name carrying an integration
+// token — see windows.go's accountHasIntegrationName) already marks it as
+// a likely legitimate integration. When true, every subject line is
+// exempted outright (nil, no match ever reported) — the same
+// "impersonating the brand vs. being a real integration named after it"
+// judgment integrationTokens makes elsewhere, just decided once from the
+// account's own identity rather than re-litigated per subject line. When
+// false, brands are matched WITHOUT gating on words inside the subject
+// line itself (unlike MatchedBrandNames): a bulk-phishing subject
+// routinely contains "tracking" or "api" on purpose, and the OLD
+// behaviour of gating on the subject's own words silently defeated the
+// rule for exactly the subjects it exists to catch. The community-token
+// gate (N2) still applies either way — it addresses a different
+// false-positive shape (a social brand mentioned in ordinary community
+// context) that is unrelated to S1's fix.
+func (b BrandSet) MatchedBrandNamesForSubject(text string, accountHasIntegrationName bool) map[string]struct{} {
+	if accountHasIntegrationName {
+		return nil
+	}
+	return b.matched(text, false)
+}
+
+// matched is Matches/MatchedBrandNames/MatchedBrandNamesForSubject's
+// shared implementation: applyIntegrationGate selects whether
+// integrationTokens suppresses a match (true for a resource/agent name,
+// false for a subject line already cleared by
+// MatchedBrandNamesForSubject's own account-level check).
+func (b BrandSet) matched(text string, applyIntegrationGate bool) map[string]struct{} {
+	if len(b.entries) == 0 {
+		return nil
+	}
+	out := b.matchedNames(tokenize(text), text, applyIntegrationGate)
+	for name := range b.matchedNames(tokenizeCamel(text), text, applyIntegrationGate) {
+		if out == nil {
+			out = make(map[string]struct{})
+		}
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+func (b BrandSet) matchedNames(words []string, original string, applyIntegrationGate bool) map[string]struct{} {
+	if len(words) == 0 || hasCommunityToken(words) {
+		return nil
+	}
+	if applyIntegrationGate && hasIntegrationToken(words) {
+		return nil
+	}
+	var out map[string]struct{}
 	for _, brand := range b.entries {
-		if containsSequence(words, brand) {
+		if !containsSequence(words, brand.words) {
+			continue
+		}
+		if brand.caseSensitive && !containsExactCaseToken(original, brand.name) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]struct{})
+		}
+		out[brand.name] = struct{}{}
+	}
+	return out
+}
+
+// containsExactCaseToken reports whether text contains word as a
+// case-SENSITIVE standalone token, split the same way tokenize splits its
+// folded copy (any whitespace/punctuation/symbol rune) but on text's
+// ORIGINAL, un-folded casing — S2b's N1 fix round: a short brand token
+// that doubles as an ordinary English word or abbreviation (a shipping
+// brand's all-caps initialism is the common example) should not fire on
+// the word used in everyday lower-case prose; requiring the identical
+// case as a whole token lets the initialism still match while the
+// ordinary word does not.
+func containsExactCaseToken(text, word string) bool {
+	for _, tok := range strings.FieldsFunc(text, isWordSeparator) {
+		if tok == word {
 			return true
 		}
 	}
@@ -158,12 +316,21 @@ func (b BrandSet) matchesWords(words []string) bool {
 }
 
 // tokenize folds s through event.Skeleton (NFKC, confusables, lower-case,
-// whitespace-collapse), strips zero-width characters Skeleton doesn't
-// touch, canonicalises the I/l confusable the rest of the way (see
-// canonicalise), and splits on whitespace plus the common
-// name-obfuscation separators hyphen/underscore/period, dropping empty
-// tokens. "pay-pal", "pay_pal", "pay.pal" and "pay pal" all tokenize
-// identically to ["pay","pal"].
+// whitespace-collapse), strips zero-width/invisible-formatting characters
+// Skeleton doesn't touch, canonicalises the I/l confusable the rest of the
+// way (see canonicalise), and splits on whitespace plus any Unicode
+// punctuation or symbol rune (isWordSeparator — S2b's B3 fix round,
+// proven: a bare separator list of hyphen/underscore/period missed a
+// brand immediately followed by a colon, comma, exclamation mark, closing
+// parenthesis, quotation mark or slash, e.g. "PayPal:" or "(PayPal)", and
+// never recognised a possessive apostrophe-s, e.g. "PayPal's" — every one
+// of those punctuation runes is itself Unicode punctuation or a symbol,
+// so a single category-based predicate closes all of them at once rather
+// than hand-enumerating an ever-growing separator list one report at a
+// time), dropping empty tokens. "pay-pal", "pay_pal", "pay.pal", "pay:pal"
+// and "pay pal" all tokenize identically to ["pay","pal"], and "PayPal's"
+// tokenizes to ["paypal","s"] — the possessive suffix becomes its own
+// harmless token, never glued onto the brand word.
 //
 // This is the SAME function NewBrandSet uses to tokenize every brand
 // definition and Matches uses to tokenize every candidate — canonicalise
@@ -173,9 +340,15 @@ func (b BrandSet) matchesWords(words []string) bool {
 // path) silently reintroduced the exact divergence it was meant to close.
 func tokenize(s string) []string {
 	folded := canonicalise(stripZeroWidth(event.Skeleton(s)))
-	return strings.FieldsFunc(folded, func(r rune) bool {
-		return unicode.IsSpace(r) || r == '-' || r == '_' || r == '.'
-	})
+	return strings.FieldsFunc(folded, isWordSeparator)
+}
+
+// isWordSeparator reports whether r splits tokenize's candidate/brand
+// text into words: any whitespace rune, or any rune Unicode classifies as
+// punctuation or a symbol (S2b's B3 fix round — see tokenize's doc
+// comment for the punctuation shapes this specifically closes).
+func isWordSeparator(r rune) bool {
+	return unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r)
 }
 
 // canonicalise folds every remaining lower-case "i" to 'l' (D1 round 3).
@@ -200,7 +373,7 @@ func canonicalise(s string) string {
 }
 
 // tokenizeCamel is tokenize plus one more split point (R6 round 2): a
-// boundary is inserted at every transition from a lower-case letter or
+// boundary is inserted at every transition from a lower-case letter or a
 // digit to an upper-case letter, computed against text's ORIGINAL casing
 // and applied BEFORE event.Skeleton — which lower-cases everything, and
 // so would otherwise destroy the very case information this needs — so a
@@ -249,13 +422,16 @@ func insertCamelBoundaries(s string) string {
 // so this file's bytes stay unambiguous regardless of editor/tool
 // encoding: zeroWidthSpace (U+200B), zeroWidthNonJoiner (U+200C),
 // zeroWidthJoiner (U+200D), zeroWidthNoBreakSpace (U+FEFF, also the UTF-8
-// BOM), wordJoiner (U+2060).
+// BOM), wordJoiner (U+2060), softHyphen (U+00AD, S2b's N3 fix round),
+// invisibleSeparator (U+2063, S2b's N3 fix round).
 const (
 	zeroWidthSpace        = 0x200B
 	zeroWidthNonJoiner    = 0x200C
 	zeroWidthJoiner       = 0x200D
 	zeroWidthNoBreakSpace = 0xFEFF
 	wordJoiner            = 0x2060
+	softHyphen            = 0x00AD
+	invisibleSeparator    = 0x2063
 )
 
 // stripZeroWidth removes the invisible formatting characters listed above
@@ -268,7 +444,7 @@ const (
 func stripZeroWidth(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch r {
-		case zeroWidthSpace, zeroWidthNonJoiner, zeroWidthJoiner, zeroWidthNoBreakSpace, wordJoiner:
+		case zeroWidthSpace, zeroWidthNonJoiner, zeroWidthJoiner, zeroWidthNoBreakSpace, wordJoiner, softHyphen, invisibleSeparator:
 			return -1
 		}
 		return r
@@ -302,8 +478,9 @@ type rawBrandsFile struct {
 }
 
 type rawBrand struct {
-	Name    string   `yaml:"name"`
-	Aliases []string `yaml:"aliases"`
+	Name          string   `yaml:"name"`
+	Aliases       []string `yaml:"aliases"`
+	CaseSensitive bool     `yaml:"case_sensitive"`
 }
 
 // LoadBrandsFile reads and parses a config/brands.yaml-shaped file (S3: the
@@ -325,7 +502,24 @@ func LoadBrandsFile(path string) (BrandSet, error) {
 		if rb.Name == "" {
 			return BrandSet{}, fmt.Errorf("feature: %s: a brands entry is missing name", path)
 		}
-		entries = append(entries, BrandEntry{Name: rb.Name, Aliases: rb.Aliases})
+		entries = append(entries, BrandEntry{Name: rb.Name, Aliases: rb.Aliases, CaseSensitive: rb.CaseSensitive})
 	}
 	return NewBrandSet(entries), nil
+}
+
+// MergeBrandSets combines the entries of several BrandSets into one — the
+// scope's "optional private brands_extra file" requirement: an operator
+// can keep a private brand list outside this public repo (config
+// `brands_extra` / `--brands-extra`, cmd/abusekit) and have it matched
+// alongside the shipped public config/brands.yaml, without LoadBrandsFile
+// itself needing to know how many files it's loading. A zero-value/empty
+// argument contributes nothing (MergeBrandSets(a, BrandSet{}) == a in
+// behavior), so a caller can always merge in an optional set
+// unconditionally rather than branching on whether it was actually loaded.
+func MergeBrandSets(sets ...BrandSet) BrandSet {
+	var all []brandWords
+	for _, s := range sets {
+		all = append(all, s.entries...)
+	}
+	return BrandSet{entries: all}
 }

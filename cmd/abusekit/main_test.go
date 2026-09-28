@@ -38,6 +38,7 @@ func shippedConfig(t *testing.T) serveConfig {
 		vendorsPath: filepath.Join(root, "config", "vendors.yaml"),
 		weightsPath: filepath.Join(root, "config", "local_weights.yaml"),
 		brandsPath:  filepath.Join(root, "config", "brands.yaml"),
+		webmailPath: filepath.Join(root, "config", "webmail.yaml"),
 		keysPath:    filepath.Join(root, "config", "keys.yaml"),
 		dev:         true,
 	}
@@ -169,6 +170,7 @@ func TestRunServe_CheckSucceeds(t *testing.T) {
 		"--vendors", c.vendorsPath,
 		"--weights", c.weightsPath,
 		"--brands", c.brandsPath,
+		"--webmail", c.webmailPath,
 		"--keys", c.keysPath,
 	}
 	if err := runServe(args); err != nil {
@@ -225,12 +227,12 @@ func TestRunServeWithContext_ServesTheAPI(t *testing.T) {
 		t.Fatalf("boot: %v", err)
 	}
 
-	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands})
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands, Webmail: deps.webmail})
 	if err != nil {
 		s.Close()
 		t.Fatalf("worker.New: %v", err)
 	}
-	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands, deps.webmail)
 	if err != nil {
 		s.Close()
 		t.Fatalf("startAPIServer: %v", err)

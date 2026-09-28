@@ -43,7 +43,7 @@ func (f *fakeNeighbors) Evidence(context.Context, string, string) (NeighborEvide
 }
 
 func TestExtract_EmptyHistory(t *testing.T) {
-	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestExtract_EmptyHistory(t *testing.T) {
 
 func TestExtract_RequiresWindowsNow(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when windows.Now is zero")
 	}
@@ -62,7 +62,7 @@ func TestExtract_RequiresWindowsNow(t *testing.T) {
 
 func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when OneHour/DayHour are unset")
 	}
@@ -70,7 +70,7 @@ func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 
 func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 func TestExtract_NeighborEvidenceError(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{err: errors.New("boom")}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected Extract to propagate a Neighbors.Evidence error")
 	}
@@ -91,7 +91,7 @@ func TestExtract_NeighborEvidenceError(t *testing.T) {
 func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 2, LabelledAbusiveCount: 3, FingerprintShared: true, Truncated: true}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 func TestExtract_LinkedDeletedNSaturates(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 19}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -388,19 +388,19 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 	brands := smallTestBrands()
 	t.Run("brand match on the raw name", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
-		if got := nameBrandMatch(events, brands); got != 1 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
 			t.Errorf("name_brand_match = %v, want 1", got)
 		}
 	})
 	t.Run("no brand match", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "Notifications Agent"})}
-		if got := nameBrandMatch(events, brands); got != 0 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 0 {
 			t.Errorf("name_brand_match = %v, want 0", got)
 		}
 	})
 	t.Run("empty BrandSet never matches", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
-		if got := nameBrandMatch(events, BrandSet{}); got != 0 {
+		if got := boolToFloat(len(namedBrandNames(events, BrandSet{})) > 0); got != 0 {
 			t.Errorf("name_brand_match with an empty BrandSet = %v, want 0", got)
 		}
 	})
@@ -418,7 +418,7 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 		// is about resource.deleted being checked at all, not about that
 		// gate, so it uses a name the gate leaves alone.
 		events := []event.Event{ev("r1", "resource.deleted", 0, map[string]any{"name": "PayPal Alert"})}
-		if got := nameBrandMatch(events, brands); got != 1 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
 			t.Errorf("name_brand_match = %v, want 1", got)
 		}
 	})
@@ -861,5 +861,268 @@ func TestLoadBrandsFile_Round3Probes(t *testing.T) {
 		if brands.Matches(name) {
 			t.Errorf("brands.Matches(%q) = true, want false (integration-token gate must still fire after the i-fold)", name)
 		}
+	}
+}
+
+// TestLoadBrandsFile_S2bExtraBrands checks the shipped config/brands.yaml
+// against the marketplace/social/shipping additions (scope's "extra
+// public brands" item) and N1's case-sensitive UPS entry.
+func TestLoadBrandsFile_S2bExtraBrands(t *testing.T) {
+	brands, err := LoadBrandsFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBrandsFile: %v", err)
+	}
+
+	mustMatch := []string{
+		"Your eBay listing sold",
+		"Poshmark payout pending",
+		"Vinted account verification",
+		"Your TikTok account was reported",
+		"Facebook security alert",
+		"Your Booking.com reservation",
+		"UPS: delivery exception",
+	}
+	for _, name := range mustMatch {
+		if !brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = false, want true", name)
+		}
+	}
+
+	mustNotMatch := []string{
+		"it has its ups and downs", // N1: lower-case "ups" must not match
+		"Facebook group meetup",    // N2: community context
+	}
+	for _, name := range mustNotMatch {
+		if brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = true, want false", name)
+		}
+	}
+}
+
+// --- S2b: resource-kind aliases (N4) ------------------------------------
+
+func TestNormalizeResourceKind_Aliases(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{"key", "key"},
+		{"Key", "key"},
+		{"KEYS", "key"},
+		{"api_key", "key"},
+		{"api_keys", "key"},
+		{"api-key", "key"},
+		{"apikey", "key"},
+		{"API Key", "key"},
+		{"api key", "key"},
+		{"agent", "agent"}, // not a key alias: passes through unchanged
+	}
+	for _, tt := range tests {
+		if got := normalizeResourceKind(tt.raw); got != tt.want {
+			t.Errorf("normalizeResourceKind(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestKeyVelocity_RecognisesAliasedKinds(t *testing.T) {
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "api_key"}),
+		ev("r2", "resource.created", 0, map[string]any{"kind": "API Key"}),
+		ev("r3", "resource.created", 0, map[string]any{"kind": "keys"}),
+		ev("r4", "resource.created", 0, map[string]any{"kind": "agent"}),
+	}
+	got := resourceCount(events, resourceKindKey, at(0), time.Hour)
+	if got != 3 {
+		t.Errorf("key_velocity_1h with aliased kinds = %v, want 3 (the agent kind must not count)", got)
+	}
+}
+
+// --- S2b: send-volume young-account scoping (B1) ------------------------
+
+func TestSends1h_GatedByAccountAge(t *testing.T) {
+	firstSeenAt := base
+	events := []event.Event{
+		ev("c1", "content.sent", 6*24*time.Hour, map[string]any{"recipient_count": float64(50)}),
+	}
+	// Within the first 7 days: the send counts.
+	young := sends1h(events, firstSeenAt.Add(6*24*time.Hour), firstSeenAt, time.Hour)
+	if young != 50 {
+		t.Errorf("sends_1h (young account) = %v, want 50", young)
+	}
+
+	// An established (>7 day old) account sending the SAME volume right
+	// now must not read the same as day 0 (B1's established-sender
+	// fixture).
+	oldEvents := []event.Event{
+		ev("c1", "content.sent", 60*24*time.Hour, map[string]any{"recipient_count": float64(300)}),
+	}
+	oldNow := firstSeenAt.Add(60 * 24 * time.Hour)
+	old := sends1h(oldEvents, oldNow, firstSeenAt, time.Hour)
+	if old != 0 {
+		t.Errorf("sends_1h (established account, >7 days old) = %v, want 0", old)
+	}
+}
+
+func TestSends10mMax_GatedByAccountAgeAndCappedNotLifetime(t *testing.T) {
+	firstSeenAt := base
+	// A burst inside the first week counts.
+	events := []event.Event{
+		ev("c1", "content.sent", time.Hour, map[string]any{"recipient_count": float64(120)}),
+		ev("c2", "content.sent", time.Hour+5*time.Minute, map[string]any{"recipient_count": float64(80)}),
+	}
+	now := firstSeenAt.Add(2 * time.Hour)
+	got := sends10mMax(events, now, firstSeenAt)
+	if got != 200 {
+		t.Errorf("sends_10m_max (young account) = %v, want 200 (both events in the same 10m window)", got)
+	}
+
+	// The SAME historical burst, viewed 60 days later (an established
+	// sender), must no longer register at all — B1: "the flag never
+	// decays" is exactly the bug this gate closes.
+	longAfter := firstSeenAt.Add(60 * 24 * time.Hour)
+	gotLater := sends10mMax(events, longAfter, firstSeenAt)
+	if gotLater != 0 {
+		t.Errorf("sends_10m_max (60 days after a first-week burst) = %v, want 0", gotLater)
+	}
+}
+
+func TestSendsFirstDay_NotGatedByAccountAge(t *testing.T) {
+	firstSeenAt := base
+	events := []event.Event{ev("c1", "content.sent", time.Hour, map[string]any{"recipient_count": float64(40)})}
+	// SendsFirstDay is a permanent day-1 fact: it must still report the
+	// same value long after the account has matured past
+	// youngAccountWindow, unlike Sends1h/Sends10mMax/WebmailSends1h/
+	// DistinctRecipients1h.
+	now := firstSeenAt.Add(60 * 24 * time.Hour)
+	got := sendsFirstDay(events, firstSeenAt, now, 24*time.Hour)
+	if got != 40 {
+		t.Errorf("sends_first_day (60 days later) = %v, want 40 (permanent, not gated)", got)
+	}
+}
+
+func TestSends10mMax_FutureDatedEventsExcluded(t *testing.T) {
+	// N5: an event dated after `now` must not be counted.
+	events := []event.Event{ev("c1", "content.sent", 2*time.Hour, map[string]any{"recipient_count": float64(999)})}
+	now := at(time.Hour)
+	if got := sends10mMax(events, now, base); got != 0 {
+		t.Errorf("sends_10m_max with a future-dated event = %v, want 0", got)
+	}
+}
+
+func TestRecipientCountOf_PerEventCap(t *testing.T) {
+	e := ev("c1", "content.sent", 0, map[string]any{"recipient_count": float64(10000)})
+	if got := recipientCountOf(e); got != sendsVolumeCap {
+		t.Errorf("recipientCountOf with an oversized recipient_count = %v, want capped at %v", got, sendsVolumeCap)
+	}
+}
+
+func TestRecipientCountOf_FallsBackToOne(t *testing.T) {
+	tests := []map[string]any{
+		nil,
+		{"recipient_count": float64(0)},
+		{"recipient_count": float64(-1)},
+		{"recipient_count": float64(2.5)},
+	}
+	for _, data := range tests {
+		e := ev("c1", "content.sent", 0, data)
+		if got := recipientCountOf(e); got != 1 {
+			t.Errorf("recipientCountOf(%v) = %v, want 1", data, got)
+		}
+	}
+}
+
+// --- S2b: webmail features (S7) -----------------------------------------
+
+func TestWebmailSends1h_ComputedDirectlyNotShareTimesVolume(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com"})
+	firstSeenAt := base
+	// Lifetime: 1 webmail send of 10, 1 non-webmail send of 90 (so the
+	// LIFETIME webmail share is 10/100 = 0.1). But the last hour is
+	// ENTIRELY webmail (40 recipients) — share*volume would have reported
+	// 0.1*40 = 4, which is wrong; the direct computation must report 40.
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(10)}),
+		ev("c2", "content.sent", time.Minute, map[string]any{"recipient_domain": "corp-example.test", "recipient_count": float64(90)}),
+		ev("c3", "content.sent", 50*time.Minute, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(40)}),
+	}
+	now := at(time.Hour)
+	got := webmailSends1h(events, now, firstSeenAt, time.Hour, webmail)
+	if got != 40 {
+		t.Errorf("webmail_sends_1h = %v, want 40 (direct computation, not share*volume)", got)
+	}
+}
+
+func TestWebmailRecipientShare_LifetimeAndNotGated(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com"})
+	firstSeenAt := base
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(10)}),
+		ev("c2", "content.sent", time.Minute, map[string]any{"recipient_domain": "corp-example.test", "recipient_count": float64(90)}),
+	}
+	// Evaluated 60 days later: still 0.1, since this feature is a
+	// lifetime ratio, never gated by account age.
+	now := firstSeenAt.Add(60 * 24 * time.Hour)
+	got := webmailRecipientShare(events, now, webmail)
+	if math.Abs(got-0.1) > 1e-9 {
+		t.Errorf("webmail_recipient_share = %v, want 0.1", got)
+	}
+}
+
+// --- S2b: subject_brand_match (S1, S2) -----------------------------------
+
+func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
+	brands := smallTestBrands()
+	// S1: "tracking" inside the SUBJECT LINE itself must not suppress the
+	// match (only the account's own resource/agent name can).
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal package tracking update"})}
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, false)
+	if got != 1 {
+		t.Errorf("subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
+	}
+}
+
+func TestSubjectBrandMatch_SuppressedByAccountIntegrationName(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
+	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, nil, true)
+	if got != 0 {
+		t.Errorf("subject_brand_match with accountHasIntegrationName=true = %v, want 0", got)
+	}
+}
+
+func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
+	alreadyNamed := map[string]struct{}{"PayPal": {}}
+	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, alreadyNamed, false)
+	if got != 0 {
+		t.Errorf("subject_brand_match = %v, want 0 (S2: already counted by name_brand_match)", got)
+	}
+}
+
+func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
+	brands := NewBrandSet([]BrandEntry{{Name: "Fictaone"}, {Name: "Fictatwo"}, {Name: "Fictathree"}, {Name: "Fictafour"}})
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Fictaone Fictatwo Fictathree Fictafour update"})}
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, false)
+	if got != subjectBrandMatchCap {
+		t.Errorf("subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
+	}
+}
+
+// TestExtract_SubjectBrandMatchIntegratesWithNamedBrandNames is an
+// Extract-level check that Features.NameBrandMatch and
+// Features.SubjectBrandMatch never double-count the same brand (S2).
+func TestExtract_SubjectBrandMatchDoesNotDoubleCount(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Alert"}),
+		ev("c1", "content.sent", time.Minute, map[string]any{"subject_line": "Your PayPal account"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), brands, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.NameBrandMatch != 1 {
+		t.Errorf("NameBrandMatch = %v, want 1", res.Features.NameBrandMatch)
+	}
+	if res.Features.SubjectBrandMatch != 0 {
+		t.Errorf("SubjectBrandMatch = %v, want 0 (S2: PayPal already counted via NameBrandMatch)", res.Features.SubjectBrandMatch)
 	}
 }

@@ -182,6 +182,179 @@ func TestBuildIntegrationTokens(t *testing.T) {
 	}
 }
 
+// TestBrandSet_PunctuationBoundaries is S2b's B3 fix round: a brand
+// immediately followed by a colon, comma, exclamation mark, closing
+// parenthesis, quotation mark or slash — none of which the old
+// separator list (whitespace, hyphen, underscore, period) recognised —
+// must still match, and a possessive 's must not glue onto the brand
+// word either.
+func TestBrandSet_PunctuationBoundaries(t *testing.T) {
+	brands := mechanismBrands()
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"colon", "PayPal: your account", true},
+		{"comma", "Hi, PayPal here", true},
+		{"exclamation", "PayPal!", true},
+		{"closing paren", "(PayPal) verification", true},
+		{"quote", `"PayPal" support`, true},
+		{"slash", "PayPal/billing", true},
+		{"possessive", "PayPal's security team", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := brands.Matches(tt.text); got != tt.want {
+				t.Errorf("Matches(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTokenize_Punctuation is B3's direct unit test on tokenize itself.
+func TestTokenize_Punctuation(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"PayPal:", []string{"paypal"}},
+		{"PayPal,", []string{"paypal"}},
+		{"PayPal!", []string{"paypal"}},
+		{"(PayPal)", []string{"paypal"}},
+		{`"PayPal"`, []string{"paypal"}},
+		{"PayPal/billing", []string{"paypal", "bllllng"}}, // canonicalise (D1 round 3) folds every remaining "i" to 'l' too — see TestCanonicalise
+		{"PayPal's", []string{"paypal", "s"}},
+	}
+	for _, tt := range tests {
+		got := tokenize(tt.in)
+		if !equalStrings(got, tt.want) {
+			t.Errorf("tokenize(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestTokenize_SoftHyphenAndInvisibleSeparator is S2b's N3 fix round:
+// U+00AD (soft hyphen) and U+2063 (invisible separator) must be stripped
+// like the other zero-width formatting characters, not treated as a
+// visible separator or left in place — either would defeat the
+// word-boundary match on a brand name split by one.
+func TestTokenize_SoftHyphenAndInvisibleSeparator(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"soft hyphen mid-word", "pay­pal"},
+		{"invisible separator mid-word", "pay⁣pal"},
+	}
+	for _, tt := range tests {
+		got := tokenize(tt.in)
+		want := []string{"paypal"}
+		if !equalStrings(got, want) {
+			t.Errorf("tokenize(%q) = %v, want %v", tt.in, got, want)
+		}
+	}
+}
+
+// TestBrandSet_CaseSensitiveShortToken is S2b's N1 fix round: a brand
+// entry marked CaseSensitive must not fire on the ordinary lower-case
+// English word it collides with, only on its exact-case spelling as a
+// standalone token.
+func TestBrandSet_CaseSensitiveShortToken(t *testing.T) {
+	brands := NewBrandSet([]BrandEntry{
+		{Name: "UPS", CaseSensitive: true},
+	})
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"exact case, standalone", "Your UPS package has shipped", true},
+		{"exact case, punctuation-adjacent", "UPS: delivery notice", true},
+		{"ordinary lower-case word", "it has its ups and downs", false},
+		{"mixed case does not count as exact", "Ups, wrong address", false},
+		{"substring of a longer word", "startups are hard", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := brands.Matches(tt.text); got != tt.want {
+				t.Errorf("Matches(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBrandSet_CommunityContextSuppressesMatch is S2b's N2 fix round: a
+// social-media brand mentioned as part of describing an ordinary
+// community gathering must not match, the subject-line analogue of
+// integrationTokens.
+func TestBrandSet_CommunityContextSuppressesMatch(t *testing.T) {
+	brands := NewBrandSet([]BrandEntry{{Name: "Fictabook"}})
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"plain mention", "Fictabook password reset", true},
+		{"group meetup", "Fictabook group meetup this Friday", false},
+		{"fan club", "Join the Fictabook fans chat", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := brands.Matches(tt.text); got != tt.want {
+				t.Errorf("Matches(%q) = %v, want %v", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMatchedBrandNamesForSubject is S2b's S1 fix round: a subject line's
+// OWN words ("tracking", "api") must never suppress a match — only the
+// SENDING ACCOUNT's own integration-name evidence (passed in by the
+// caller) does, and it suppresses the whole subject rather than being
+// re-litigated per word.
+func TestMatchedBrandNamesForSubject(t *testing.T) {
+	brands := mechanismBrands()
+
+	got := brands.MatchedBrandNamesForSubject("Your PayPal package tracking update", false)
+	if _, ok := got["PayPal"]; !ok {
+		t.Errorf("subject-line matching must not be suppressed by the subject's own words (%v)", got)
+	}
+
+	got = brands.MatchedBrandNamesForSubject("Your PayPal account api access", true)
+	if len(got) != 0 {
+		t.Errorf("accountHasIntegrationName=true must suppress every subject match, got %v", got)
+	}
+
+	// The community-token gate (N2) still applies to subject-line
+	// matching — it is a different false-positive shape than S1's
+	// integration-token fix.
+	got = brands.MatchedBrandNamesForSubject("Apple fan club meetup", false)
+	if len(got) != 0 {
+		t.Errorf("community-context gate must still apply to subject-line matching, got %v", got)
+	}
+}
+
+// TestMergeBrandSets is the scope's optional brands_extra support: a
+// merged set matches every entry from every input set, and an empty/zero
+// argument contributes nothing.
+func TestMergeBrandSets(t *testing.T) {
+	a := NewBrandSet([]BrandEntry{{Name: "PayPal"}})
+	b := NewBrandSet([]BrandEntry{{Name: "Fictashop"}})
+	merged := MergeBrandSets(a, b)
+	if !merged.Matches("PayPal") {
+		t.Errorf("merged set must still match the first set's brand")
+	}
+	if !merged.Matches("Fictashop") {
+		t.Errorf("merged set must match the second set's brand")
+	}
+
+	onlyA := MergeBrandSets(a, BrandSet{})
+	if !onlyA.Matches("PayPal") || onlyA.Matches("Fictashop") {
+		t.Errorf("merging in an empty BrandSet must not add or remove matches")
+	}
+}
+
 func TestTokenizeCamel(t *testing.T) {
 	tests := []struct {
 		in   string
