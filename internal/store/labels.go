@@ -18,20 +18,29 @@ type Label struct {
 	EvidenceRef string
 }
 
-// PutLabel records l for tenant and returns its assigned id. S1 only
-// stores the row; turning a label into a corpus_examples row (design
-// §4.9's "a label writes a corpus example...") is S3/S4 work once the
-// label API and harness exist to make use of it.
+// PutLabel records l for tenant and returns its assigned id.
 //
-// An "abusive" label also propagates to l.Subject's same-tenant neighbours
-// (S2 fix round, PropagateToNeighbors): their linked_labelled_abusive_n
-// feature just became stale the instant this label landed, and would
-// otherwise sit wrong until something else happened to touch them. The
-// label itself is already committed by the time propagation runs, so a
-// propagation failure is returned alongside the now-valid id rather than
-// silently swallowed — the label write did succeed; the caller decides
-// whether a failed propagation nudge (which a neighbour's own next real
-// event would correct anyway) is worth surfacing or just logging.
+// It also bumps l.Subject's OWN dirty_seq (S3): a label is new evidence
+// about the subject itself (design §4.9), so the worker revisits it even
+// though no v0 feature currently reads a label directly — this keeps
+// "labelling a subject reschedules it" true regardless of which future
+// feature ends up caring, rather than silently depending on the subject's
+// next unrelated event to ever trigger a fresh round. A subject row that
+// doesn't exist yet (a label posted before any event ever arrived for it)
+// simply matches zero rows here, the same tolerant no-op
+// PropagateToNeighbors already relies on for a subject with no
+// neighbours.
+//
+// An "abusive" label ALSO propagates to l.Subject's same-tenant
+// neighbours (S2 fix round, PropagateToNeighbors): their
+// linked_labelled_abusive_n feature just became stale the instant this
+// label landed, and would otherwise sit wrong until something else
+// happened to touch them. The label itself is already committed by the
+// time either bump runs, so a failure is returned alongside the
+// now-valid id rather than silently swallowed — the label write did
+// succeed; the caller decides whether a failed dirty-bump (which the
+// subject's own next real event would correct anyway) is worth
+// surfacing or just logging.
 func (s *Store) PutLabel(ctx context.Context, tenant string, l Label) (int64, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx, `
@@ -41,6 +50,11 @@ func (s *Store) PutLabel(ctx context.Context, tenant string, l Label) (int64, er
 	`, tenant, l.Subject, l.Rule, l.Label, l.Source, l.Actor, l.Note, l.EvidenceRef).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert label for subject %s: %w", l.Subject, err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE subjects SET dirty_seq = dirty_seq + 1 WHERE tenant = $1 AND subject = $2
+	`, tenant, l.Subject); err != nil {
+		return id, fmt.Errorf("store: label %d recorded, but bump dirty_seq for %s: %w", id, l.Subject, err)
 	}
 	if l.Label == "abusive" {
 		if perr := s.PropagateToNeighbors(ctx, tenant, l.Subject); perr != nil {
