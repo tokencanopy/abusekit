@@ -43,21 +43,31 @@ type BrandEntry struct {
 // one word with no separator tokenizes as a single word that doesn't
 // equal "paypal"): trading a little recall for the word-boundary safety
 // two independent reviews required is the deliberate v0 choice.
+// brandWords is one pre-tokenized name/alias word sequence, tagged with
+// the CANONICAL brand name (BrandEntry.Name) it belongs to — [S2b]:
+// subject_brand_match needs to count DISTINCT brands, so a match has to
+// be traceable back to which brand identity fired, not just "something
+// matched" (Matches' original bool-only contract).
+type brandWords struct {
+	words []string
+	name  string
+}
+
 type BrandSet struct {
-	entries [][]string // one pre-tokenized word sequence per name/alias
+	entries []brandWords
 }
 
 // NewBrandSet builds a BrandSet from entries, pre-tokenizing every name and
 // alias once rather than per Matches call.
 func NewBrandSet(entries []BrandEntry) BrandSet {
-	var all [][]string
+	var all []brandWords
 	for _, e := range entries {
 		if words := tokenize(e.Name); len(words) > 0 {
-			all = append(all, words)
+			all = append(all, brandWords{words, e.Name})
 		}
 		for _, a := range e.Aliases {
 			if words := tokenize(a); len(words) > 0 {
-				all = append(all, words)
+				all = append(all, brandWords{words, e.Name})
 			}
 		}
 	}
@@ -142,19 +152,49 @@ func (b BrandSet) Matches(text string) bool {
 	if len(b.entries) == 0 {
 		return false
 	}
-	return b.matchesWords(tokenize(text)) || b.matchesWords(tokenizeCamel(text))
+	return len(b.MatchedBrandNames(text)) > 0
 }
 
-func (b BrandSet) matchesWords(words []string) bool {
-	if len(words) == 0 || hasIntegrationToken(words) {
-		return false
+// MatchedBrandNames [S2b] returns the set of DISTINCT curated brand names
+// (BrandEntry.Name — an entry matched via an alias still reports its
+// canonical name, never the alias text) whose word sequence appears in
+// text, per Matches' own word/token-boundary rule and integration-token
+// gate. Used by subject_brand_match to count how many different brands a
+// subject_line mentions, not merely whether any did — Matches itself is
+// now defined in terms of this (len(...) > 0), so the two can never drift
+// apart on which candidates count as a match.
+//
+// Returns nil (never a non-nil empty map) when nothing matched, matching
+// Go's normal "ranging over a nil map is a no-op, len(nil map) is 0"
+// idiom — callers never need a special nil check before iterating.
+func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
+	if len(b.entries) == 0 {
+		return nil
 	}
+	out := b.matchedNames(tokenize(text))
+	for name := range b.matchedNames(tokenizeCamel(text)) {
+		if out == nil {
+			out = make(map[string]struct{})
+		}
+		out[name] = struct{}{}
+	}
+	return out
+}
+
+func (b BrandSet) matchedNames(words []string) map[string]struct{} {
+	if len(words) == 0 || hasIntegrationToken(words) {
+		return nil
+	}
+	var out map[string]struct{}
 	for _, brand := range b.entries {
-		if containsSequence(words, brand) {
-			return true
+		if containsSequence(words, brand.words) {
+			if out == nil {
+				out = make(map[string]struct{})
+			}
+			out[brand.name] = struct{}{}
 		}
 	}
-	return false
+	return out
 }
 
 // tokenize folds s through event.Skeleton (NFKC, confusables, lower-case,
@@ -328,4 +368,21 @@ func LoadBrandsFile(path string) (BrandSet, error) {
 		entries = append(entries, BrandEntry{Name: rb.Name, Aliases: rb.Aliases})
 	}
 	return NewBrandSet(entries), nil
+}
+
+// MergeBrandSets [S2b] combines the entries of several BrandSets into one
+// — F5's "optional second brands file" requirement: an operator can keep
+// a private brand list outside this public repo (config `brands_extra` /
+// `--brands-extra`, cmd/abusekit) and have it matched alongside the
+// shipped public config/brands.yaml, without LoadBrandsFile itself needing
+// to know how many files it's loading. A zero-value/empty argument
+// contributes nothing (MergeBrandSets(a, BrandSet{}) == a in behavior),
+// so a caller can always merge in an optional set unconditionally rather
+// than branching on whether it was actually loaded.
+func MergeBrandSets(sets ...BrandSet) BrandSet {
+	var all []brandWords
+	for _, s := range sets {
+		all = append(all, s.entries...)
+	}
+	return BrandSet{entries: all}
 }

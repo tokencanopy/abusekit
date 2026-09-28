@@ -76,6 +76,55 @@ func TestBrandSet_WordBoundarySafety(t *testing.T) {
 	}
 }
 
+// TestBrandSet_MatchedBrandNames is [S2b]: subject_brand_match needs to
+// count DISTINCT brands, not just whether something matched — an entry
+// matched via an alias must report its CANONICAL name, and the same brand
+// matched twice (once directly, once via an alias) must count once.
+func TestBrandSet_MatchedBrandNames(t *testing.T) {
+	brands := mechanismBrands()
+	t.Run("matching via an alias reports the canonical name", func(t *testing.T) {
+		got := brands.MatchedBrandNames("Pay Pal Rewards")
+		if len(got) != 1 {
+			t.Fatalf("MatchedBrandNames = %v, want exactly one match", got)
+		}
+		if _, ok := got["PayPal"]; !ok {
+			t.Errorf("MatchedBrandNames = %v, want the canonical name %q, not the alias", got, "PayPal")
+		}
+	})
+	t.Run("two different brands both count, once each", func(t *testing.T) {
+		got := brands.MatchedBrandNames("PayPal and Apple accounts")
+		if len(got) != 2 {
+			t.Fatalf("MatchedBrandNames = %v, want exactly two distinct brands", got)
+		}
+		if _, ok := got["PayPal"]; !ok {
+			t.Errorf("missing PayPal in %v", got)
+		}
+		if _, ok := got["Apple"]; !ok {
+			t.Errorf("missing Apple in %v", got)
+		}
+	})
+	t.Run("no match returns an empty (nil-safe) set", func(t *testing.T) {
+		got := brands.MatchedBrandNames("Notifications Agent")
+		if len(got) != 0 {
+			t.Errorf("MatchedBrandNames = %v, want empty", got)
+		}
+	})
+	t.Run("empty BrandSet returns nil", func(t *testing.T) {
+		got := BrandSet{}.MatchedBrandNames("PayPal")
+		if got != nil {
+			t.Errorf("MatchedBrandNames on the zero BrandSet = %v, want nil", got)
+		}
+	})
+	t.Run("Matches and MatchedBrandNames never disagree on whether anything matched", func(t *testing.T) {
+		texts := []string{"PayPal Support", "PayPal integration", "Pineapple Bot", ""}
+		for _, text := range texts {
+			if brands.Matches(text) != (len(brands.MatchedBrandNames(text)) > 0) {
+				t.Errorf("Matches(%q) and MatchedBrandNames(%q) disagree", text, text)
+			}
+		}
+	})
+}
+
 func TestBrandSet_EmptyMatchesNothing(t *testing.T) {
 	if (BrandSet{}).Matches("PayPal") {
 		t.Errorf("the zero BrandSet must never match anything")
@@ -139,6 +188,40 @@ func TestContainsSequence(t *testing.T) {
 		if got := containsSequence(tt.haystack, tt.needle); got != tt.want {
 			t.Errorf("containsSequence(%v, %v) = %v, want %v", tt.haystack, tt.needle, got, tt.want)
 		}
+	}
+}
+
+// TestMergeBrandSets is [S2b]'s "operator private brand list" support:
+// F5's `brands_extra` merges a second BrandSet's entries in alongside the
+// public one, and matching against the merged set finds brands from
+// EITHER source.
+func TestMergeBrandSets(t *testing.T) {
+	public := NewBrandSet([]BrandEntry{{Name: "PayPal"}})
+	private := NewBrandSet([]BrandEntry{{Name: "AcmeCorp Internal Tool"}})
+	merged := MergeBrandSets(public, private)
+
+	if !merged.Matches("PayPal Support") {
+		t.Errorf("merged set should still match the public brand")
+	}
+	if !merged.Matches("AcmeCorp Internal Tool Alert") {
+		t.Errorf("merged set should match the private brand")
+	}
+	if merged.Matches("Nothing Related") {
+		t.Errorf("merged set should not match unrelated text")
+	}
+}
+
+func TestMergeBrandSets_EmptyArgumentContributesNothing(t *testing.T) {
+	public := NewBrandSet([]BrandEntry{{Name: "PayPal"}})
+	merged := MergeBrandSets(public, BrandSet{})
+	if !merged.Matches("PayPal Support") {
+		t.Errorf("merging in an empty BrandSet must not drop the non-empty one's matches")
+	}
+}
+
+func TestMergeBrandSets_NoArgumentsMatchesNothing(t *testing.T) {
+	if MergeBrandSets().Matches("PayPal") {
+		t.Errorf("MergeBrandSets with no arguments must match nothing")
 	}
 }
 

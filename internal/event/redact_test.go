@@ -296,6 +296,40 @@ func TestEvent_Redact(t *testing.T) {
 				}
 			},
 		},
+		// [S2b] recipient_hash is an OPAQUE string the product computes
+		// under its own salt — never an address. It is a listed text field
+		// like any other, so it is already covered by the recursive
+		// email/control-character scan (scanForLeaks runs before schema
+		// filtering) and the schema's 128-byte cap; these three cases make
+		// that coverage explicit for this specific field rather than
+		// relying on the generic tests above to imply it.
+		{
+			name:     "recipient_hash that looks like an email is rejected",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "victim@example.com"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "recipient_hash is capped at 128 bytes, not rejected",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_hash": strings.Repeat("a", 300)},
+			check: func(t *testing.T, out map[string]any) {
+				s, _ := out["recipient_hash"].(string)
+				if len(s) != 128 {
+					t.Fatalf("expected recipient_hash truncated to 128 bytes, got %d", len(s))
+				}
+			},
+		},
+		{
+			name: "an ordinary opaque recipient_hash passes through unchanged",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_hash": "rh_9f8a2c"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_hash"] != "rh_9f8a2c" {
+					t.Fatalf("expected recipient_hash to pass through, got %#v", out)
+				}
+			},
+		},
 		// S8: closed-set enum fields reject an out-of-set value rather
 		// than silently storing it — design §4.3's built-in vocabulary
 		// table.

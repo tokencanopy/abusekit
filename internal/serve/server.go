@@ -75,6 +75,10 @@ type Deps struct {
 	// features match what the worker would have computed for it.
 	Neighbors feature.Neighbors
 	Brands    feature.BrandSet
+	// Webmail feeds the same label-handler feature extraction ([S2b]:
+	// webmail_recipient_share/webmail_sends_1h) — the zero value holds
+	// both at 0, matching Brands' own "not loaded yet" convention.
+	Webmail feature.WebmailSet
 
 	// Now returns the current time; nil uses time.Now().UTC(). Tests
 	// inject a fixed clock for deterministic signature/skew and
@@ -114,6 +118,7 @@ type Server struct {
 
 	neighbors feature.Neighbors
 	brands    feature.BrandSet
+	webmail   feature.WebmailSet
 
 	nowFn  func() time.Time
 	logger *slog.Logger
@@ -175,6 +180,7 @@ func New(deps Deps) (*Server, error) {
 		keys:           deps.Keys,
 		neighbors:      deps.Neighbors,
 		brands:         deps.Brands,
+		webmail:        deps.Webmail,
 		nowFn:          deps.Now,
 		logger:         deps.Logger,
 		replay:         newReplayCache(),

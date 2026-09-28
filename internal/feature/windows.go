@@ -2,6 +2,7 @@ package feature
 
 import (
 	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,6 +62,30 @@ func normalizeToken(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// normalizeResourceKind [S2b] canonicalises resource.created/deleted's
+// producer-supplied, free-text `kind` field per the design's [S2b]
+// producer-contract amendment (docs/design's §4.5 note): case/whitespace-
+// insensitive (S10's normalizeToken, already true), and folding the
+// aliases "key"/"api_key"/"apikey"/"api-key" to resourceKindKey ("key") and
+// "agent"/"mailbox"/"inbox" to "agent" — proven necessary, a real
+// producer's own "api_key" spelling was never recognized as a key at all,
+// so a burst of key creation read as ordinary (uncounted) resource
+// activity instead of the key-specific signal it actually was. A kind
+// outside both alias groups passes through normalizeToken's folding
+// unchanged (still case/whitespace-insensitive), never rejected — the
+// vocabulary here is a documented convention producers SHOULD follow, not
+// something ingest itself enforces (design §4.12).
+func normalizeResourceKind(raw string) string {
+	switch normalizeToken(raw) {
+	case "key", "api_key", "apikey", "api-key":
+		return "key"
+	case "agent", "mailbox", "inbox":
+		return "agent"
+	default:
+		return normalizeToken(raw)
+	}
+}
+
 // resourceCount counts resource.created events, optionally restricted to a
 // specific `kind` and/or a trailing window ending at now.
 //
@@ -75,7 +100,7 @@ func resourceCount(events []event.Event, kind string, now time.Time, window time
 		}
 		if kind != "" {
 			k, ok := dataString(e.Data, "kind")
-			if !ok || normalizeToken(k) != kind {
+			if !ok || normalizeResourceKind(k) != kind {
 				continue
 			}
 		}
@@ -426,4 +451,185 @@ func earliestWindowExit(events []event.Event, now time.Time, window time.Duratio
 		return time.Time{}, false
 	}
 	return exit, true
+}
+
+// subjectBrandMatchCap [S2b] bounds Features.SubjectBrandMatch (design's
+// own "capped at 3" — matching NameBrandMatch's spirit that a lure
+// mentioning many different brands isn't linearly worse past a point, and
+// an unbounded count would let a template test-mailing every brand in the
+// list swamp the model through this feature alone).
+const subjectBrandMatchCap = 3
+
+// recipientCountOf [S2b] reads a content.sent event's recipient_count,
+// falling back to 1 (a single recipient) when the field is absent or not a
+// positive number — design's [S2b] amendment: "recipient_count summed,
+// falling back to 1". Every send-volume feature below (Sends10mMax,
+// Sends1h, SendsFirstDay, WebmailRecipientShare) reads recipient counts
+// through this one function so the fallback rule can't drift between them.
+func recipientCountOf(e event.Event) float64 {
+	n, ok := dataNumber(e.Data, "recipient_count")
+	if !ok || n <= 0 {
+		return 1
+	}
+	return n
+}
+
+// sendsInWindow [S2b] sums recipientCountOf across content.sent events
+// falling within the half-open window (now-window, now] — withinWindow's
+// own convention — used by both Sends1h (a real decaying window) and
+// DistinctRecipients1h's no-hash fallback.
+func sendsInWindow(events []event.Event, now time.Time, window time.Duration) float64 {
+	var sum float64
+	for _, e := range events {
+		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+			continue
+		}
+		sum += recipientCountOf(e)
+	}
+	return sum
+}
+
+// sends1h [S2b] is Features.Sends1h: log1p of sendsInWindow over the
+// trailing window ending at now — decays exactly like
+// resourceCount(events, "", now, window) as the window slides forward
+// with no new event; content.sent is already a windowed event type (see
+// isWindowedEventType), so no rescore-scheduling change is needed for the
+// decay this introduces.
+func sends1h(events []event.Event, now time.Time, window time.Duration) float64 {
+	return math.Log1p(sendsInWindow(events, now, window))
+}
+
+// sendsFirstDay [S2b] is Features.SendsFirstDay: log1p of the sum of
+// content.sent recipient_count within [firstSeenAt, firstSeenAt+window]
+// inclusive on both ends — anchored to the subject's first event exactly
+// like firstDayDistinctDomains, not to "now": once past firstSeenAt+window,
+// this feature is permanently fixed, and nextRescoreAt's existing
+// first-day-cutover candidate (feature-agnostic) already covers its one
+// transition with no code change.
+func sendsFirstDay(events []event.Event, firstSeenAt time.Time, window time.Duration) float64 {
+	cutoff := firstSeenAt.Add(window)
+	var sum float64
+	for _, e := range events {
+		if e.Type != "content.sent" {
+			continue
+		}
+		if e.At.Before(firstSeenAt) || e.At.After(cutoff) {
+			continue
+		}
+		sum += recipientCountOf(e)
+	}
+	return math.Log1p(sum)
+}
+
+// sends10mMax [S2b] is Features.Sends10mMax: log1p of the LARGEST sum of
+// content.sent recipient_count within any window-duration-wide window
+// across the subject's whole history — computed order-independently (a
+// standard two-pointer sliding-window-sum maximum over events sorted by
+// At) so out-of-order delivery can never miss the true maximum the way a
+// single forward pass over delivery order could. Unlike sends1h/
+// sendsFirstDay above, this is a MAXIMUM over already-elapsed windows: it
+// can only grow as a new event arrives, never shrink as time passes with
+// no new event, so it needs no window-exit rescore of its own (see its
+// Features field doc comment).
+func sends10mMax(events []event.Event, window time.Duration) float64 {
+	type point struct {
+		at time.Time
+		n  float64
+	}
+	var pts []point
+	for _, e := range events {
+		if e.Type != "content.sent" {
+			continue
+		}
+		pts = append(pts, point{e.At, recipientCountOf(e)})
+	}
+	if len(pts) == 0 {
+		return 0
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].at.Before(pts[j].at) })
+
+	var maxSum, sum float64
+	left := 0
+	for right := range pts {
+		sum += pts[right].n
+		for left < right && !pts[left].at.After(pts[right].at.Add(-window)) {
+			sum -= pts[left].n
+			left++
+		}
+		if sum > maxSum {
+			maxSum = sum
+		}
+	}
+	return math.Log1p(maxSum)
+}
+
+// distinctRecipients1h [S2b] is Features.DistinctRecipients1h: log1p of
+// the count of distinct content.sent recipient_hash values within the
+// trailing window ending at now, falling back to ADDING recipient_count
+// (not counting the event as a single recipient) for any event with no
+// recipient_hash at all — an event with no hash gives no way to tell its
+// recipients apart, so treating it as "recipient_count more distinct
+// recipients" is closer to the truth than either dropping it or counting
+// it as exactly one.
+func distinctRecipients1h(events []event.Event, now time.Time, window time.Duration) float64 {
+	seen := make(map[string]struct{})
+	var fallback float64
+	for _, e := range events {
+		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+			continue
+		}
+		if h, ok := dataString(e.Data, "recipient_hash"); ok && h != "" {
+			seen[h] = struct{}{}
+			continue
+		}
+		fallback += recipientCountOf(e)
+	}
+	return math.Log1p(float64(len(seen)) + fallback)
+}
+
+// webmailRecipientShare [S2b] is Features.WebmailRecipientShare: the
+// LIFETIME share (0..1) of sent recipients whose recipient_domain is on
+// webmail's loaded list — a permanent fact, not a decaying window (see its
+// Features field doc comment). 0 when the subject has sent nothing at all
+// (never a division by zero).
+func webmailRecipientShare(events []event.Event, webmail WebmailSet) float64 {
+	var total, webmailSum float64
+	for _, e := range events {
+		if e.Type != "content.sent" {
+			continue
+		}
+		n := recipientCountOf(e)
+		total += n
+		if d, ok := dataString(e.Data, "recipient_domain"); ok && webmail.Contains(d) {
+			webmailSum += n
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return webmailSum / total
+}
+
+// subjectBrandMatch [S2b] is Features.SubjectBrandMatch: the count of
+// DISTINCT curated brands (BrandSet.MatchedBrandNames — same
+// canonicalisation and integration-token gate as NameBrandMatch) matched
+// across every content.sent subject_line within the trailing window ending
+// at now, capped at subjectBrandMatchCap. content.sent is already a
+// windowed event type, so this decaying window's rescore scheduling is
+// already covered with no code change.
+func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration, brands BrandSet) float64 {
+	matched := make(map[string]struct{})
+	for _, e := range events {
+		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+			continue
+		}
+		subj, ok := dataString(e.Data, "subject_line")
+		if !ok || subj == "" {
+			continue
+		}
+		for name := range brands.MatchedBrandNames(subj) {
+			matched[name] = struct{}{}
+		}
+	}
+	return saturate(len(matched), subjectBrandMatchCap)
 }

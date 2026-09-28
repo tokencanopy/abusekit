@@ -93,6 +93,20 @@ var Names = []string{
 	"fingerprint_seen_on_other_subjects",
 	"neighbors_truncated",
 	"burst_ratio_24h_vs_lifetime",
+	// [S2b] see docs/design's [S2b] amendment (§4.5): send-volume,
+	// webmail, recipient, and subject-line-brand features a real
+	// phishing campaign's shape exposed as gaps in the v0 list above —
+	// 100 recipients per account on one webmail domain in minutes (no
+	// fan-out across distinct domains for first_day_distinct_domains to
+	// see), and the lure text living in subject lines rather than any
+	// resource name.
+	"sends_10m_max",
+	"sends_1h",
+	"sends_first_day",
+	"webmail_recipient_share",
+	"webmail_sends_1h",
+	"distinct_recipients_1h",
+	"subject_brand_match",
 }
 
 // Features is one subject's v0 feature vector (design §4.5), as of the
@@ -205,6 +219,57 @@ type Features struct {
 	// for an account with a long, currently-quiet history. 0 when the
 	// subject has no resource/content activity at all.
 	BurstRatio24hVsLifetime float64
+
+	// [S2b] Sends10mMax is log1p of the largest sum of content.sent
+	// recipient_count (falling back to 1 per event when absent/non-positive
+	// — recipientCountOf) within ANY 10-minute window across the subject's
+	// WHOLE HISTORY so far — not a currently-decaying trailing window like
+	// Sends1h below: a maximum over already-elapsed windows can only grow
+	// as a new event arrives, never shrink as time passes with no new
+	// event, so (unlike every *_1h/*_24h feature) it needs no window-exit
+	// rescore of its own.
+	Sends10mMax float64
+	// Sends1h is log1p of the sum of content.sent recipient_count (same
+	// fallback) within the trailing Windows.OneHour window ending at
+	// Windows.Now — decays exactly like ResourceVelocity1h/KeyVelocity1h,
+	// covered by the SAME window-exit rescore scheduling (content.sent is
+	// already a windowed event type — see isWindowedEventType).
+	Sends1h float64
+	// SendsFirstDay is log1p of the sum of content.sent recipient_count
+	// (same fallback) within the subject's first Windows.DayHour, anchored
+	// to firstSeenAt like FirstDayDistinctDomains — permanently fixed once
+	// that window closes, and covered by nextRescoreAt's existing
+	// first-day-cutover candidate (feature-agnostic; no code change
+	// needed).
+	SendsFirstDay float64
+	// WebmailRecipientShare is the LIFETIME share (0..1) of sent recipients
+	// whose recipient_domain is on the configured webmail list
+	// (config/webmail.yaml, WebmailSet) — a permanent fact, not a decaying
+	// window: it only changes when a new content.sent event arrives. 0 when
+	// the subject has sent nothing at all (never a division by zero).
+	WebmailRecipientShare float64
+	// WebmailSends1h is Sends1h * WebmailRecipientShare (design's own
+	// formula): send volume alone, or webmail share alone, is weak
+	// evidence — a handful of webmail recipients is nothing, a hundred
+	// within an hour is — so this feature lets the local model weight the
+	// COMBINATION directly rather than relying on the product of two
+	// separately-weighted terms.
+	WebmailSends1h float64
+	// DistinctRecipients1h is log1p of the count of distinct
+	// content.sent recipient_hash values seen within the trailing
+	// Windows.OneHour window, falling back to ADDING recipient_count (not
+	// counting the event as one) for any event that carries no
+	// recipient_hash at all — an event with no hash gives no way to tell
+	// its recipients apart, so it's treated as that many additional
+	// distinct recipients rather than silently undercounted as one.
+	DistinctRecipients1h float64
+	// SubjectBrandMatch counts DISTINCT curated brands (BrandSet,
+	// config/brands.yaml, canonicalised the same way NameBrandMatch is)
+	// matched across every content.sent subject_line within the trailing
+	// Windows.DayHour window, capped at subjectBrandMatchCap (3) — the lure
+	// signal NameBrandMatch can't see at all, since it only ever reads
+	// resource.created/resource.deleted's `name`, never subject_line.
+	SubjectBrandMatch float64
 }
 
 // Map converts f into the map[string]float64 shape internal/core.Plan and
@@ -229,6 +294,13 @@ func (f Features) Map() map[string]float64 {
 		"fingerprint_seen_on_other_subjects": f.FingerprintSeenOnOtherSubjects,
 		"neighbors_truncated":                f.NeighborsTruncated,
 		"burst_ratio_24h_vs_lifetime":        f.BurstRatio24hVsLifetime,
+		"sends_10m_max":                      f.Sends10mMax,
+		"sends_1h":                           f.Sends1h,
+		"sends_first_day":                    f.SendsFirstDay,
+		"webmail_recipient_share":            f.WebmailRecipientShare,
+		"webmail_sends_1h":                   f.WebmailSends1h,
+		"distinct_recipients_1h":             f.DistinctRecipients1h,
+		"subject_brand_match":                f.SubjectBrandMatch,
 	}
 }
 
@@ -251,12 +323,19 @@ type Windows struct {
 	// hour-scale fixture data.
 	OneHour time.Duration
 	DayHour time.Duration
+	// TenMinutes [S2b] is Sends10mMax's window SIZE — not a "trailing
+	// window ending at Now" the way OneHour/DayHour are (Sends10mMax is a
+	// historical maximum over every possible 10-minute window, not a
+	// currently-decaying one; see its own doc comment), so this field
+	// fixes only the duration a "10-minute window" means, independent of
+	// Now.
+	TenMinutes time.Duration
 }
 
-// DefaultWindows returns the production Windows (1h / 24h) evaluated as of
-// now.
+// DefaultWindows returns the production Windows (10m / 1h / 24h) evaluated
+// as of now.
 func DefaultWindows(now time.Time) Windows {
-	return Windows{Now: now, OneHour: time.Hour, DayHour: 24 * time.Hour}
+	return Windows{Now: now, OneHour: time.Hour, DayHour: 24 * time.Hour, TenMinutes: 10 * time.Minute}
 }
 
 // NeighborEvidence is the same-tenant identity-graph evidence the
@@ -329,13 +408,15 @@ type Result struct {
 //
 // neighbors nil is treated as NoNeighbors, a convenience for a caller (or
 // test) that doesn't care about the linked_* features. brands' zero value
-// (BrandSet{}) holds name_brand_match at 0.
-func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet) (Result, error) {
+// (BrandSet{}) holds name_brand_match/subject_brand_match at 0; webmail's
+// zero value (WebmailSet{}) holds webmail_recipient_share/webmail_sends_1h
+// at 0 ([S2b]).
+func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet, webmail WebmailSet) (Result, error) {
 	if windows.Now.IsZero() {
 		return Result{}, fmt.Errorf("feature: windows.Now must be set")
 	}
-	if windows.OneHour <= 0 || windows.DayHour <= 0 {
-		return Result{}, fmt.Errorf("feature: windows.OneHour and windows.DayHour must both be positive")
+	if windows.OneHour <= 0 || windows.DayHour <= 0 || windows.TenMinutes <= 0 {
+		return Result{}, fmt.Errorf("feature: windows.OneHour, windows.DayHour and windows.TenMinutes must all be positive")
 	}
 	if neighbors == nil {
 		neighbors = NoNeighbors
@@ -376,7 +457,14 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		FingerprintSeenOnOtherSubjects: boolToFloat(ev.FingerprintShared),
 		NeighborsTruncated:             boolToFloat(ev.Truncated),
 		BurstRatio24hVsLifetime:        burstRatio(events, now, windows.DayHour),
+		Sends10mMax:                    sends10mMax(events, windows.TenMinutes),
+		Sends1h:                        sends1h(events, now, windows.OneHour),
+		SendsFirstDay:                  sendsFirstDay(events, firstSeenAt, windows.DayHour),
+		WebmailRecipientShare:          webmailRecipientShare(events, webmail),
+		DistinctRecipients1h:           distinctRecipients1h(events, now, windows.OneHour),
+		SubjectBrandMatch:              subjectBrandMatch(events, now, windows.DayHour, brands),
 	}
+	f.WebmailSends1h = f.Sends1h * f.WebmailRecipientShare
 
 	return Result{
 		Features:      f,

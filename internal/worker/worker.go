@@ -103,8 +103,9 @@ type Store interface {
 type Deps struct {
 	Store     Store
 	Config    *config.Config
-	Neighbors feature.Neighbors // feature.NewStoreNeighbors(realStore, cfg) in production; feature.NoNeighbors is a valid choice too.
-	Brands    feature.BrandSet  // config/brands.yaml, loaded once at startup; the zero value holds name_brand_match at 0.
+	Neighbors feature.Neighbors  // feature.NewStoreNeighbors(realStore, cfg) in production; feature.NoNeighbors is a valid choice too.
+	Brands    feature.BrandSet   // config/brands.yaml, loaded once at startup; the zero value holds name_brand_match at 0.
+	Webmail   feature.WebmailSet // [S2b] config/webmail.yaml, loaded once at startup; the zero value holds webmail_recipient_share/webmail_sends_1h at 0.
 
 	// Calibration is consulted by internal/core.Combine the same way it
 	// would be by the harness (S4). v0 has no vendor scorer needing a
@@ -731,7 +732,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	}
 
 	windows := feature.DefaultWindows(now)
-	fr, err := feature.Extract(ctx, d.Tenant, d.Subject, events, w.deps.Neighbors, windows, w.deps.Brands)
+	fr, err := feature.Extract(ctx, d.Tenant, d.Subject, events, w.deps.Neighbors, windows, w.deps.Brands, w.deps.Webmail)
 	if err != nil {
 		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("extract features: %w", err)
 	}

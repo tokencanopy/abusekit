@@ -1,0 +1,54 @@
+# config/webmail.yaml — [S2b] a PUBLIC list of major consumer webmail
+# provider domains (internal/feature.LoadWebmailFile, design's [S2b]
+# amendment to §4.5), used only to compute webmail_recipient_share and
+# webmail_sends_1h.
+#
+# This is deliberately a flat, public list of well-known free/consumer
+# email provider domain NAMES (gmail.com, outlook.com, ...) — the same
+# kind of public fact a spam filter's own provider list would carry, no
+# different from naming "Gmail" as a company in prose. It names no
+# customer, no account and no real send data (AGENTS.md's corpus/data-
+# boundary rule): it is exactly as public as the provider's own domain
+# registration.
+#
+# A domain here is matched case/whitespace-insensitively against
+# content.sent's `recipient_domain` field (internal/feature.WebmailSet).
+# Extend this list as new consumer providers become common in phishing
+# lures; there is no "brands.yaml-style" curation judgment involved here
+# (unlike config/brands.yaml, a webmail provider's status is a simple
+# fact, not a false-positive-prone name match).
+domains:
+  # Google
+  - gmail.com
+  - googlemail.com
+  # Microsoft
+  - outlook.com
+  - hotmail.com
+  - live.com
+  - msn.com
+  # Yahoo
+  - yahoo.com
+  - yahoo.co.uk
+  - ymail.com
+  # Apple
+  - icloud.com
+  - me.com
+  - mac.com
+  # AOL
+  - aol.com
+  # Proton
+  - protonmail.com
+  - proton.me
+  - pm.me
+  # Other major consumer/webmail providers commonly seen in phishing lures
+  - gmx.com
+  - gmx.net
+  - mail.com
+  - zoho.com
+  - yandex.com
+  - yandex.ru
+  - qq.com
+  - 163.com
+  - 126.com
+  - naver.com
+  - web.de

@@ -43,7 +43,7 @@ func (f *fakeNeighbors) Evidence(context.Context, string, string) (NeighborEvide
 }
 
 func TestExtract_EmptyHistory(t *testing.T) {
-	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestExtract_EmptyHistory(t *testing.T) {
 
 func TestExtract_RequiresWindowsNow(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when windows.Now is zero")
 	}
@@ -62,7 +62,7 @@ func TestExtract_RequiresWindowsNow(t *testing.T) {
 
 func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when OneHour/DayHour are unset")
 	}
@@ -70,7 +70,7 @@ func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 
 func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 func TestExtract_NeighborEvidenceError(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{err: errors.New("boom")}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected Extract to propagate a Neighbors.Evidence error")
 	}
@@ -91,7 +91,7 @@ func TestExtract_NeighborEvidenceError(t *testing.T) {
 func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 2, LabelledAbusiveCount: 3, FingerprintShared: true, Truncated: true}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 func TestExtract_LinkedDeletedNSaturates(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 19}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -208,6 +208,50 @@ func TestResourceCount_KindNormalization(t *testing.T) {
 	now := at(time.Minute)
 	if got := resourceCount(events, "key", now, 0); got != 3 {
 		t.Errorf("key_total with mixed-case/whitespace kind = %v, want 3", got)
+	}
+}
+
+// TestNormalizeResourceKind is [S2b]'s producer-contract test: one case per
+// documented alias, proving each folds to its canonical kind — a real
+// phishing campaign scored low in part because a producer's own "api_key"
+// spelling was never recognized as resourceKindKey ("key") at all.
+func TestNormalizeResourceKind(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"key", "key"},
+		{"api_key", "key"},
+		{"apikey", "key"},
+		{"api-key", "key"},
+		{"Key", "key"},
+		{" API_KEY ", "key"},
+		{"agent", "agent"},
+		{"mailbox", "agent"},
+		{"inbox", "agent"},
+		{"Mailbox", "agent"},
+		{" INBOX ", "agent"},
+		{"webhook", "webhook"}, // an unrecognized kind passes through normalizeToken unchanged, not rejected
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := normalizeResourceKind(tt.in); got != tt.want {
+			t.Errorf("normalizeResourceKind(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestResourceCount_KindAliases proves resourceCount itself (not just the
+// normalization helper in isolation) recognizes every alias when filtering
+// by the canonical "key" kind.
+func TestResourceCount_KindAliases(t *testing.T) {
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "key"}),
+		ev("r2", "resource.created", 0, map[string]any{"kind": "api_key"}),
+		ev("r3", "resource.created", 0, map[string]any{"kind": "apikey"}),
+		ev("r4", "resource.created", 0, map[string]any{"kind": "api-key"}),
+		ev("r5", "resource.created", 0, map[string]any{"kind": "agent"}), // not a key alias: excluded
+	}
+	now := at(time.Minute)
+	if got := resourceCount(events, "key", now, 0); got != 4 {
+		t.Errorf("key_total with every key alias = %v, want 4", got)
 	}
 }
 
@@ -698,6 +742,367 @@ func TestNextRescoreAt(t *testing.T) {
 	})
 }
 
+// --- [S2b]: send-volume, webmail, recipient and subject-brand features ---
+
+// sendEvent builds one content.sent event with the given optional fields;
+// zero/empty values are simply omitted from data (matching how a producer
+// that doesn't set an optional field would emit it).
+func sendEvent(id string, offset time.Duration, recipientCount float64, recipientDomain, recipientHash, subjectLine string) event.Event {
+	data := map[string]any{}
+	if recipientCount != 0 {
+		data["recipient_count"] = recipientCount
+	}
+	if recipientDomain != "" {
+		data["recipient_domain"] = recipientDomain
+	}
+	if recipientHash != "" {
+		data["recipient_hash"] = recipientHash
+	}
+	if subjectLine != "" {
+		data["subject_line"] = subjectLine
+	}
+	return ev(id, "content.sent", offset, data)
+}
+
+func TestRecipientCountOf(t *testing.T) {
+	tests := []struct {
+		name string
+		data map[string]any
+		want float64
+	}{
+		{"present and positive", map[string]any{"recipient_count": 5.0}, 5},
+		{"absent falls back to 1", nil, 1},
+		{"zero falls back to 1", map[string]any{"recipient_count": 0.0}, 1},
+		{"negative falls back to 1", map[string]any{"recipient_count": -3.0}, 1},
+		{"wrong type falls back to 1", map[string]any{"recipient_count": "5"}, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := ev("c1", "content.sent", 0, tt.data)
+			if got := recipientCountOf(e); got != tt.want {
+				t.Errorf("recipientCountOf(%+v) = %v, want %v", tt.data, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSends1h(t *testing.T) {
+	window := time.Hour
+	t.Run("sums recipient_count within the trailing window, log1p-scaled", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 10, "a.example.test", "", ""),
+			sendEvent("c2", 30*time.Minute, 5, "b.example.test", "", ""),
+		}
+		now := at(45 * time.Minute)
+		want := math.Log1p(15)
+		if got := sends1h(events, now, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends1h = %v, want %v", got, want)
+		}
+	})
+	t.Run("falls back to 1 recipient when recipient_count is absent", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 0, "a.example.test", "", "")}
+		want := math.Log1p(1)
+		if got := sends1h(events, at(time.Minute), window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends1h = %v, want %v", got, want)
+		}
+	})
+	t.Run("window boundary: exactly window-old is excluded", func(t *testing.T) {
+		now := at(time.Hour)
+		events := []event.Event{sendEvent("c1", 0, 10, "", "", "")} // exactly `now - window`
+		if got := sends1h(events, now, window); got != 0 {
+			t.Errorf("sends1h at the boundary = %v, want 0 (just expired)", got)
+		}
+	})
+	t.Run("out-of-order delivery doesn't affect the sum", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c2", 30*time.Minute, 5, "", "", ""),
+			sendEvent("c1", 0, 10, "", "", ""), // chronologically earlier, delivered second
+		}
+		now := at(45 * time.Minute)
+		want := math.Log1p(15)
+		if got := sends1h(events, now, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends1h (out of order) = %v, want %v", got, want)
+		}
+	})
+	t.Run("empty history is exactly zero", func(t *testing.T) {
+		if got := sends1h(nil, at(0), window); got != 0 {
+			t.Errorf("sends1h(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("non-content.sent events are ignored", func(t *testing.T) {
+		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"kind": "agent"})}
+		if got := sends1h(events, at(time.Minute), window); got != 0 {
+			t.Errorf("sends1h = %v, want 0 (only content.sent counts)", got)
+		}
+	})
+}
+
+func TestSendsFirstDay(t *testing.T) {
+	day := 24 * time.Hour
+	t.Run("sums recipient_count within the first day, boundary inclusive", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 10, "", "", ""),
+			sendEvent("c2", time.Hour, 5, "", "", ""),
+			sendEvent("c3", day, 3, "", "", ""),               // exactly at the cutover: included
+			sendEvent("c4", day+time.Second, 100, "", "", ""), // just past: excluded
+		}
+		want := math.Log1p(18)
+		if got := sendsFirstDay(events, base, day); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sendsFirstDay = %v, want %v", got, want)
+		}
+	})
+	t.Run("sends after the first day don't count at all", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", day+time.Hour, 50, "", "", "")}
+		if got := sendsFirstDay(events, base, day); got != 0 {
+			t.Errorf("sendsFirstDay = %v, want 0", got)
+		}
+	})
+	t.Run("out-of-order delivery doesn't affect the sum", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c2", time.Hour, 5, "", "", ""),
+			sendEvent("c1", 0, 10, "", "", ""),
+		}
+		want := math.Log1p(15)
+		if got := sendsFirstDay(events, base, day); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sendsFirstDay (out of order) = %v, want %v", got, want)
+		}
+	})
+	t.Run("no sends at all is exactly zero", func(t *testing.T) {
+		if got := sendsFirstDay(nil, base, day); got != 0 {
+			t.Errorf("sendsFirstDay(nil) = %v, want 0", got)
+		}
+	})
+}
+
+func TestSends10mMax(t *testing.T) {
+	window := 10 * time.Minute
+	t.Run("finds the largest sum among several 10-minute windows", func(t *testing.T) {
+		events := []event.Event{
+			// A dense cluster of 100 in under 10 minutes...
+			sendEvent("c1", 0, 40, "", "", ""),
+			sendEvent("c2", 3*time.Minute, 30, "", "", ""),
+			sendEvent("c3", 6*time.Minute, 30, "", "", ""),
+			// ...then an isolated, much smaller send an hour later.
+			sendEvent("c4", time.Hour, 5, "", "", ""),
+		}
+		want := math.Log1p(100)
+		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends10mMax = %v, want %v (the dense cluster, not the later isolated send)", got, want)
+		}
+	})
+	t.Run("boundary: exactly window-old falls out of a given window", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 10, "", "", ""),
+			sendEvent("c2", window, 20, "", "", ""), // exactly 10m after c1: c1 has just expired relative to c2
+		}
+		// The max single-event sum (20) beats any window containing both,
+		// since c1 is not within 10m of c2 (boundary excluded, withinWindow's
+		// own half-open convention).
+		want := math.Log1p(20)
+		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends10mMax at the boundary = %v, want %v", got, want)
+		}
+	})
+	t.Run("out-of-order delivery still finds the true maximum", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c3", 6*time.Minute, 30, "", "", ""),
+			sendEvent("c1", 0, 40, "", "", ""),
+			sendEvent("c2", 3*time.Minute, 30, "", "", ""),
+		}
+		want := math.Log1p(100)
+		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends10mMax (out of order) = %v, want %v", got, want)
+		}
+	})
+	t.Run("empty history is exactly zero", func(t *testing.T) {
+		if got := sends10mMax(nil, window); got != 0 {
+			t.Errorf("sends10mMax(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("a single event's own count is its own max", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 7, "", "", "")}
+		want := math.Log1p(7)
+		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends10mMax = %v, want %v", got, want)
+		}
+	})
+	t.Run("does not decay with time passing (a historical max, not a trailing window)", func(t *testing.T) {
+		// sends10mMax has no "now" parameter at all -- it is computed purely
+		// from event history, so this is really just documentation that its
+		// signature has no way to make it decay; see its own doc comment.
+		events := []event.Event{sendEvent("c1", 0, 100, "", "", "")}
+		want := math.Log1p(100)
+		if got := sends10mMax(events, window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("sends10mMax = %v, want %v", got, want)
+		}
+	})
+}
+
+func TestDistinctRecipients1h(t *testing.T) {
+	window := time.Hour
+	t.Run("dedupes by recipient_hash", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 1, "", "hash-a", ""),
+			sendEvent("c2", time.Minute, 1, "", "hash-a", ""), // same recipient again
+			sendEvent("c3", 2*time.Minute, 1, "", "hash-b", ""),
+		}
+		want := math.Log1p(2)
+		if got := distinctRecipients1h(events, at(3*time.Minute), window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("distinctRecipients1h = %v, want %v (2 distinct hashes)", got, want)
+		}
+	})
+	t.Run("falls back to adding recipient_count when recipient_hash is absent", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 1, "", "hash-a", ""),
+			sendEvent("c2", time.Minute, 5, "", "", ""), // no hash: adds 5, doesn't just count as 1
+		}
+		want := math.Log1p(1 + 5)
+		if got := distinctRecipients1h(events, at(2*time.Minute), window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("distinctRecipients1h = %v, want %v", got, want)
+		}
+	})
+	t.Run("window boundary: exactly window-old is excluded", func(t *testing.T) {
+		now := at(time.Hour)
+		events := []event.Event{sendEvent("c1", 0, 1, "", "hash-a", "")}
+		if got := distinctRecipients1h(events, now, window); got != 0 {
+			t.Errorf("distinctRecipients1h at the boundary = %v, want 0", got)
+		}
+	})
+	t.Run("out-of-order delivery doesn't affect the count", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c2", time.Minute, 1, "", "hash-b", ""),
+			sendEvent("c1", 0, 1, "", "hash-a", ""),
+		}
+		want := math.Log1p(2)
+		if got := distinctRecipients1h(events, at(2*time.Minute), window); math.Abs(got-want) > 1e-9 {
+			t.Errorf("distinctRecipients1h (out of order) = %v, want %v", got, want)
+		}
+	})
+	t.Run("empty history is exactly zero", func(t *testing.T) {
+		if got := distinctRecipients1h(nil, at(0), window); got != 0 {
+			t.Errorf("distinctRecipients1h(nil) = %v, want 0", got)
+		}
+	})
+}
+
+func TestWebmailRecipientShare(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com", "yahoo.com"})
+	t.Run("mixed webmail and non-webmail recipients", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 10, "gmail.com", "", ""),
+			sendEvent("c2", time.Minute, 5, "corp.example.test", "", ""),
+			sendEvent("c3", 2*time.Minute, 5, "Yahoo.COM", "", ""), // case-insensitive
+		}
+		want := 15.0 / 20.0
+		if got := webmailRecipientShare(events, webmail); math.Abs(got-want) > 1e-9 {
+			t.Errorf("webmailRecipientShare = %v, want %v", got, want)
+		}
+	})
+	t.Run("no webmail recipients at all", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 10, "corp.example.test", "", "")}
+		if got := webmailRecipientShare(events, webmail); got != 0 {
+			t.Errorf("webmailRecipientShare = %v, want 0", got)
+		}
+	})
+	t.Run("no sends at all: no division by zero", func(t *testing.T) {
+		if got := webmailRecipientShare(nil, webmail); got != 0 {
+			t.Errorf("webmailRecipientShare(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("zero-value WebmailSet matches nothing", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 10, "gmail.com", "", "")}
+		if got := webmailRecipientShare(events, WebmailSet{}); got != 0 {
+			t.Errorf("webmailRecipientShare with an unloaded WebmailSet = %v, want 0", got)
+		}
+	})
+}
+
+func TestExtract_WebmailSendsIsShareTimesSends1h(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com"})
+	events := []event.Event{
+		sendEvent("c1", 0, 10, "gmail.com", "", ""),
+		sendEvent("c2", time.Minute, 10, "corp.example.test", "", ""),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(2*time.Minute), BrandSet{}, webmail)
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	f := res.Features
+	wantShare := 0.5
+	if math.Abs(f.WebmailRecipientShare-wantShare) > 1e-9 {
+		t.Fatalf("WebmailRecipientShare = %v, want %v", f.WebmailRecipientShare, wantShare)
+	}
+	want := f.Sends1h * wantShare
+	if math.Abs(f.WebmailSends1h-want) > 1e-9 {
+		t.Errorf("WebmailSends1h = %v, want Sends1h(%v) * share(%v) = %v", f.WebmailSends1h, f.Sends1h, wantShare, want)
+	}
+}
+
+func TestSubjectBrandMatch(t *testing.T) {
+	brands := smallTestBrands() // PayPal (+ alias "Pay Pal")
+	window := 24 * time.Hour
+	t.Run("counts one distinct brand even matched via multiple sends/aliases", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c1", 0, 1, "", "", "PayPal Account Alert"),
+			sendEvent("c2", time.Minute, 1, "", "", "Pay Pal Security Notice"), // same brand, via its alias
+		}
+		if got := subjectBrandMatch(events, at(2*time.Minute), window, brands); got != 1 {
+			t.Errorf("subjectBrandMatch = %v, want 1", got)
+		}
+	})
+	t.Run("caps at 3 distinct brands", func(t *testing.T) {
+		many := NewBrandSet([]BrandEntry{{Name: "Alpha"}, {Name: "Bravo"}, {Name: "Charlie"}, {Name: "Delta"}})
+		events := []event.Event{
+			sendEvent("c1", 0, 1, "", "", "Alpha Verify"),
+			sendEvent("c2", time.Minute, 1, "", "", "Bravo Verify"),
+			sendEvent("c3", 2*time.Minute, 1, "", "", "Charlie Verify"),
+			sendEvent("c4", 3*time.Minute, 1, "", "", "Delta Verify"),
+		}
+		if got := subjectBrandMatch(events, at(4*time.Minute), window, many); got != subjectBrandMatchCap {
+			t.Errorf("subjectBrandMatch = %v, want the cap %v", got, subjectBrandMatchCap)
+		}
+	})
+	t.Run("no match at all", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 1, "", "", "Your weekly digest")}
+		if got := subjectBrandMatch(events, at(time.Minute), window, brands); got != 0 {
+			t.Errorf("subjectBrandMatch = %v, want 0", got)
+		}
+	})
+	t.Run("the integration-token gate still applies", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 1, "", "", "PayPal integration webhook")}
+		if got := subjectBrandMatch(events, at(time.Minute), window, brands); got != 0 {
+			t.Errorf("subjectBrandMatch = %v, want 0 (integration-token gate)", got)
+		}
+	})
+	t.Run("window boundary: exactly window-old is excluded", func(t *testing.T) {
+		now := at(window)
+		events := []event.Event{sendEvent("c1", 0, 1, "", "", "PayPal Account Alert")}
+		if got := subjectBrandMatch(events, now, window, brands); got != 0 {
+			t.Errorf("subjectBrandMatch at the boundary = %v, want 0", got)
+		}
+	})
+	t.Run("out-of-order delivery doesn't affect the distinct count", func(t *testing.T) {
+		events := []event.Event{
+			sendEvent("c2", time.Minute, 1, "", "", "PayPal Account Alert"),
+			sendEvent("c1", 0, 1, "", "", "PayPal Account Alert"),
+		}
+		if got := subjectBrandMatch(events, at(2*time.Minute), window, brands); got != 1 {
+			t.Errorf("subjectBrandMatch (out of order) = %v, want 1", got)
+		}
+	})
+	t.Run("empty history is exactly zero", func(t *testing.T) {
+		if got := subjectBrandMatch(nil, at(0), window, brands); got != 0 {
+			t.Errorf("subjectBrandMatch(nil) = %v, want 0", got)
+		}
+	})
+	t.Run("empty BrandSet never matches", func(t *testing.T) {
+		events := []event.Event{sendEvent("c1", 0, 1, "", "", "PayPal Account Alert")}
+		if got := subjectBrandMatch(events, at(time.Minute), window, BrandSet{}); got != 0 {
+			t.Errorf("subjectBrandMatch with an empty BrandSet = %v, want 0", got)
+		}
+	})
+}
+
 // repoRoot locates the repository root from this test file's own path, so
 // TestLoadBrandsFile_ShippedListRegressionCases can load the real shipped
 // config/brands.yaml rather than a copy.
@@ -860,6 +1265,63 @@ func TestLoadBrandsFile_Round3Probes(t *testing.T) {
 	for _, name := range mustNotMatch {
 		if brands.Matches(name) {
 			t.Errorf("brands.Matches(%q) = true, want false (integration-token gate must still fire after the i-fold)", name)
+		}
+	}
+}
+
+// TestLoadBrandsFile_S2bMarketplaceSocialShippingBrands proves the [S2b]
+// batch of marketplace/social/shipping brands (added alongside the
+// send-volume/webmail/subject-line features — a real phishing campaign
+// impersonated exactly this class of brand, missing from the pre-[S2b]
+// list) loaded from the real shipped config/brands.yaml.
+func TestLoadBrandsFile_S2bMarketplaceSocialShippingBrands(t *testing.T) {
+	brands, err := LoadBrandsFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBrandsFile: %v", err)
+	}
+
+	mustMatch := []string{
+		"Your TikTok account has been flagged",
+		"Confirm your Poshmark listing",
+		"Vinted payment issue",
+		"Depop order update",
+		"Mercari shipping label",
+		"Your Etsy shop needs attention",
+		"eBay account suspended",
+		"Facebook Security Alert",
+		"Instagram Copyright Notice",
+		"WhatsApp Verification Code",
+		"Booking.com reservation confirmed",
+		"Airbnb host payout issue",
+		"UPS delivery exception",
+		"Royal Mail parcel held",
+		"DPD missed delivery",
+		"Evri parcel update",
+		"PostNL delivery notice",
+		"Post NL delivery notice",
+		"Canada Post customs fee",
+		"Australia Post delivery notice",
+	}
+	for _, name := range mustMatch {
+		if !brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = false, want true", name)
+		}
+	}
+
+	// Shopify is on the list, but "Your Etsy order #123 shipped" sent
+	// through an agent literally NAMED "Shopify Integration" must not read
+	// as an impersonation attempt on the name side — the integration-token
+	// gate already covers this generically (documented tradeoff on
+	// "tracking"/"DHL Package Tracking" above), proven here for the new
+	// brand specifically.
+	mustNotMatch := []string{
+		"Shopify Order Sync",
+		"Shopify Webhook Relay",
+		"Etsy API Integration",
+	}
+	for _, name := range mustNotMatch {
+		if brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = true, want false (integration-token gate)", name)
 		}
 	}
 }

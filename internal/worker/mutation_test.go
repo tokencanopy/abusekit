@@ -144,7 +144,7 @@ func extractFixture(t *testing.T, brands feature.BrandSet, fixtureFile string, a
 		events = setup
 	}
 	now := lastEventAt(events).Add(after)
-	res, err := feature.Extract(context.Background(), testTenant, "subject", events, fakeNeighborsWith{ev}, feature.DefaultWindows(now), brands)
+	res, err := feature.Extract(context.Background(), testTenant, "subject", events, fakeNeighborsWith{ev}, feature.DefaultWindows(now), brands, feature.WebmailSet{})
 	if err != nil {
 		t.Fatalf("feature.Extract(%s): %v", fixtureFile, err)
 	}
@@ -166,13 +166,13 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 	const eventsPerSubject = 5
 	subject3Onboarding := churnEvents[2*eventsPerSubject : 2*eventsPerSubject+4]
 	now3 := lastEventAt(subject3Onboarding).Add(time.Second)
-	res3, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_3", subject3Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 2, FingerprintShared: true}}, feature.DefaultWindows(now3), brands)
+	res3, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_3", subject3Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 2, FingerprintShared: true}}, feature.DefaultWindows(now3), brands, feature.WebmailSet{})
 	if err != nil {
 		t.Fatalf("feature.Extract(churn subject 3): %v", err)
 	}
 	subject6Onboarding := churnEvents[5*eventsPerSubject : 5*eventsPerSubject+4]
 	now6 := lastEventAt(subject6Onboarding).Add(time.Second)
-	res6, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_6", subject6Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 5, FingerprintShared: true}}, feature.DefaultWindows(now6), brands)
+	res6, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_6", subject6Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 5, FingerprintShared: true}}, feature.DefaultWindows(now6), brands, feature.WebmailSet{})
 	if err != nil {
 		t.Fatalf("feature.Extract(churn subject 6): %v", err)
 	}

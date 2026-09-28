@@ -23,15 +23,32 @@
 # comment for the exact rule and why it's text-wide rather than
 # positional.
 #
-# Still excluded: ebay, chase, ups, irs. Unlike the six above, these
-# aren't false-positive-prone specifically because they double as
-# integration/platform names — they're short, ordinary English words/
-# abbreviations ("chase" the verb, "ups" as in "ups and downs", "irs" as a
-# generic acronym) whose false-positive surface the integration-token rule
-# doesn't bound at all (there's no "chase sync"/"ups webhook" pattern to
-# gate on; the collision is with ordinary prose, not with integration
-# naming). Proper context-aware matching for these remains future work
-# (see docs/design's open questions).
+# Still excluded: chase, irs. These aren't false-positive-prone
+# specifically because they double as integration/platform names —
+# they're short, ordinary English words/abbreviations ("chase" the verb,
+# "irs" as a generic acronym) whose false-positive surface the
+# integration-token rule doesn't bound at all (there's no "chase sync"
+# pattern to gate on; the collision is with ordinary prose, not with
+# integration naming). Proper context-aware matching for these remains
+# future work (see docs/design's open questions).
+#
+# [S2b]: eBay and UPS moved OUT of that excluded set and into the list
+# below. eBay was originally grouped with chase/ups/irs as "an ordinary
+# word" on the theory that the whole foursome shared one false-positive
+# reason — on review that reasoning was never actually true for "ebay"
+# specifically (it is not an English word or common phrase; it collides
+# with nothing chase/ups/irs's own reasoning describes), so it belongs in
+# the main list like any other distinctive brand name. UPS genuinely does
+# collide with the ordinary phrase "ups and downs" (and with "UPS" used as
+# some other, non-shipping abbreviation) — that risk is accepted here
+# deliberately, the same documented tradeoff as "DHL Package Tracking"
+# above: package-delivery lures are one of the most common phishing
+# templates in practice (motivating this whole batch of marketplace/
+# social/shipping brand additions — see docs/design's [S2b] amendment),
+# the word/token-boundary matcher already rules out the worst substring
+# false positives (e.g. "startups" is one token, never equal to "ups"),
+# and a bare "ups"/"UPS" as its own capitalized word at a sentence
+# boundary is comparatively rare outside that exact idiom.
 brands:
   - name: PayPal
     aliases: ["Pay Pal"]
@@ -49,3 +66,31 @@ brands:
   - name: Amazon
   - name: DHL
   - name: Microsoft
+  # [S2b] marketplace, social and shipping brands commonly impersonated in
+  # phishing lures — added alongside the send-volume/webmail/subject-line
+  # features in the same amendment (docs/design's [S2b] note): a resource
+  # or agent NAME match alone (NameBrandMatch) misses a lure whose brand
+  # mention lives only in the message subject line (SubjectBrandMatch).
+  - name: TikTok
+    aliases: ["Tik Tok"]
+  - name: Poshmark
+  - name: Vinted
+  - name: Depop
+  - name: Mercari
+  - name: Etsy
+  - name: Shopify
+  - name: eBay
+  - name: Facebook
+  - name: Instagram
+  - name: WhatsApp
+    aliases: ["What's App"]
+  - name: Booking.com
+  - name: Airbnb
+  - name: UPS
+  - name: Royal Mail
+  - name: DPD
+  - name: Evri
+  - name: PostNL
+    aliases: ["Post NL"]
+  - name: Canada Post
+  - name: Australia Post
