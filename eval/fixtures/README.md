@@ -189,3 +189,19 @@ bounded which weight.
   feature set alone, from a genuine brand-impersonation blast, and R1's
   blocker-level outcomes were kept intact rather than weakened to spare
   it).
+
+- **S2b's round 2 (R5)** adds tier-envelope fixtures, each stated with
+  margin >= 0.05 from the tier cut it lands on:
+  - `single_brand_100_45m.jsonl` — a brand-new account, 100 webmail
+    recipients over 45 minutes, one repeated fictional brand — `high`.
+  - `brand_colon_country_variant_20m.jsonl` — a brand-new account, 60
+    recipients on a country-variant consumer webmail domain
+    (`hotmail.co.uk` — S8) over 20 minutes, subject line "Glowbank: your
+    account was flagged" (the brand immediately followed by a colon —
+    B3) — `high`.
+  - `slow_sender_15_per_hour_6h.jsonl` — a documented KNOWN GAP, not a
+    passing tier claim: the same total volume and brand mention as
+    `single_brand_100_45m.jsonl`, paced at 15/hour over 6 hours instead
+    of one burst, reaches only `medium` — see
+    `internal/worker/replay_test.go`'s `TestReplay_SlowSenderKnownGap`
+    and `docs/design`'s own §8 open-questions entry for why.

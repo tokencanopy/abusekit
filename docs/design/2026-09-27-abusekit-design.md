@@ -756,3 +756,12 @@ erasure rules. Migrations embedded, expand-only.
      email verification, a KYC-style check, a long-lived OAuth session) that would legitimately
      lower risk independent of behavioural velocity. Every v0 signal is behavioural; an
      otherwise-suspicious-looking but genuinely verified account has no way to net that out.
+   - **[S2b round 2, R5]** A deliberately-paced "low and slow" sender is a known gap:
+     `eval/fixtures/slow_sender_15_per_hour_6h.jsonl` sends the SAME total volume and brand mention
+     as `single_brand_100_45m.jsonl` (90-100 webmail recipients, one repeated brand) but spread at
+     15/hour over 6 hours instead of one burst, and reaches only `medium`, never `high` —
+     `sends_10m_max`/`webmail_sends_1h` (this model's two most heavily-weighted volume signals) can
+     only ever see one hour's worth at any given scoring instant, so pacing sends below any single
+     window's threshold evades a windowed-burst detector by construction. Detecting this would need
+     a wider trailing window than any this v0 feature set reads, or a feature that tracks total
+     volume irrespective of concentration — deferred, not fixed in this round.

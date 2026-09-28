@@ -543,3 +543,58 @@ func TestReplay_CommunityGroupPhotoWalkKnownGap(t *testing.T) {
 	t.Logf("community_group_photo_walk: tier=%q score=%v (documented known gap — see this test's own doc comment)", view.Tier, view.Score)
 	assertBand(t, "community_group_photo_walk", view.Score, 0.9, 1.0)
 }
+
+// TestReplay_SingleBrand100In45mReachesHigh replays eval/fixtures/
+// single_brand_100_45m.jsonl — round 2's R5 tier-envelope fixture: a
+// brand-new account, 100 webmail recipients over 45 minutes, every
+// subject mentioning the identical fictional brand. Expected tier: high,
+// with at least a 0.05 margin from the high cut point (0.8).
+func TestReplay_SingleBrand100In45mReachesHigh(t *testing.T) {
+	view := runReplay(t, "single_brand_100_45m.jsonl", "acct_example_single_brand_100_45m_1")
+	if view.Tier != "high" {
+		t.Errorf("single_brand_100_45m: tier = %q (score %v), want high\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "single_brand_100_45m", view.Score, 0.85, 1.0)
+}
+
+// TestReplay_BrandColonCountryVariant20mReachesHigh replays eval/fixtures/
+// brand_colon_country_variant_20m.jsonl — round 2's R5 tier-envelope
+// fixture: a brand-new account, 60 recipients on a country-variant
+// consumer webmail domain (hotmail.co.uk — S8) over 20 minutes, subject
+// line "Glowbank: your account was flagged" (the brand immediately
+// followed by a colon — B3). Expected tier: high, with at least a 0.05
+// margin from the high cut point (0.8).
+func TestReplay_BrandColonCountryVariant20mReachesHigh(t *testing.T) {
+	view := runReplay(t, "brand_colon_country_variant_20m.jsonl", "acct_example_brand_colon_country_variant_1")
+	if view.Tier != "high" {
+		t.Errorf("brand_colon_country_variant_20m: tier = %q (score %v), want high\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "brand_colon_country_variant_20m", view.Score, 0.85, 1.0)
+}
+
+// TestReplay_SlowSenderKnownGap replays eval/fixtures/
+// slow_sender_15_per_hour_6h.jsonl — round 2's R5 documented known gap: a
+// brand-new account sending the SAME total volume as
+// single_brand_100_45m.jsonl's shape (a brand mentioned in every subject,
+// webmail recipients) but spread thin — 15 recipients once per hour for 6
+// hours (90 total) — instead of concentrated into one burst.
+//
+// KNOWN GAP: this never reaches `high`, only `medium`. sends_10m_max and
+// webmail_sends_1h (this model's two most heavily-weighted volume
+// signals, and the ones single_brand_100_45m/brand_colon_country_variant_20m
+// above depend on) can only ever see ONE hour's worth (15) at any given
+// scoring instant — a "low and slow" sender that deliberately paces
+// itself below any single window's threshold is invisible to a
+// windowed-burst detector by construction. Only subject_brand_match (a
+// flat, non-volume signal) and the modest sends_1h/distinct_recipients_1h
+// companions contribute here. Detecting a slow-drip campaign like this
+// would need a wider trailing window than any this v0 feature set reads,
+// or a feature that tracks total volume irrespective of concentration —
+// left as a documented gap, not fixed in this round.
+func TestReplay_SlowSenderKnownGap(t *testing.T) {
+	view := runReplay(t, "slow_sender_15_per_hour_6h.jsonl", "acct_example_slow_sender_1")
+	t.Logf("slow_sender_15_per_hour_6h: tier=%q score=%v (known gap — see this test's own doc comment)", view.Tier, view.Score)
+	if view.Tier == "high" {
+		t.Errorf("slow_sender_15_per_hour_6h: tier = high (score %v) — the known gap this test documents (a slow-drip sender never reaching high) no longer holds; update this test's comment if the mechanism changed intentionally", view.Score)
+	}
+}
