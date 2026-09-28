@@ -841,40 +841,83 @@ func namedBrandNames(events []event.Event, brands BrandSet) map[string]struct{} 
 	return out
 }
 
-// accountHasIntegrationName reports whether any resource.created/
-// resource.deleted event's raw `name` field carries an integration token
-// (S2b's S1 fix round) — the SENDING ACCOUNT's own onboarding evidence
-// that subjectBrandMatch uses to decide whether to exempt every subject
-// line outright, instead of re-litigating "tracking"/"api"-style words
-// found inside each individual subject.
-func accountHasIntegrationName(events []event.Event) bool {
+// exemptSubjectBrands returns the set of curated brand names round 2's R2
+// fix round exempts from subject-line matching: for each LIVE (not later
+// deleted), agent-kind resource whose raw name carries an integration
+// token, the brand(s) matched IN THAT NAME specifically — not every brand
+// the account has ever mentioned anywhere. An account with an unrelated
+// "Stripe Webhook Relay" agent still gets flagged for a subject line
+// mentioning a completely different brand.
+//
+// "LIVE" is a name-based heuristic (R2 fix round): the event vocabulary
+// has no resource id, so a resource.created event is treated as live
+// unless SOME resource.deleted event anywhere in the subject's history
+// shares its exact name — the same limitation resourceCount's own kind
+// matching already accepts for this vocabulary. "agent-kind" is checked
+// via normalizeResourceKind so the same kind aliases N4 taught
+// resourceCount apply here too; a key (any of its alias spellings,
+// including a key literally named with an integration token AND a brand,
+// e.g. "Stripe API Key") never counts, regardless of liveness.
+//
+// Matched via BrandSet.MatchedBrandNamesForSubject (no integration-token
+// gate on the NAME text itself) rather than MatchedBrandNames: a name
+// like "Stripe Webhook Relay" is EXACTLY the shape the integration-token
+// gate suppresses when matching for name_brand_match — here we need the
+// opposite, to identify WHICH brand an already-known-to-be-an-integration
+// name is about.
+func exemptSubjectBrands(events []event.Event, brands BrandSet) map[string]struct{} {
+	deletedNames := make(map[string]struct{})
 	for _, e := range events {
-		if e.Type != "resource.created" && e.Type != "resource.deleted" {
+		if e.Type != "resource.deleted" {
+			continue
+		}
+		if name, ok := dataString(e.Data, "name"); ok {
+			deletedNames[normalizeToken(name)] = struct{}{}
+		}
+	}
+
+	var out map[string]struct{}
+	for _, e := range events {
+		if e.Type != "resource.created" {
+			continue
+		}
+		kind, _ := dataString(e.Data, "kind")
+		if normalizeResourceKind(kind) != "agent" {
 			continue
 		}
 		name, ok := dataString(e.Data, "name")
 		if !ok {
 			continue
 		}
-		if hasIntegrationToken(tokenize(name)) {
-			return true
+		if _, deleted := deletedNames[normalizeToken(name)]; deleted {
+			continue
+		}
+		if !hasIntegrationToken(tokenize(name)) {
+			continue
+		}
+		for brandName := range brands.MatchedBrandNamesForSubject(name) {
+			if out == nil {
+				out = make(map[string]struct{})
+			}
+			out[brandName] = struct{}{}
 		}
 	}
-	return false
+	return out
 }
 
 // subjectBrandMatch is Features.SubjectBrandMatch: the count of DISTINCT
-// curated brands (BrandSet.MatchedBrandNamesForSubject — S1 fix round)
-// matched across every content.sent subject_line within the trailing
-// window ending at now, EXCLUDING any brand already counted by
-// namedBrandNames (S2 fix round: caps the combined per-brand
-// contribution of name_brand_match and subject_brand_match — a brand
-// already credited via the resource/agent name never ALSO inflates this
-// count), capped at subjectBrandMatchCap. content.sent is already a
-// windowed event type, so this decaying window's rescore scheduling is
-// already covered with no code change. Future-dated events are excluded
-// by withinWindow.
-func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration, brands BrandSet, alreadyNamed map[string]struct{}, accountHasIntegrationName bool) float64 {
+// curated brands (BrandSet.MatchedBrandNamesForSubject — S1 fix round:
+// never gated by words inside the subject line itself) matched across
+// every content.sent subject_line within the trailing window ending at
+// now, EXCLUDING any brand already counted by namedBrandNames (S2 fix
+// round: caps the combined per-brand contribution of name_brand_match
+// and subject_brand_match) and any brand in exemptBrands (R2 fix round:
+// exemptSubjectBrands' precise, per-brand integration-name exemption —
+// see its own doc comment), capped at subjectBrandMatchCap. content.sent
+// is already a windowed event type, so this decaying window's rescore
+// scheduling is already covered with no code change. Future-dated events
+// are excluded by withinWindow.
+func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration, brands BrandSet, alreadyNamed, exemptBrands map[string]struct{}) float64 {
 	matched := make(map[string]struct{})
 	for _, e := range events {
 		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
@@ -884,8 +927,11 @@ func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration
 		if !ok || subj == "" {
 			continue
 		}
-		for name := range brands.MatchedBrandNamesForSubject(subj, accountHasIntegrationName) {
+		for name := range brands.MatchedBrandNamesForSubject(subj) {
 			if _, already := alreadyNamed[name]; already {
+				continue
+			}
+			if _, exempt := exemptBrands[name]; exempt {
 				continue
 			}
 			matched[name] = struct{}{}

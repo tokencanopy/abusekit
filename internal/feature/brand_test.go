@@ -309,27 +309,28 @@ func TestBrandSet_CommunityContextSuppressesMatch(t *testing.T) {
 }
 
 // TestMatchedBrandNamesForSubject is S2b's S1 fix round: a subject line's
-// OWN words ("tracking", "api") must never suppress a match — only the
-// SENDING ACCOUNT's own integration-name evidence (passed in by the
-// caller) does, and it suppresses the whole subject rather than being
-// re-litigated per word.
+// OWN words ("tracking", "api") must never suppress a match — round 2's
+// R2 fix round moved the "which account evidence exempts which brand"
+// decision out of this function entirely (see windows.go's
+// exemptSubjectBrands); this function's own contract is just "match,
+// ignoring the integration-token gate, but not the community-token gate".
 func TestMatchedBrandNamesForSubject(t *testing.T) {
 	brands := mechanismBrands()
 
-	got := brands.MatchedBrandNamesForSubject("Your PayPal package tracking update", false)
+	got := brands.MatchedBrandNamesForSubject("Your PayPal package tracking update")
 	if _, ok := got["PayPal"]; !ok {
 		t.Errorf("subject-line matching must not be suppressed by the subject's own words (%v)", got)
 	}
 
-	got = brands.MatchedBrandNamesForSubject("Your PayPal account api access", true)
-	if len(got) != 0 {
-		t.Errorf("accountHasIntegrationName=true must suppress every subject match, got %v", got)
+	got = brands.MatchedBrandNamesForSubject("Your PayPal account api access")
+	if _, ok := got["PayPal"]; !ok {
+		t.Errorf("subject-line matching must not be suppressed by the subject's own words (%v)", got)
 	}
 
 	// The community-token gate (N2) still applies to subject-line
 	// matching — it is a different false-positive shape than S1's
 	// integration-token fix.
-	got = brands.MatchedBrandNamesForSubject("Apple fan club meetup", false)
+	got = brands.MatchedBrandNamesForSubject("Apple fan club meetup")
 	if len(got) != 0 {
 		t.Errorf("community-context gate must still apply to subject-line matching, got %v", got)
 	}

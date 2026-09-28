@@ -127,10 +127,13 @@ func NewBrandSet(entries []BrandEntry) BrandSet {
 // SUBJECT LINE itself — an ordinary bulk-phishing subject routinely
 // contains "tracking" or "api" on purpose ("Your package tracking update
 // failed"), and gating subject-line matching on the subject's own words
-// silently defeated the very rule meant to catch that shape. Whether a
-// subject line should be exempted at all is now decided once, from the
-// SENDING ACCOUNT's own onboarding evidence (see accountHasIntegrationName
-// in windows.go), not from words the phishing subject itself supplies.
+// silently defeated the very rule meant to catch that shape. Round 2's R2
+// fix round: whether a MATCHED brand should be exempted is decided
+// per-brand by windows.go's exemptSubjectBrands (the SENDING ACCOUNT's own
+// live, agent-kind resource names), not by this function — an earlier
+// round exempted subject-line matching outright, for every brand, the
+// instant ANY resource name anywhere carried an integration token; that
+// swept away a genuinely different brand's lure in the same subject line.
 //
 // integrationTokenWords lists each word in its natural spelling;
 // integrationTokens (built by buildIntegrationTokens, below) canonicalises
@@ -232,26 +235,23 @@ func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
 }
 
 // MatchedBrandNamesForSubject is subject_brand_match's matcher (S2b's S1
-// fix round): accountHasIntegrationName is whether the SENDING ACCOUNT's
-// own onboarding evidence (a resource/agent name carrying an integration
-// token — see windows.go's accountHasIntegrationName) already marks it as
-// a likely legitimate integration. When true, every subject line is
-// exempted outright (nil, no match ever reported) — the same
-// "impersonating the brand vs. being a real integration named after it"
-// judgment integrationTokens makes elsewhere, just decided once from the
-// account's own identity rather than re-litigated per subject line. When
-// false, brands are matched WITHOUT gating on words inside the subject
-// line itself (unlike MatchedBrandNames): a bulk-phishing subject
-// routinely contains "tracking" or "api" on purpose, and the OLD
+// fix round): brands are matched WITHOUT gating on words inside the
+// subject line itself (unlike MatchedBrandNames) — a bulk-phishing
+// subject routinely contains "tracking" or "api" on purpose, and the OLD
 // behaviour of gating on the subject's own words silently defeated the
 // rule for exactly the subjects it exists to catch. The community-token
-// gate (N2) still applies either way — it addresses a different
-// false-positive shape (a social brand mentioned in ordinary community
-// context) that is unrelated to S1's fix.
-func (b BrandSet) MatchedBrandNamesForSubject(text string, accountHasIntegrationName bool) map[string]struct{} {
-	if accountHasIntegrationName {
-		return nil
-	}
+// gate (N2) still applies — it addresses a different false-positive shape
+// (a social brand mentioned in ordinary community context) that is
+// unrelated to S1's fix.
+//
+// Deciding WHICH matched brand(s) to then exempt (round 2's R2 fix round:
+// only the brand adjacent to an integration token in the SENDING
+// ACCOUNT's own live, agent-kind resource name — see windows.go's
+// exemptSubjectBrands) is the caller's job, not this function's: it also
+// reuses this exact matcher to identify which brand an integration-named
+// resource is ABOUT in the first place, so it can't itself decide the
+// exemption without becoming circular.
+func (b BrandSet) MatchedBrandNamesForSubject(text string) map[string]struct{} {
 	return b.matched(text, false)
 }
 

@@ -1086,18 +1086,23 @@ func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
 	// S1: "tracking" inside the SUBJECT LINE itself must not suppress the
 	// match (only the account's own resource/agent name can).
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal package tracking update"})}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, false)
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
 	if got != 1 {
 		t.Errorf("subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
 	}
 }
 
-func TestSubjectBrandMatch_SuppressedByAccountIntegrationName(t *testing.T) {
-	brands := smallTestBrands()
-	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
-	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, nil, true)
-	if got != 0 {
-		t.Errorf("subject_brand_match with accountHasIntegrationName=true = %v, want 0", got)
+// TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand is round 2's R2: only
+// the brand adjacent to the integration token in a live agent's name is
+// exempted from subject matching — a DIFFERENT brand mentioned in a
+// subject line must still count.
+func TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand(t *testing.T) {
+	brands := mechanismBrands() // PayPal (+ alias), Apple, Amazon, Stripe, Wells Fargo, Bank of America
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account was flagged, also check Stripe"})}
+	exempt := map[string]struct{}{"PayPal": {}}
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, exempt)
+	if got != 1 {
+		t.Errorf("subject_brand_match = %v, want 1 (Stripe must still count; only PayPal is exempt)", got)
 	}
 }
 
@@ -1105,7 +1110,7 @@ func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
 	brands := smallTestBrands()
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
 	alreadyNamed := map[string]struct{}{"PayPal": {}}
-	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, alreadyNamed, false)
+	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, alreadyNamed, nil)
 	if got != 0 {
 		t.Errorf("subject_brand_match = %v, want 0 (S2: already counted by name_brand_match)", got)
 	}
@@ -1114,9 +1119,66 @@ func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
 func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
 	brands := NewBrandSet([]BrandEntry{{Name: "Fictaone"}, {Name: "Fictatwo"}, {Name: "Fictathree"}, {Name: "Fictafour"}})
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Fictaone Fictatwo Fictathree Fictafour update"})}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, false)
+	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
 	if got != subjectBrandMatchCap {
 		t.Errorf("subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
+	}
+}
+
+// --- Round 2, R2: precise integration-name subject suppression ----------
+
+// TestExemptSubjectBrands_KeyNamedAPIDoesNotSuppress is round 2's R2:
+// keys never count, even when named with an integration token AND a
+// brand.
+func TestExemptSubjectBrands_KeyNamedAPIDoesNotSuppress(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"kind": "key", "name": "Stripe API Key"})}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands (key resource) = %v, want empty — keys never count", got)
+	}
+}
+
+// TestExemptSubjectBrands_DeletedAgentNamedSyncDoesNotSuppress is round
+// 2's R2: only a LIVE (not later deleted) agent counts.
+func TestExemptSubjectBrands_DeletedAgentNamedSyncDoesNotSuppress(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "Stripe Sync"}),
+		ev("r2", "resource.deleted", time.Minute, map[string]any{"kind": "agent", "name": "Stripe Sync"}),
+	}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands (deleted agent) = %v, want empty — a deleted agent never counts", got)
+	}
+}
+
+// TestExemptSubjectBrands_LiveAgentExemptsOnlyItsOwnBrand is round 2's
+// R2's core positive case: a live agent named after an integration
+// exempts ONLY the brand adjacent to the integration token in ITS OWN
+// name, not every brand the account has ever mentioned anywhere.
+func TestExemptSubjectBrands_LiveAgentExemptsOnlyItsOwnBrand(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "Stripe Webhook Relay"}),
+	}
+	got := exemptSubjectBrands(events, brands)
+	if _, ok := got["Stripe"]; !ok || len(got) != 1 {
+		t.Errorf("exemptSubjectBrands = %v, want exactly {Stripe}", got)
+	}
+}
+
+// TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing is round 2's
+// R2: a live agent whose name matches a brand but carries no integration
+// token at all must not exempt anything (that's an ordinary
+// brand-impersonating name, already caught by name_brand_match/S2 — not
+// a legitimate-integration signal).
+func TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "PayPal Alert"})}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands = %v, want empty (no integration token in the name)", got)
 	}
 }
 

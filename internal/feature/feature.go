@@ -428,10 +428,10 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 
 	// S2b: computed once and shared between NameBrandMatch and
 	// SubjectBrandMatch (S2 fix round's double-counting cap) and between
-	// SubjectBrandMatch and S1 fix round's subject-line integration
-	// exemption.
+	// SubjectBrandMatch and round 2's R2 fix round's precise, per-brand
+	// subject-line integration exemption.
 	namedBrands := namedBrandNames(events, brands)
-	accountIntegrationName := accountHasIntegrationName(events)
+	exemptBrands := exemptSubjectBrands(events, brands)
 
 	f := Features{
 		SubjectAgeH:                    subjectAgeHours(firstSeenAt, now),
@@ -458,7 +458,7 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		WebmailRecipientShare:          webmailRecipientShare(events, now, webmail),
 		WebmailSends1h:                 webmailSends1h(events, now, firstSeenAt, windows.OneHour, webmail),
 		DistinctRecipients1h:           distinctRecipients1h(events, now, firstSeenAt, windows.OneHour),
-		SubjectBrandMatch:              subjectBrandMatch(events, now, windows.OneHour, brands, namedBrands, accountIntegrationName),
+		SubjectBrandMatch:              subjectBrandMatch(events, now, windows.OneHour, brands, namedBrands, exemptBrands),
 	}
 
 	return Result{
