@@ -1,0 +1,48 @@
+# config/keys.yaml — per-producer/per-operator credentials (design §4.3:
+# "X-Abusekit-Key" identifies one of these; §4.2's "credentials are per
+# producer").
+#
+# DEVELOPMENT/TEST ONLY. Every secret below is a synthetic placeholder
+# committed to a public repo (AGENTS.md's public-data-boundary rule) —
+# never a real credential. In the hosted deployment (e2a-ops), this file's
+# production equivalent is generated from GCP Secret Manager and mounted
+# outside this repo, the same pattern e2a's billing sidecar and its own
+# `.env` assembly already use; --keys/ABUSEKIT_KEYS_CONFIG points at it.
+#
+# Rotate a key by adding a new id here (or in the real generated file) and
+# retiring the old one once every producer has switched — there is no
+# separate "rotate in place" operation, matching HMAC secrets everywhere
+# else in this stack.
+keys:
+  # The OSS e2a server's event emitter (design §4.12): ingests
+  # subject.created/deleted, resource.created/deleted, content.sent,
+  # content.verdict, subject.class.
+  - id: dev_e2a_server
+    secret: "dev-only-secret-e2a-server-0000000000000000"
+    tenant: e2a
+    producer: e2a-server
+    scopes: [events]
+
+  # The e2a-ops billing sidecar (design §4.12): payment.attempt,
+  # subscription.changed.
+  - id: dev_e2a_billing
+    secret: "dev-only-secret-e2a-billing-0000000000000000"
+    tenant: e2a
+    producer: e2a-billing
+    scopes: [events]
+
+  # The operator UI / dashboard: reads scores, posts labels (design §4.9).
+  # Erasure (design §4.4) is not implemented in this slice — see
+  # docs/design/notes/erasure-findings.md on feat/s3b-list-erasure.
+  - id: dev_e2a_operator
+    secret: "dev-only-secret-e2a-operator-0000000000000000"
+    tenant: e2a
+    scopes: [read, labels]
+
+  # A one-off operator backfill script (design §4.12): skips the ±24h
+  # clock-skew check (design §4.3/§5) and never fires webhooks.
+  - id: dev_e2a_backfill
+    secret: "dev-only-secret-e2a-backfill-0000000000000000"
+    tenant: e2a
+    producer: e2a-backfill
+    scopes: [events, backfill]

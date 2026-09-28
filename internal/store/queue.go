@@ -33,6 +33,13 @@ type DirtySubject struct {
 	ScoredSeq   int64
 	CurrentTier string // "unknown" for a never-scored subject; used to size an elevated-subject's budget headroom (design §4.8's 25% reserve).
 	FailCount   int    // consecutive whole-pass failures so far (B3 fix round) — 0 for a subject that has never failed outright.
+	// ClaimedUntil is the EXACT claimed_until value this claim set (T3,
+	// round 3) — the same value for every subject in one ClaimDirtySubjects
+	// batch, or ClaimSubjectForEvaluate's own single-subject claim. Callers
+	// pass this back to ReleaseClaim so it can compare-and-clear rather
+	// than clearing unconditionally: see ReleaseClaim's own doc comment for
+	// why an unconditional release is unsafe.
+	ClaimedUntil time.Time
 }
 
 // claimCandidateColumns is the column list both claim-selection queries
@@ -123,7 +130,13 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 		limit = DefaultClaimBatchSize
 	}
 	newSubjectCutoff := now.Add(-newSubjectAge)
-	claimedUntil := now.Add(s.claimLeaseOrDefault())
+	// Truncated to microsecond precision (timestamptz's own limit) before
+	// ever being used as a write parameter, matching
+	// ClaimSubjectForEvaluate's own fix for the same class of issue — kept
+	// even though the RETURNING clause below is this method's primary
+	// defense, since it's also the fallback value if that RETURNING result
+	// set ever comes back empty (see below).
+	claimedUntil := now.Add(s.claimLeaseOrDefault()).Truncate(time.Microsecond)
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -155,12 +168,43 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 			tenants[i] = d.Tenant
 			subjects[i] = d.Subject
 		}
-		if _, err := tx.Exec(ctx, `
+		// Follow-up (CI red on Linux): RETURNING the value Postgres actually
+		// stored, rather than trusting the Go-side claimedUntil to survive
+		// its own round trip byte-for-byte — timestamptz is microsecond
+		// precision, and a bare time.Time parameter's encoding path isn't
+		// guaranteed to truncate identically on every OS/driver combination
+		// (a Linux CI run surfaced exactly this: the value ReleaseClaim
+		// later compared against didn't match what got stored, even though
+		// both sides used "the same" Go value — see ReleaseClaim's own doc
+		// comment for the full explanation). Every row in one batch shares
+		// the identical claimed_until, so reading it back off any one
+		// returned row is authoritative for all of them.
+		rows, err := tx.Query(ctx, `
 			UPDATE subjects s SET claimed_until = $1
 			FROM unnest($2::text[], $3::text[]) AS c(tenant, subject)
 			WHERE s.tenant = c.tenant AND s.subject = c.subject
-		`, claimedUntil, tenants, subjects); err != nil {
+			RETURNING s.claimed_until
+		`, claimedUntil, tenants, subjects)
+		if err != nil {
 			return nil, fmt.Errorf("store: set claimed_until: %w", err)
+		}
+		storedClaims, err := pgx.CollectRows(rows, pgx.RowTo[time.Time])
+		if err != nil {
+			return nil, fmt.Errorf("store: collect returned claimed_until: %w", err)
+		}
+		// Every row in the batch shares the identical claimed_until (one
+		// $1 parameter for the whole UPDATE) — any one of them is
+		// authoritative for all of out. storedClaims is empty only if
+		// every candidate lost a claim race between being SELECTed above
+		// and this UPDATE (SKIP LOCKED already makes that vanishingly
+		// unlikely, but fall back to the Go-side value rather than panic
+		// if it ever happens).
+		stored := claimedUntil
+		if len(storedClaims) > 0 {
+			stored = storedClaims[0]
+		}
+		for i := range out {
+			out[i].ClaimedUntil = stored
 		}
 	}
 
@@ -195,15 +239,47 @@ func queryClaimCandidates(ctx context.Context, tx pgx.Tx, query string, now, new
 	return out, nil
 }
 
-// ReleaseClaim clears claimed_until for (tenant, subject) without touching
-// anything else — called by internal/worker once a scoring pass concludes
-// on a path that doesn't already touch subjects itself (a stale round;
-// see UpsertVerdicts and RecordSubjectFailure for the success/failure
-// paths, which clear it as part of their own update).
-func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string) error {
+// ReleaseClaim clears claimed_until for (tenant, subject) — called by
+// internal/worker once a scoring pass concludes on a path that doesn't
+// already touch subjects itself (a stale round; see UpsertVerdicts and
+// RecordSubjectFailure for the success/failure paths, which clear it as
+// part of their own update).
+//
+// claimedUntil is the EXACT value the caller's own claim set (T3, round
+// 3): the clear is a compare-and-clear against it
+// (WHERE claimed_until = $3), not unconditional. Proven necessary: an
+// unconditional `SET claimed_until = NULL` released whatever lease
+// happened to be on the row AT THE TIME this call ran — including a
+// DIFFERENT, still-active lease a concurrent claim (the worker's own next
+// Tick, or another evaluate call) took in the meantime, e.g. after the
+// original caller's own claim attempt raced an ambiguous commit
+// (store.ErrClaimAmbiguous) and its actual outcome was never certain.
+// Releasing someone else's live lease early breaks the mutual exclusion
+// claiming exists for in the first place — a second scoring pass could
+// then start concurrently with the one whose lease was just stolen out
+// from under it. A caller that never actually held a claim (claimedUntil
+// is the zero value, or simply doesn't match what's in the row) safely
+// no-ops here instead.
+//
+// claimedUntil PRECISION (CI red on Linux, follow-up to T3): timestamptz
+// stores microsecond precision; Go's time.Time carries nanoseconds, and a
+// real wall-clock-derived value can carry a nonzero sub-microsecond
+// remainder that a round trip through Postgres silently drops (macOS's
+// own clock reads happened to mask this locally, which is how it first
+// shipped). Both claim methods now hand this method a value that is
+// EITHER read back from Postgres itself via a RETURNING clause
+// (ClaimDirtySubjects, ClaimSubjectForEvaluate's normal success path —
+// see their own comments) OR truncated to time.Microsecond before it was
+// ever used as a write parameter in the first place
+// (ClaimSubjectForEvaluate's ErrClaimAmbiguous path, where no RETURNING
+// value exists to read back because the commit's own outcome is what's
+// uncertain) — either way, guaranteed to be exactly what a matching row
+// would have stored, never a nanosecond-bearing value that could silently
+// fail this WHERE clause's equality check against it.
+func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string, claimedUntil time.Time) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE subjects SET claimed_until = NULL WHERE tenant = $1 AND subject = $2
-	`, tenant, subject)
+		UPDATE subjects SET claimed_until = NULL WHERE tenant = $1 AND subject = $2 AND claimed_until = $3
+	`, tenant, subject, claimedUntil)
 	if err != nil {
 		return fmt.Errorf("store: release claim for %s: %w", subject, err)
 	}

@@ -160,12 +160,67 @@ product ◀─GET score / POST evaluate──────── serve ◀── 
 
 `POST /v1/events`, batch of 1–100, body ≤1 MiB.
 
-**Auth [r2]:** `X-Abusekit-Key: <producer key id>`, `X-Abusekit-Timestamp: <RFC3339>`,
-`X-Abusekit-Signature: hex(hmac-sha256(secret, method \n path?query \n timestamp \n key_id \n
-sha256(body)))`. Timestamp within ±5 min; constant-time compare; the same scheme covers every
+**Auth [r2, amended S3]:** `X-Abusekit-Key: <producer key id>`, `X-Abusekit-Timestamp: <RFC3339>`,
+`X-Abusekit-Nonce: <hex, ≥16 random bytes>` **[S3]**, `X-Abusekit-Signature: hex(hmac-sha256(secret,
+method \n path?query \n timestamp \n key_id \n nonce \n sha256(body)))` **[S3: nonce added to the
+signed payload]**. Timestamp within ±5 min; constant-time compare; the same scheme covers every
 endpoint including GET (body hash of the empty string). Key scopes: `events`, `labels`, `read`,
 `backfill`. A producer key has `events` only; label keys are issued to the operator UI; `backfill`
-skips the clock-skew check and never fires webhooks.
+never fires webhooks. **[R5, round 2]** `backfill`'s timestamp-freshness exemption is scoped to POST
+`/v1/events` only, and bounded rather than unconditional: ±24 h there (matching this design's other
+backfill-adjacent tolerances), not "skip the check entirely" — a `backfill`-scoped key calling any
+OTHER endpoint (a read, an evaluate, a label) uses the ordinary ±5 min window like any other key,
+since there is no legitimate reason for a backdated timestamp anywhere but a historical event
+import. An unconditional exemption on every endpoint meant a captured `backfill`-scoped request's
+signature (for whichever endpoint that key could reach) never aged out on timestamp grounds at all —
+nonce-replay protection alone stood between it and reuse forever.
+
+**[S3] Nonce and replay window:** the timestamp alone does not prevent replay — a captured request
+stays valid to resend for the whole freshness window it remains valid under the check above. The
+nonce is a per-request random value the server remembers per `(key, nonce)` for at least as long as
+that request's own timestamp could still independently pass the freshness check: `max(received_at,
+timestamp) + window`, where `window` is the SAME ±5 min (ordinary key) or ±24 h (`backfill`-scoped
+key on `/v1/events` — **[R5, round 2]** amended from a flat, `received_at`-only 24 h window to this
+same `max(...)` form) the timestamp was just checked against. This is `received_at`-anchored rather
+than a fixed window from the timestamp alone, because a request signed near the future edge of its
+window (e.g. timestamp = now+`window`-1 min) would otherwise have its replay record expire only 1
+minute after the timestamp itself, while the timestamp remained independently acceptable for the
+rest of that window — letting the SAME request be replayed again once the record (but not the
+timestamp's own validity) had lapsed; this held for the ordinary ±5 min case from S3 onward, and
+**[R5, round 2]** the previous flat `received_at`-only backfill formula reintroduced exactly this
+gap once backfill's window became bounded rather than unconditional, which is why both cases now
+share one formula. A caller retrying a request (e.g. after a `5xx`) must sign the retry with a FRESH
+nonce — reusing the original request's nonce makes a legitimate retry indistinguishable from a
+replay. **[R5, round 2]** A nonce is also bounded in length now (16–64 hex-encoded bytes, i.e. 32–128
+hex characters) — rejected past the upper bound before any signature verification is attempted — and
+is only recorded into the replay cache once the caller's key is confirmed to hold the scope the
+endpoint requires; a request that authenticates but is denied for lacking scope never consumes its
+nonce, so a caller can retry the identical nonce once properly scoped instead of being permanently
+told "replay detected" for an attempt that never actually succeeded at anything.
+
+**[T6, round 3] Replay-cache memory bound:** each entry is keyed on a 16-byte hash of `(key, nonce)`,
+not the raw nonce string, and lives for the window above (±5 min ordinary, ±24 h backfill-on-events)
+— call it ~63 bytes/entry (the hash, a `time.Time` value, and Go map bucket overhead). Only requests
+that pass signature verification AND the scope check ever reach this cache (a bad signature, an
+unknown key, or a scope denial consumes nothing here — see the pre-auth limiter below for THAT
+traffic instead), so its growth is bounded by legitimate, authenticated throughput, not by an
+attacker's own flood. The backfill case is the one actually worth sizing: a single backfill-scoped
+key sustaining 50 req/s for the full ±24 h window accumulates on the order of 50 × 86400 ≈ 4.3M
+entries ≈ 270 MB — real memory to budget for if a producer's backfill throughput could approach that,
+not an unbounded risk under ordinary load.
+
+**[T6, round 3] Pre-auth per-IP limiter — what it actually bounds:** an earlier round's rationale for
+this limiter ("bounds how much HMAC-verification work an unauthenticated flood can force this
+process to do") was never accurate and is corrected here. The limiter does not reduce how much
+signature-verification work the server does — every request's HMAC is still computed and checked
+exactly once, pass or fail, since round 2's own fix moved the limiter to be consulted only AFTER a
+request has already failed to authenticate (never before, and never for one that succeeds). What it
+actually bounds is repeated FAILED-authentication traffic from one IP degrading to a 429 once that IP
+has failed enough times recently — a fail2ban-style guard against a garbage/replay flood, not a
+cost-of-cryptography guard. HMAC-SHA256 itself is cheap enough (microseconds) that verifying it
+unconditionally, even under a flood, was never the actual risk; the real risk the ORIGINAL,
+unconditional-block design introduced was blocking a real producer's LEGITIMATE traffic when it
+shared an IP (a NAT gateway, a corporate proxy) with whatever was generating the failures.
 
 Event: `{id (required, ≤64), subject (≤256), type ([a-z_.]+ ≤64), at (RFC3339 UTC, ±24 h unless
 backfill scope), links? {email_hash?, card_fingerprint_hash?, ip24_hash?, asn?, ua_hash?,

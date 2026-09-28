@@ -2,14 +2,14 @@
 // "One Go binary; Postgres").
 //
 // S1 wired up the store and config layers behind two subcommands with
-// `serve --check` only. S2's fix round (S9) now also wires up and runs the
-// SCORING LOOP itself (internal/worker) under plain `serve` — it finds
-// dirty subjects, scores them, and commits verdicts. R8 (round 2) adds a
-// loopback HTTP listener serving worker.Metrics via expvar. The `/v1/*`
-// HTTP surface itself is still S3's job. `serve` without --check runs the
-// worker standing, blocking on SIGINT/SIGTERM. `serve --check` is
-// unaffected: it still only validates config and migrates the database,
-// then exits 0.
+// `serve --check` only. S2's fix round (S9) wired up and ran the SCORING
+// LOOP itself (internal/worker) under plain `serve` — it finds dirty
+// subjects, scores them, and commits verdicts. R8 (round 2) added a
+// loopback HTTP listener serving worker.Metrics via expvar. S3 adds the
+// `/v1/*` HTTP surface itself (internal/serve): `serve` without --check
+// now runs both the worker AND the API, blocking on SIGINT/SIGTERM.
+// `serve --check` is unaffected: it still only validates config and
+// migrates the database, then exits 0.
 package main
 
 import (
@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -32,6 +34,7 @@ import (
 	"github.com/tokencanopy/abusekit/internal/feature"
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/model/local"
+	"github.com/tokencanopy/abusekit/internal/serve"
 	"github.com/tokencanopy/abusekit/internal/store"
 	"github.com/tokencanopy/abusekit/internal/worker"
 )
@@ -59,31 +62,82 @@ func run(args []string) error {
 
 type serveConfig struct {
 	check         bool
+	dev           bool
 	databaseURL   string
 	rulesPath     string
 	vendorsPath   string
 	weightsPath   string
 	brandsPath    string
+	keysPath      string
 	metricsListen string
+	listenAddr    string
 }
+
+// minKeySecretBytes and devSecretPrefix are the fix round's B2 guards
+// against booting with a fail-open default credential set: config/keys.yaml
+// (this repo's own shipped dev/test file) names every secret with
+// devSecretPrefix specifically so validateKeySecrets can recognize and
+// refuse it outside --dev, and every one of those shipped secrets is
+// already >= minKeySecretBytes so --dev alone is enough to run locally
+// against the shipped file.
+const (
+	minKeySecretBytes = 32
+	devSecretPrefix   = "dev-only-"
+)
 
 func parseServeFlags(args []string) (serveConfig, error) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var c serveConfig
 	fs.BoolVar(&c.check, "check", false, "boot store and config, then exit 0 without serving")
+	fs.BoolVar(&c.dev, "dev", false, "allow key secrets prefixed \"dev-only-\" (config/keys.yaml ships these) -- refused otherwise (B2 fix round)")
 	fs.StringVar(&c.databaseURL, "database-url", os.Getenv("ABUSEKIT_DATABASE_URL"), "Postgres connection string (env ABUSEKIT_DATABASE_URL)")
 	fs.StringVar(&c.rulesPath, "rules", envOr("ABUSEKIT_RULES_CONFIG", "config/rules.yaml"), "path to rules.yaml")
 	fs.StringVar(&c.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&c.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
 	fs.StringVar(&c.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
+	// B2 fix round: NO default keys path. A silently-defaulted
+	// config/keys.yaml is exactly the fail-open behavior this guards
+	// against -- every deployment must say explicitly where its keys live.
+	fs.StringVar(&c.keysPath, "keys", os.Getenv("ABUSEKIT_KEYS_CONFIG"), "path to keys.yaml (design §4.3's per-producer/operator credentials) -- required, no default (env ABUSEKIT_KEYS_CONFIG)")
 	fs.StringVar(&c.metricsListen, "metrics-listen", envOr("ABUSEKIT_METRICS_LISTEN", "127.0.0.1:9099"), "loopback address to serve worker.Metrics on via expvar's /debug/vars (env ABUSEKIT_METRICS_LISTEN; empty disables it — R8 round 2)")
+	// B2 fix round: loopback by default, not every interface -- an
+	// operator has to opt into a wider bind explicitly.
+	fs.StringVar(&c.listenAddr, "listen", envOr("ABUSEKIT_LISTEN", "127.0.0.1:8080"), "address to serve the /v1/* HTTP API on (env ABUSEKIT_LISTEN; empty disables it — S3)")
 	if err := fs.Parse(args); err != nil {
 		return serveConfig{}, err
 	}
 	if c.databaseURL == "" {
 		return serveConfig{}, errors.New("a database URL is required: pass --database-url or set ABUSEKIT_DATABASE_URL")
 	}
+	if c.keysPath == "" {
+		return serveConfig{}, errors.New("a keys config is required: pass --keys or set ABUSEKIT_KEYS_CONFIG (no default — B2 fix round)")
+	}
 	return c, nil
+}
+
+// validateKeySecrets is the B2 fix round's boot-time guard against a
+// fail-open credential set: every secret must be at least
+// minKeySecretBytes long (regardless of --dev — a short secret is weak
+// however it got there), and none may carry devSecretPrefix unless dev is
+// true (config/keys.yaml, this repo's own shipped dev/test file, names
+// every secret this way specifically so it can never boot silently
+// outside --dev).
+func validateKeySecrets(keys map[string]config.Key, dev bool) error {
+	ids := make([]string, 0, len(keys))
+	for id := range keys {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // deterministic error ordering, not map iteration
+	for _, id := range ids {
+		k := keys[id]
+		if len(k.Secret) < minKeySecretBytes {
+			return fmt.Errorf("key %q: secret is %d bytes, want >= %d", id, len(k.Secret), minKeySecretBytes)
+		}
+		if !dev && strings.HasPrefix(k.Secret, devSecretPrefix) {
+			return fmt.Errorf("key %q: secret is prefixed %q (config/keys.yaml's own dev/test credentials) -- pass --dev to allow this, or point --keys at a real credential file", id, devSecretPrefix)
+		}
+	}
+	return nil
 }
 
 func envOr(key, fallback string) string {
@@ -169,15 +223,81 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 		}()
 	}
 
-	fmt.Println("abusekit: worker running (no HTTP surface yet — that's S3); press Ctrl-C to stop")
+	// S3: the /v1/* HTTP API. Started BEFORE the worker begins ticking
+	// (so evaluate/events never race a not-yet-ready dependency) and shut
+	// down BEFORE the worker stops (below) — draining in-flight HTTP
+	// requests first means an evaluate call that's already claimed a
+	// subject gets to finish its round through a still-running worker
+	// rather than racing its own shutdown.
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	if err != nil {
+		return fmt.Errorf("start api server: %w", err)
+	}
+	if apiSrv != nil {
+		fmt.Println("abusekit: API listening on http://" + apiAddr)
+	}
+
+	fmt.Println("abusekit: worker running; press Ctrl-C to stop")
 	w.Start(ctx)
-	// Start returns once ctx is done; Stop is still safe (and a no-op
-	// beyond releasing state, since Start already returned) to call here
-	// for symmetry with a caller that constructs a Worker and drives
+	// Start returns once ctx is done. Shut the API server down first (it
+	// stops accepting new requests and waits for in-flight ones), then
+	// Stop the worker — safe (and a no-op beyond releasing state) to call
+	// here for symmetry with a caller that constructs a Worker and drives
 	// Start/Stop itself.
+	if apiSrv != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_ = apiSrv.Shutdown(shutdownCtx)
+		cancel()
+	}
 	w.Stop()
 	fmt.Println("abusekit: worker stopped")
 	return nil
+}
+
+// apiServerTimeouts bound the HTTP API's connection lifecycle (task's
+// "timeouts on the server"): generous enough for a synchronous evaluate
+// call at its full {deadline_ms<=3000} ceiling with room to spare, tight
+// enough that a stalled client can't hold a connection open indefinitely.
+const (
+	apiReadHeaderTimeout = 5 * time.Second
+	apiReadTimeout       = 10 * time.Second
+	apiWriteTimeout      = 15 * time.Second
+	apiIdleTimeout       = 60 * time.Second
+)
+
+// startAPIServer builds internal/serve's Server and starts it on addr.
+// addr == "" disables it entirely (matching startMetricsServer's own
+// convention), returning (nil, "", nil) — a test constructing a
+// serveConfig by hand (leaving listenAddr at its zero value) gets no
+// listener at all, never a port collision.
+func startAPIServer(addr string, s *store.Store, w *worker.Worker, cfg *config.Config, keys map[string]config.Key, neighbors feature.Neighbors, brands feature.BrandSet) (*http.Server, string, error) {
+	if addr == "" {
+		return nil, "", nil
+	}
+	srv, err := serve.New(serve.Deps{
+		Store: s, Worker: w, Config: cfg, Keys: keys,
+		Neighbors: neighbors, Brands: brands, Logger: slog.Default(),
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("construct http server: %w", err)
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, "", fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	httpSrv := &http.Server{
+		Handler:           srv.Handler(),
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
+	}
+	go func() {
+		if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Default().Error("abusekit: api server failed", "error", err)
+		}
+	}()
+	return httpSrv, ln.Addr().String(), nil
 }
 
 // startMetricsServer starts a loopback HTTP server on addr serving
@@ -234,6 +354,11 @@ type bootDeps struct {
 	brands    feature.BrandSet
 	metrics   *worker.Metrics
 	budgets   *worker.Budgets
+	// keys is design §4.3's per-producer/operator credential set (S3),
+	// loaded alongside every other config file below — a bad keys.yaml
+	// fails boot the same way a bad rules/vendors/weights/brands file
+	// does, before ever touching Postgres.
+	keys map[string]config.Key
 }
 
 // boot performs the startup sequence every `serve` invocation needs:
@@ -283,6 +408,18 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 		return nil, nil, bootDeps{}, fmt.Errorf("load brands config: %w", err)
 	}
 
+	keysData, err := os.ReadFile(c.keysPath)
+	if err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("read keys config: %w", err)
+	}
+	keys, err := config.LoadKeys(keysData)
+	if err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("load keys config: %w", err)
+	}
+	if err := validateKeySecrets(keys, c.dev); err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("validate keys config: %w", err)
+	}
+
 	pool, err := pgxpool.New(ctx, c.databaseURL)
 	if err != nil {
 		return nil, nil, bootDeps{}, fmt.Errorf("connect to database: %w", err)
@@ -299,6 +436,7 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 		brands:    brands,
 		budgets:   worker.NewPersistedBudgets(s, defaultPerAdapterDailyBudget, worker.DefaultPerSubjectDailyBudget, defaultPerTenantDailyBudget),
 		metrics:   metrics,
+		keys:      keys,
 	}
 	return s, cfg, deps, nil
 }

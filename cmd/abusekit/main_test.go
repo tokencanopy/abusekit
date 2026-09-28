@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tokencanopy/abusekit/internal/worker"
 )
 
 func repoRoot(t *testing.T) string {
@@ -21,6 +24,13 @@ func repoRoot(t *testing.T) string {
 	return filepath.Join(filepath.Dir(thisFile), "..", "..")
 }
 
+// shippedConfig builds a serveConfig against this repo's own config/*.yaml
+// files, including config/keys.yaml — whose secrets are all prefixed
+// "dev-only-" specifically so a boot against them requires --dev (B2 fix
+// round); shippedConfig always sets dev: true so callers get the old
+// "just works against the shipped config" behavior unless a test
+// specifically wants to exercise the refusal itself (see
+// TestBoot_RefusesDevOnlySecretsWithoutDevFlag below).
 func shippedConfig(t *testing.T) serveConfig {
 	root := repoRoot(t)
 	return serveConfig{
@@ -28,6 +38,8 @@ func shippedConfig(t *testing.T) serveConfig {
 		vendorsPath: filepath.Join(root, "config", "vendors.yaml"),
 		weightsPath: filepath.Join(root, "config", "local_weights.yaml"),
 		brandsPath:  filepath.Join(root, "config", "brands.yaml"),
+		keysPath:    filepath.Join(root, "config", "keys.yaml"),
+		dev:         true,
 	}
 }
 
@@ -40,6 +52,7 @@ func TestParseServeFlags_RequiresDatabaseURL(t *testing.T) {
 
 func TestParseServeFlags_Defaults(t *testing.T) {
 	t.Setenv("ABUSEKIT_DATABASE_URL", "postgres://example/db")
+	t.Setenv("ABUSEKIT_KEYS_CONFIG", "/tmp/keys.yaml") // no default (B2) -- must set something to reach the other defaults
 	c, err := parseServeFlags(nil)
 	if err != nil {
 		t.Fatalf("parseServeFlags: %v", err)
@@ -50,16 +63,61 @@ func TestParseServeFlags_Defaults(t *testing.T) {
 	if c.rulesPath != "config/rules.yaml" || c.vendorsPath != "config/vendors.yaml" || c.weightsPath != "config/local_weights.yaml" {
 		t.Errorf("unexpected default paths: %+v", c)
 	}
+	if c.listenAddr != "127.0.0.1:8080" {
+		t.Errorf("listenAddr = %q, want 127.0.0.1:8080 by default (B2 fix round: loopback, not every interface)", c.listenAddr)
+	}
 	if c.check {
 		t.Errorf("expected check=false by default")
+	}
+	if c.dev {
+		t.Errorf("expected dev=false by default (B2 fix round)")
 	}
 	if c.metricsListen != "127.0.0.1:9099" {
 		t.Errorf("metricsListen = %q, want the default 127.0.0.1:9099 (R8 round 2)", c.metricsListen)
 	}
 }
 
+// TestParseServeFlags_RequiresKeysPath is B2: no default keys path — a
+// silently-defaulted config/keys.yaml is exactly the fail-open behavior
+// this guards against.
+func TestParseServeFlags_RequiresKeysPath(t *testing.T) {
+	t.Setenv("ABUSEKIT_DATABASE_URL", "postgres://example/db")
+	t.Setenv("ABUSEKIT_KEYS_CONFIG", "")
+	if _, err := parseServeFlags(nil); err == nil {
+		t.Fatalf("expected an error with no keys path configured")
+	}
+}
+
+// TestBoot_RefusesDevOnlySecretsWithoutDevFlag is B2: config/keys.yaml's
+// own secrets are all prefixed "dev-only-" specifically so this refusal
+// has something real to catch — proving a caller can't silently boot
+// against the shipped dev/test credentials without opting in via --dev.
+func TestBoot_RefusesDevOnlySecretsWithoutDevFlag(t *testing.T) {
+	c := shippedConfig(t)
+	c.dev = false
+	if _, _, _, err := boot(context.Background(), c); err == nil {
+		t.Fatalf("expected boot to refuse dev-only- prefixed secrets without --dev")
+	}
+}
+
+// TestBoot_RefusesShortSecrets is B2's unconditional minimum-length floor
+// — even under --dev, a secret under minKeySecretBytes is refused.
+func TestBoot_RefusesShortSecrets(t *testing.T) {
+	c := shippedConfig(t)
+	c.dev = true
+	short := filepath.Join(t.TempDir(), "short-keys.yaml")
+	if err := os.WriteFile(short, []byte("keys:\n  - id: k\n    secret: tooshort\n    tenant: e2a\n    scopes: [read]\n"), 0o644); err != nil {
+		t.Fatalf("write short keys file: %v", err)
+	}
+	c.keysPath = short
+	if _, _, _, err := boot(context.Background(), c); err == nil {
+		t.Fatalf("expected boot to refuse a secret shorter than %d bytes even under --dev", minKeySecretBytes)
+	}
+}
+
 func TestParseServeFlags_CheckFlag(t *testing.T) {
 	t.Setenv("ABUSEKIT_DATABASE_URL", "postgres://example/db")
+	t.Setenv("ABUSEKIT_KEYS_CONFIG", "/tmp/keys.yaml")
 	c, err := parseServeFlags([]string{"--check"})
 	if err != nil {
 		t.Fatalf("parseServeFlags: %v", err)
@@ -105,11 +163,13 @@ func TestRunServe_CheckSucceeds(t *testing.T) {
 	dbURL := testDBURL(t)
 	args := []string{
 		"--check",
+		"--dev",
 		"--database-url", dbURL,
 		"--rules", c.rulesPath,
 		"--vendors", c.vendorsPath,
 		"--weights", c.weightsPath,
 		"--brands", c.brandsPath,
+		"--keys", c.keysPath,
 	}
 	if err := runServe(args); err != nil {
 		t.Fatalf("runServe --check: %v", err)
@@ -145,6 +205,55 @@ func TestRunServeWithContext_StartsAndStopsTheWorker(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("runServeWithContext did not return after its context was cancelled")
+	}
+}
+
+// TestRunServeWithContext_ServesTheAPI is S3's cmd-level wiring proof: with
+// a real (OS-assigned, via ":0") listen address, runServeWithContext
+// actually answers /healthz over HTTP while running, and the listener is
+// gone (connection refused) once its context is cancelled and the call has
+// returned — proving startAPIServer's shutdown is wired into the SAME
+// graceful-stop path as the worker's own Stop(), not left dangling.
+func TestRunServeWithContext_ServesTheAPI(t *testing.T) {
+	c := shippedConfig(t)
+	c.databaseURL = testDBURL(t)
+	c.listenAddr = "127.0.0.1:0"
+	c.metricsListen = "" // avoid a second listener neither this test nor its port-discovery needs
+
+	s, cfg, deps, err := boot(context.Background(), c)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands})
+	if err != nil {
+		s.Close()
+		t.Fatalf("worker.New: %v", err)
+	}
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	if err != nil {
+		s.Close()
+		t.Fatalf("startAPIServer: %v", err)
+	}
+	defer s.Close()
+
+	resp, err := http.Get("http://" + apiAddr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := apiSrv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if _, err := http.Get("http://" + apiAddr + "/healthz"); err == nil {
+		t.Fatalf("expected the listener to be gone after Shutdown")
 	}
 }
 
