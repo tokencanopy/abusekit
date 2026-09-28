@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -977,6 +979,36 @@ func TestLoadBrandsFile_S2bExtraBrands(t *testing.T) {
 	// see TestBrandSet_NameMatchingNeverCommunityGated for that half.
 	if len(brands.MatchedBrandNamesForSubject("Facebook group meetup")) != 0 {
 		t.Errorf("MatchedBrandNamesForSubject(%q) matched, want none (N2: community context)", "Facebook group meetup")
+	}
+}
+
+// TestBrandsYAML_CategoryCommentsStayGeneric is round 2's H1: a category
+// comment in config/brands.yaml must describe the CATEGORY (marketplace,
+// social, shipping) only, never pair it with a specific quoted lure theme
+// observed for that category's brands — the same hygiene rule applied to
+// fixtures/PR text/commits extended to the shipped config file itself.
+// Reads the raw file text (LoadBrandsFile only sees the parsed brand
+// names, never the comments) and asserts none of the specific lure
+// phrases a prior round's category comments quoted are present anywhere
+// in it.
+func TestBrandsYAML_CategoryCommentsStayGeneric(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("read brands.yaml: %v", err)
+	}
+	text := string(raw)
+
+	bannedLurePhrases := []string{
+		"your listing",
+		"your order",
+		"account security",
+		"policy violation",
+		"package delivery",
+	}
+	for _, phrase := range bannedLurePhrases {
+		if strings.Contains(strings.ToLower(text), phrase) {
+			t.Errorf("config/brands.yaml contains the quoted lure phrase %q — category comments must stay generic (H1), never pair a brand category with a specific lure theme", phrase)
+		}
 	}
 }
 

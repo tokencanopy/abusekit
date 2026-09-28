@@ -42,6 +42,11 @@
 # the identical-case standalone token "UPS", never the everyday word
 # "ups" (as in "its ups and downs").
 #
+# S2b's round 2 (H1): a category comment below names the CATEGORY only
+# (marketplace, social, shipping, ...) — it never pairs a category with a
+# specific quoted lure theme observed for that category's brands. See
+# internal/feature's TestBrandsYAML_CategoryCommentsStayGeneric.
+#
 # Categories below are alphabetized within each one.
 brands:
   # Financial / payments
@@ -70,8 +75,7 @@ brands:
   - name: Microsoft
   - name: Stripe
 
-  # Marketplace / classifieds — addressing common bulk-phishing shapes
-  # around a "your listing"/"your order" lure.
+  # Marketplace / classifieds
   - name: Depop
   - name: eBay
   - name: Etsy
@@ -80,10 +84,9 @@ brands:
   - name: Shopify
   - name: Vinted
 
-  # Social / community — addressing common bulk-phishing shapes around an
-  # "account security"/"policy violation" lure. N2's community-context
-  # gate (a brand mentioned as part of an ordinary group/meetup/fan-club
-  # description) applies to every entry here, not only these four.
+  # Social / community. N2's community-context gate (a brand mentioned as
+  # part of an ordinary group/meetup/fan-club description) applies to
+  # every entry here, not only these four.
   - name: Facebook
   - name: Instagram
   - name: TikTok
@@ -95,8 +98,7 @@ brands:
   - name: Airbnb
   - name: Booking.com
 
-  # Shipping / postal (additional carriers) — addressing common
-  # bulk-phishing shapes around a "package delivery" lure.
+  # Shipping / postal (additional carriers)
   - name: Australia Post
   - name: Canada Post
   - name: DPD
