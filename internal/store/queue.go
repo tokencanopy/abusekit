@@ -33,6 +33,13 @@ type DirtySubject struct {
 	ScoredSeq   int64
 	CurrentTier string // "unknown" for a never-scored subject; used to size an elevated-subject's budget headroom (design §4.8's 25% reserve).
 	FailCount   int    // consecutive whole-pass failures so far (B3 fix round) — 0 for a subject that has never failed outright.
+	// ClaimedUntil is the EXACT claimed_until value this claim set (T3,
+	// round 3) — the same value for every subject in one ClaimDirtySubjects
+	// batch, or ClaimSubjectForEvaluate's own single-subject claim. Callers
+	// pass this back to ReleaseClaim so it can compare-and-clear rather
+	// than clearing unconditionally: see ReleaseClaim's own doc comment for
+	// why an unconditional release is unsafe.
+	ClaimedUntil time.Time
 }
 
 // claimCandidateColumns is the column list both claim-selection queries
@@ -162,6 +169,11 @@ func (s *Store) ClaimDirtySubjects(ctx context.Context, now time.Time, limit int
 		`, claimedUntil, tenants, subjects); err != nil {
 			return nil, fmt.Errorf("store: set claimed_until: %w", err)
 		}
+		// T3 (round 3): stamp the exact value just set so a caller's later
+		// ReleaseClaim call can compare-and-clear against it.
+		for i := range out {
+			out[i].ClaimedUntil = claimedUntil
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -195,15 +207,31 @@ func queryClaimCandidates(ctx context.Context, tx pgx.Tx, query string, now, new
 	return out, nil
 }
 
-// ReleaseClaim clears claimed_until for (tenant, subject) without touching
-// anything else — called by internal/worker once a scoring pass concludes
-// on a path that doesn't already touch subjects itself (a stale round;
-// see UpsertVerdicts and RecordSubjectFailure for the success/failure
-// paths, which clear it as part of their own update).
-func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string) error {
+// ReleaseClaim clears claimed_until for (tenant, subject) — called by
+// internal/worker once a scoring pass concludes on a path that doesn't
+// already touch subjects itself (a stale round; see UpsertVerdicts and
+// RecordSubjectFailure for the success/failure paths, which clear it as
+// part of their own update).
+//
+// claimedUntil is the EXACT value the caller's own claim set (T3, round
+// 3): the clear is a compare-and-clear against it
+// (WHERE claimed_until = $3), not unconditional. Proven necessary: an
+// unconditional `SET claimed_until = NULL` released whatever lease
+// happened to be on the row AT THE TIME this call ran — including a
+// DIFFERENT, still-active lease a concurrent claim (the worker's own next
+// Tick, or another evaluate call) took in the meantime, e.g. after the
+// original caller's own claim attempt raced an ambiguous commit
+// (store.ErrClaimAmbiguous) and its actual outcome was never certain.
+// Releasing someone else's live lease early breaks the mutual exclusion
+// claiming exists for in the first place — a second scoring pass could
+// then start concurrently with the one whose lease was just stolen out
+// from under it. A caller that never actually held a claim (claimedUntil
+// is the zero value, or simply doesn't match what's in the row) safely
+// no-ops here instead.
+func (s *Store) ReleaseClaim(ctx context.Context, tenant, subject string, claimedUntil time.Time) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE subjects SET claimed_until = NULL WHERE tenant = $1 AND subject = $2
-	`, tenant, subject)
+		UPDATE subjects SET claimed_until = NULL WHERE tenant = $1 AND subject = $2 AND claimed_until = $3
+	`, tenant, subject, claimedUntil)
 	if err != nil {
 		return fmt.Errorf("store: release claim for %s: %w", subject, err)
 	}

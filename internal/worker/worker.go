@@ -90,7 +90,7 @@ type Store interface {
 	ClearRuleBackoff(ctx context.Context, tenant, subject, rule string) error
 	PruneRuleState(ctx context.Context, tenant, subject string, currentRules []string) error
 	RecordSubjectFailure(ctx context.Context, tenant, subject string, nextAttemptAt time.Time) error
-	ReleaseClaim(ctx context.Context, tenant, subject string) error
+	ReleaseClaim(ctx context.Context, tenant, subject string, claimedUntil time.Time) error
 	ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error
 	QueueStats(ctx context.Context, now time.Time) (depth int, oldestDirtyAge time.Duration, err error)
 	// ClaimSubjectForEvaluate backs EvaluateSubject (S3): design §4.4's
@@ -377,8 +377,10 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 			// release defensively so a slow loser never holds a lease past
 			// its useful life. Best-effort: a failure here isn't this
 			// round's problem to report, since the round it lost to is
-			// what matters.
-			_ = w.deps.Store.ReleaseClaim(ctx, d.Tenant, d.Subject)
+			// what matters. d.ClaimedUntil (T3, round 3) is the exact value
+			// THIS claim set, so ReleaseClaim's compare-and-clear can never
+			// touch the newer round's own (different) lease.
+			_ = w.deps.Store.ReleaseClaim(ctx, d.Tenant, d.Subject, d.ClaimedUntil)
 		}
 	}
 	return result, nil
@@ -552,17 +554,24 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 		// the UPDATE may have landed durably on the server even though we
 		// got an error back. Best-effort release with a context independent
 		// of ctx (which is likely already expired/cancelled — that's how we
-		// got here) and a short bound of its own; ReleaseClaim is
-		// unconditional and idempotent, so if the commit never actually
-		// landed this is a harmless no-op. Proven necessary: without this,
-		// a claim left behind by an ambiguous commit sits for the full
+		// got here) and a short bound of its own. Proven necessary: without
+		// this, a claim left behind by an ambiguous commit sits for the full
 		// ~2-minute lease with nothing to release it — neither a later
 		// evaluate call nor the worker's own Tick can touch the subject
 		// until the lease itself expires.
+		//
+		// T3 (round 3): passes ambiguous.ClaimedUntil — the exact value THIS
+		// ambiguous commit attempted to set — to ReleaseClaim's own
+		// compare-and-clear rather than a bare (tenant, subject). A plain
+		// unconditional release here would clear WHATEVER lease happens to
+		// be on the row at the moment this runs, including a DIFFERENT,
+		// still-active one the worker's own next Tick (or another evaluate
+		// call) legitimately took in the meantime, since the commit's real
+		// outcome was never certain in the first place.
 		var ambiguous *store.ErrClaimAmbiguous
 		if errors.As(err, &ambiguous) {
 			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseClaimTimeout)
-			if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject); rerr != nil {
+			if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject, ambiguous.ClaimedUntil); rerr != nil {
 				w.deps.logger().Error("worker: release ambiguous evaluate claim failed", "tenant", tenant, "error", rerr)
 			}
 			cancel()
@@ -579,6 +588,11 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 	// ReleaseClaim(ctx, ...)` using the caller's own (already-cancelled)
 	// ctx makes the release call itself fail immediately, leaving the
 	// subject claimed for the full ~2-minute lease.
+	//
+	// T3 (round 3): d.ClaimedUntil is the exact value THIS call's own claim
+	// set — ReleaseClaim's compare-and-clear means this defer can never
+	// clear a DIFFERENT lease a concurrent claimant took after this one's
+	// own natural expiry or an otherwise-unexpected release path.
 	committed := false
 	defer func() {
 		if committed {
@@ -586,7 +600,7 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 		}
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseClaimTimeout)
 		defer cancel()
-		if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject); rerr != nil {
+		if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject, d.ClaimedUntil); rerr != nil {
 			w.deps.logger().Error("worker: release evaluate claim failed", "tenant", tenant, "error", rerr)
 		}
 	}()
@@ -950,7 +964,24 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			// same evaluate retried, or the worker's own Tick, neither of
 			// which artificially shortens ctx) tries again with a full
 			// budget on its own schedule.
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			//
+			// T1 (round 3): checking errors.Is(err, context.DeadlineExceeded)
+			// ALONE also matched safeScore's own PER-CALL ScoreTimeout — a
+			// completely different, genuine adapter timeout, wrapped in its
+			// own context.WithTimeout(scoreCtx, w.deps.ScoreTimeout) child
+			// that expires on its own schedule regardless of scoreCtx's
+			// (the ROUND's) budget. In Tick specifically (ctx==scoreCtx,
+			// never artificially shortened by a deadline_ms), a scorer that
+			// simply timed out was committed unscored with NO backoff and
+			// no retry scheduled — silently going quiet for up to
+			// next_rescore_at's feature-window-decay fallback (hours, not
+			// the ~30s a real adapter failure should retry after). The
+			// distinguishing signal is scoreCtx.Err() itself, checked here
+			// rather than the error safeScore returned: it is non-nil ONLY
+			// when the ROUND's own outer context is what expired/was
+			// cancelled — a child callCtx's shorter ScoreTimeout firing on
+			// its own never sets its parent scoreCtx's Err().
+			if scoreCtx.Err() != nil {
 				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "deadline_exceeded"}
 				continue
 			}

@@ -126,14 +126,85 @@ func TestClaimSubjectForEvaluate_ReclaimableAfterRelease(t *testing.T) {
 
 	appendAt(t, ctx, s, "acct_eval_release", "subject.created", now, nil)
 
-	if _, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_eval_release", now); err != nil {
+	claimed, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_eval_release", now)
+	if err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
-	if err := s.ReleaseClaim(ctx, testTenant, "acct_eval_release"); err != nil {
+	if err := s.ReleaseClaim(ctx, testTenant, "acct_eval_release", claimed.ClaimedUntil); err != nil {
 		t.Fatalf("ReleaseClaim: %v", err)
 	}
 	if _, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_eval_release", now); err != nil {
 		t.Fatalf("second claim after release: %v", err)
+	}
+}
+
+// TestReleaseClaim_DoesNotClearANewerLease is T3 (round 3): ReleaseClaim
+// must compare-and-clear against the EXACT claimed_until value the caller
+// itself set, not clear the row unconditionally. Reproduces the scenario
+// worker.EvaluateSubject's two release call sites (the ErrClaimAmbiguous
+// path and the release-on-not-committed defer) both guard against: a
+// caller's own claim attempt becomes stale (here, released for real by an
+// UNRELATED path — in production this is an ambiguous-commit outcome or a
+// round that never committed) and, before that staleness is discovered,
+// the worker's own Tick legitimately claims the SAME subject with a NEW
+// lease. The stale caller's eventual (delayed) release call must be a
+// no-op against that newer lease, not clear it out from under Tick.
+func TestReleaseClaim_DoesNotClearANewerLease(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T12:00:00Z")
+
+	appendAt(t, ctx, s, "acct_release_cas", "subject.created", now, nil)
+
+	// The "stale" caller's own claim — its ClaimedUntil is what a delayed
+	// release call will (incorrectly, if unconditional) try to clear
+	// later.
+	stale, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_release_cas", now)
+	if err != nil {
+		t.Fatalf("stale claim: %v", err)
+	}
+
+	// That claim is released for real through the ordinary path (standing
+	// in for however it actually became stale in production — an
+	// ambiguous commit, or a round that errored before UpsertVerdicts).
+	if err := s.ReleaseClaim(ctx, testTenant, "acct_release_cas", stale.ClaimedUntil); err != nil {
+		t.Fatalf("release the stale claim: %v", err)
+	}
+
+	// The worker's own Tick claims the subject for real, at a LATER
+	// instant so its ClaimedUntil is a genuinely DIFFERENT value than the
+	// stale claim's.
+	tickNow := now.Add(time.Hour)
+	tickClaims, err := s.ClaimDirtySubjects(ctx, tickNow, 0)
+	if err != nil {
+		t.Fatalf("ClaimDirtySubjects: %v", err)
+	}
+	var tick store.DirtySubject
+	for _, c := range tickClaims {
+		if c.Subject == "acct_release_cas" {
+			tick = c
+		}
+	}
+	if tick.Subject == "" {
+		t.Fatalf("expected Tick to claim acct_release_cas, got %+v", tickClaims)
+	}
+	if tick.ClaimedUntil.Equal(stale.ClaimedUntil) {
+		t.Fatalf("test setup broken: Tick's ClaimedUntil (%v) must differ from the stale claim's (%v)", tick.ClaimedUntil, stale.ClaimedUntil)
+	}
+
+	// The stale caller's own (delayed) release call arrives now, still
+	// carrying its OWN old ClaimedUntil — it must be a no-op against
+	// Tick's newer lease, not clear it.
+	if err := s.ReleaseClaim(ctx, testTenant, "acct_release_cas", stale.ClaimedUntil); err != nil {
+		t.Fatalf("stale ReleaseClaim: %v", err)
+	}
+
+	// Tick's lease must have survived: a fresh evaluate claim attempt at
+	// tickNow must see *store.ErrBusy, not succeed.
+	_, err = s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_release_cas", tickNow)
+	var busy *store.ErrBusy
+	if !errors.As(err, &busy) {
+		t.Fatalf("expected Tick's lease to survive the stale release (want *store.ErrBusy), got %v", err)
 	}
 }
 

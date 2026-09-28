@@ -43,16 +43,21 @@ func (e *ErrBusy) Error() string {
 // caller (worker.EvaluateSubject) can't tell which happened from the
 // error alone, so it treats this specific error as "may have claimed the
 // subject" and issues a best-effort release with its own timeout,
-// independent of the (already expired) caller context — ReleaseClaim is
-// unconditional and idempotent, so releasing a claim that never actually
-// landed is a harmless no-op. This is deliberately NOT used for ErrBusy,
-// ErrNotFound, or ErrNotScorable: those are returned before any commit is
-// attempted (or, for the lost-race case, after a definitive
-// zero-rows-affected UPDATE), so there is nothing of ours to release —
-// treating them as ambiguous too would risk releasing a DIFFERENT,
-// legitimate concurrent claimant's lease.
+// independent of the (already expired) caller context. This is
+// deliberately NOT used for ErrBusy, ErrNotFound, or ErrNotScorable: those
+// are returned before any commit is attempted (or, for the lost-race case,
+// after a definitive zero-rows-affected UPDATE), so there is nothing of
+// ours to release — treating them as ambiguous too would risk releasing a
+// DIFFERENT, legitimate concurrent claimant's lease.
+//
+// ClaimedUntil (T3, round 3) is the exact value this ambiguous commit
+// attempted to set — the caller passes it back to ReleaseClaim's own
+// compare-and-clear (see that method's doc comment) so a best-effort
+// release here can never clear a DIFFERENT lease a concurrent claimant
+// took after this commit's own outcome became uncertain.
 type ErrClaimAmbiguous struct {
-	Err error
+	Err          error
+	ClaimedUntil time.Time
 }
 
 func (e *ErrClaimAmbiguous) Error() string {
@@ -146,7 +151,8 @@ func (s *Store) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject str
 	if err := tx.Commit(ctx); err != nil {
 		// R2 (round 2 fix round): wrap distinctly from the other error
 		// paths above — see ErrClaimAmbiguous.
-		return DirtySubject{}, &ErrClaimAmbiguous{Err: fmt.Errorf("store: commit evaluate-claim transaction: %w", err)}
+		return DirtySubject{}, &ErrClaimAmbiguous{Err: fmt.Errorf("store: commit evaluate-claim transaction: %w", err), ClaimedUntil: claimedUntil}
 	}
+	d.ClaimedUntil = claimedUntil
 	return d, nil
 }

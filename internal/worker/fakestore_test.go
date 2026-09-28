@@ -72,8 +72,8 @@ func (f *fakeStore) RecordSubjectFailure(ctx context.Context, tenant, subject st
 	return f.real.RecordSubjectFailure(ctx, tenant, subject, nextAttemptAt)
 }
 
-func (f *fakeStore) ReleaseClaim(ctx context.Context, tenant, subject string) error {
-	return f.real.ReleaseClaim(ctx, tenant, subject)
+func (f *fakeStore) ReleaseClaim(ctx context.Context, tenant, subject string, claimedUntil time.Time) error {
+	return f.real.ReleaseClaim(ctx, tenant, subject, claimedUntil)
 }
 
 func (f *fakeStore) ExtendClaims(ctx context.Context, tenants, subjects []string, now time.Time) error {

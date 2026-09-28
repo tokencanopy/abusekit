@@ -969,7 +969,7 @@ func TestSubjectView_FiltersSignalsToCurrentConfigRules(t *testing.T) {
 		t.Fatalf("UpsertVerdicts: %v", err)
 	}
 
-	view, err := s.SubjectView(ctx, testTenant, "acct_filter_rules", []string{"current_rule"})
+	view, err := s.SubjectView(ctx, testTenant, "acct_filter_rules", []store.CurrentRule{{Name: "current_rule", Advise: true}})
 	if err != nil {
 		t.Fatalf("SubjectView: %v", err)
 	}
@@ -1003,7 +1003,13 @@ func TestSubjectView_DegradedOnlyFromCurrentConfigRules(t *testing.T) {
 		t.Fatalf("UpsertVerdicts: %v", err)
 	}
 
-	excluded, err := s.SubjectView(ctx, testTenant, "acct_filter_degraded", []string{"some_other_current_rule"})
+	// some_other_current_rule is deliberately Advise: false (shadow) here —
+	// this sub-case is specifically about a RETIRED rule's own unscored
+	// signal not degrading once excluded by name; a shadow decoy entry
+	// with no recorded verdict at all must not itself trigger T4's
+	// separate "missing ADVISE rule" check (see
+	// TestSubjectView_MissingAdviseRuleDegrades for that).
+	excluded, err := s.SubjectView(ctx, testTenant, "acct_filter_degraded", []store.CurrentRule{{Name: "some_other_current_rule", Advise: false}})
 	if err != nil {
 		t.Fatalf("SubjectView (excluded): %v", err)
 	}
@@ -1011,12 +1017,77 @@ func TestSubjectView_DegradedOnlyFromCurrentConfigRules(t *testing.T) {
 		t.Fatalf("expected a retired rule's unscored signal, excluded by the current config filter, to not degrade")
 	}
 
-	included, err := s.SubjectView(ctx, testTenant, "acct_filter_degraded", []string{"retired_rule"})
+	included, err := s.SubjectView(ctx, testTenant, "acct_filter_degraded", []store.CurrentRule{{Name: "retired_rule", Advise: true}})
 	if err != nil {
 		t.Fatalf("SubjectView (included): %v", err)
 	}
 	if !included.Degraded {
 		t.Fatalf("expected an unscored advise rule that IS in the current config filter to degrade")
+	}
+}
+
+// TestSubjectView_MissingAdviseRuleDegrades is T4 (round 3): a currently
+// configured advise rule with NO recorded verdict at all — not even as
+// unscored — must degrade the view exactly like one that IS recorded but
+// unscored (design §5: "absence of an advise signal must never look fully
+// healthy"). Before this fix, an omitted rule (round 2's R3: a syncOnly
+// evaluate round with nothing to carry forward for a non-local rule omits
+// it entirely rather than recording it unscored) was invisible to
+// SubjectView — it never appeared in the verdicts query at all, so its
+// absence looked identical to "this subject has no such rule," silently
+// reporting a fully-healthy, non-degraded view missing an advise opinion.
+// The subject's current_tier — materialized from whatever WAS actually
+// scored — is unaffected; only Degraded changes.
+func TestSubjectView_MissingAdviseRuleDegrades(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-01-01T00:00:00Z")
+
+	e := mkEvent(t, "evt_1", "acct_missing_advise", "resource.created", now, map[string]any{"kind": "agent", "name": "a"})
+	if _, err := s.AppendEvents(ctx, testTenant, "e2a-server", []event.Event{e}); err != nil {
+		t.Fatalf("AppendEvents: %v", err)
+	}
+
+	// scored_rule is the only rule that ever actually recorded a verdict —
+	// missing_advise_rule is currently configured but has NOTHING recorded
+	// for this subject at all.
+	risk := 0.9
+	records := []store.VerdictRecord{
+		{Rule: "scored_rule", Mode: "advise", Scorer: "local", Model: "local", Probs: map[string]float64{"benign": 0.1},
+			Risk: &risk, Flagged: true, InputHash: "h1", Status: "scored"},
+	}
+	if _, err := s.UpsertVerdicts(ctx, testTenant, "acct_missing_advise", 1, records, store.SubjectSummary{Tier: "high", Score: risk}); err != nil {
+		t.Fatalf("UpsertVerdicts: %v", err)
+	}
+
+	view, err := s.SubjectView(ctx, testTenant, "acct_missing_advise", []store.CurrentRule{
+		{Name: "scored_rule", Advise: true},
+		{Name: "missing_advise_rule", Advise: true},
+	})
+	if err != nil {
+		t.Fatalf("SubjectView: %v", err)
+	}
+	if !view.Degraded {
+		t.Fatalf("expected a currently-configured advise rule with NO recorded verdict at all to degrade the view")
+	}
+	if view.Tier != "high" {
+		t.Fatalf("expected the tier to still reflect what WAS scored (high), got %q", view.Tier)
+	}
+	if len(view.Signals) != 1 || view.Signals[0].Rule != "scored_rule" {
+		t.Fatalf("expected exactly one signal (the rule that WAS scored) since missing_advise_rule has no row at all, got %+v", view.Signals)
+	}
+
+	// A missing SHADOW rule, by contrast, must not degrade — matching the
+	// per-row unscored check's own advise-only scope.
+	viewShadow, err := s.SubjectView(ctx, testTenant, "acct_missing_advise", []store.CurrentRule{
+		{Name: "scored_rule", Advise: true},
+		{Name: "missing_shadow_rule", Advise: false},
+	})
+	if err != nil {
+		t.Fatalf("SubjectView (shadow): %v", err)
+	}
+	if viewShadow.Degraded {
+		t.Fatalf("expected a missing SHADOW rule to NOT degrade the view")
 	}
 }
 

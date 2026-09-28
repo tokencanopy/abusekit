@@ -357,6 +357,20 @@ func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map
 	return out, nil
 }
 
+// CurrentRule is one entry in SubjectView's currentRules filter (T4, round
+// 3, generalizing S14's plain rule-name list): Advise records whether this
+// rule is advise-mode, which SubjectView needs to correctly flag a MISSING
+// advise rule — one currently configured but with NO recorded verdict at
+// all for this subject, e.g. a non-local rule a syncOnly evaluate round
+// omitted entirely because it had nothing to carry forward (round 2's R3)
+// — as degraded, not just one it has an unscored record for. A shadow-mode
+// rule missing entirely must NOT degrade the subject, matching the
+// existing unscored-signal check's own advise-only scope.
+type CurrentRule struct {
+	Name   string
+	Advise bool
+}
+
 // SubjectView returns the read model for (tenant, subject), or
 // ErrNotFound if the subject has never been seen by this tenant (design
 // §4.4: "404 not_found only for a subject never seen in this tenant" — a
@@ -370,7 +384,18 @@ func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map
 // view. Pass nil to see every rule that ever recorded a verdict for this
 // subject (e.g. for an operator/debug view), matching the pre-S14
 // behavior.
-func (s *Store) SubjectView(ctx context.Context, tenant, subject string, currentRules []string) (*SubjectView, error) {
+//
+// T4 (round 3): design §5's "absence of an advise signal must never look
+// fully healthy" — a currently-configured advise rule with NO verdict row
+// at all (never scored, not even as unscored) degrades the subject exactly
+// like one whose latest recorded signal IS unscored. Before this fix, an
+// omitted rule (round 2's R3: no prior result to carry forward under
+// syncOnly, so nothing was ever recorded for it) was invisible to this
+// method entirely — it simply never appeared in the verdicts query, so its
+// absence looked identical to "this subject has no such rule at all,"
+// silently reporting a fully-healthy, non-degraded view missing an
+// advise-mode opinion.
+func (s *Store) SubjectView(ctx context.Context, tenant, subject string, currentRules []CurrentRule) (*SubjectView, error) {
 	v := &SubjectView{Subject: subject}
 	var (
 		currentScore    *float64
@@ -413,8 +438,12 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 		WHERE tenant = $1 AND subject = $2`
 	args := []any{tenant, subject}
 	if len(currentRules) > 0 {
+		names := make([]string, len(currentRules))
+		for i, cr := range currentRules {
+			names[i] = cr.Name
+		}
 		query += ` AND rule = ANY($3)`
-		args = append(args, currentRules)
+		args = append(args, names)
 	}
 	// S14: a DISTINCT ON tiebreak solely on scored_at is non-deterministic
 	// when two verdicts for the same rule share an identical timestamp
@@ -429,6 +458,7 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 	}
 	defer rows.Close()
 
+	seen := make(map[string]bool, len(currentRules))
 	for rows.Next() {
 		var sig SubjectSignal
 		var risk *float64
@@ -442,10 +472,23 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 		if sig.Mode == "advise" && sig.Status == "unscored" {
 			v.Degraded = true
 		}
+		seen[sig.Rule] = true
 		v.Signals = append(v.Signals, sig)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: iterate verdicts for subject %s: %w", subject, err)
+	}
+
+	// T4 (round 3): a currently-configured ADVISE rule with no verdict row
+	// at all (never even recorded as unscored — see CurrentRule's own doc
+	// comment) degrades the subject exactly like one that IS recorded but
+	// unscored. A missing SHADOW rule does not — matching the per-row check
+	// above, which has always been advise-only.
+	for _, cr := range currentRules {
+		if cr.Advise && !seen[cr.Name] {
+			v.Degraded = true
+			break
+		}
 	}
 
 	return v, nil

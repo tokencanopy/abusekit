@@ -344,14 +344,15 @@ func TestEvaluateSubject_SyncOnlyOmitsRuleWithNoPriorResult(t *testing.T) {
 	// The claim must have been released, not leaked by the all-omitted
 	// round's evaluatedNow=false path: a normal ClaimSubjectForEvaluate
 	// right afterward must not see *store.ErrBusy.
-	if _, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_eval_nonlocal", now); err != nil {
+	claimed, err := s.ClaimSubjectForEvaluate(ctx, testTenant, "acct_eval_nonlocal", now)
+	if err != nil {
 		var busy *store.ErrBusy
 		if errors.As(err, &busy) {
 			t.Fatalf("expected the claim to have been released after an all-omitted round, got *store.ErrBusy: %+v", busy)
 		}
 		t.Fatalf("ClaimSubjectForEvaluate: %v", err)
 	}
-	if err := s.ReleaseClaim(ctx, testTenant, "acct_eval_nonlocal"); err != nil {
+	if err := s.ReleaseClaim(ctx, testTenant, "acct_eval_nonlocal", claimed.ClaimedUntil); err != nil {
 		t.Fatalf("ReleaseClaim: %v", err)
 	}
 
@@ -635,10 +636,18 @@ type ambiguousClaimStore struct {
 }
 
 func (a ambiguousClaimStore) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject string, now time.Time) (store.DirtySubject, error) {
-	if _, err := a.Store.ClaimSubjectForEvaluate(ctx, tenant, subject, now); err != nil {
+	d, err := a.Store.ClaimSubjectForEvaluate(ctx, tenant, subject, now)
+	if err != nil {
 		return store.DirtySubject{}, err
 	}
-	return store.DirtySubject{}, &store.ErrClaimAmbiguous{Err: errors.New("synthetic: simulated commit-outcome ambiguity")}
+	// T3 (round 3): ClaimedUntil must be the REAL claim's own value — a
+	// real ClaimSubjectForEvaluate populates ErrClaimAmbiguous.ClaimedUntil
+	// from exactly what it just committed (evaluate.go), and
+	// ReleaseClaim's compare-and-clear depends on that value matching what
+	// is actually in the row. Leaving it as the zero value here would make
+	// EvaluateSubject's best-effort release a guaranteed no-op — it would
+	// never actually clear the real lease this wrapper just took.
+	return store.DirtySubject{}, &store.ErrClaimAmbiguous{Err: errors.New("synthetic: simulated commit-outcome ambiguity"), ClaimedUntil: d.ClaimedUntil}
 }
 
 // TestEvaluateSubject_ReleasesAmbiguousClaimCommit is R2 (round 2 fix
@@ -725,14 +734,15 @@ func TestEvaluateSubject_ShortDeadlineDuringClaimNeverLeaksLease(t *testing.T) {
 
 	// The claim must not be leaked: a direct claim attempt with a normal
 	// context must not see *store.ErrBusy.
-	if _, err := s.ClaimSubjectForEvaluate(context.Background(), testTenant, subject, now); err != nil {
+	claimed, err := s.ClaimSubjectForEvaluate(context.Background(), testTenant, subject, now)
+	if err != nil {
 		var busy *store.ErrBusy
 		if errors.As(err, &busy) {
 			t.Fatalf("expected no leaked claim after 50 short-deadline attempts, got *store.ErrBusy: %+v", busy)
 		}
 		t.Fatalf("ClaimSubjectForEvaluate: %v", err)
 	}
-	if err := s.ReleaseClaim(context.Background(), testTenant, subject); err != nil {
+	if err := s.ReleaseClaim(context.Background(), testTenant, subject, claimed.ClaimedUntil); err != nil {
 		t.Fatalf("ReleaseClaim: %v", err)
 	}
 
