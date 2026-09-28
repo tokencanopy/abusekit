@@ -160,12 +160,28 @@ product ◀─GET score / POST evaluate──────── serve ◀── 
 
 `POST /v1/events`, batch of 1–100, body ≤1 MiB.
 
-**Auth [r2]:** `X-Abusekit-Key: <producer key id>`, `X-Abusekit-Timestamp: <RFC3339>`,
-`X-Abusekit-Signature: hex(hmac-sha256(secret, method \n path?query \n timestamp \n key_id \n
-sha256(body)))`. Timestamp within ±5 min; constant-time compare; the same scheme covers every
+**Auth [r2, amended S3]:** `X-Abusekit-Key: <producer key id>`, `X-Abusekit-Timestamp: <RFC3339>`,
+`X-Abusekit-Nonce: <hex, ≥16 random bytes>` **[S3]**, `X-Abusekit-Signature: hex(hmac-sha256(secret,
+method \n path?query \n timestamp \n key_id \n nonce \n sha256(body)))` **[S3: nonce added to the
+signed payload]**. Timestamp within ±5 min; constant-time compare; the same scheme covers every
 endpoint including GET (body hash of the empty string). Key scopes: `events`, `labels`, `read`,
 `backfill`. A producer key has `events` only; label keys are issued to the operator UI; `backfill`
 skips the clock-skew check and never fires webhooks.
+
+**[S3] Nonce and replay window:** the timestamp alone does not prevent replay — a captured request
+stays valid to resend for the whole ±5 min it remains "fresh" by the check above. The nonce is a
+per-request random value the server remembers per `(key, nonce)` for at least as long as that
+request's own timestamp could still independently pass the freshness check: `max(received_at,
+timestamp) + 5 min` for an ordinary key. This is `received_at`-anchored rather than a fixed window
+from the timestamp alone, because a request signed near the future edge of the ±5 min window (e.g.
+timestamp = now+4 min) would otherwise have its replay record expire only 1 minute after the
+timestamp itself, while the timestamp remained independently acceptable for a further 4 minutes —
+letting the SAME request be replayed again once the record (but not the timestamp's own validity)
+had lapsed. A `backfill`-scoped key skips the timestamp-freshness check entirely, so it has no
+timestamp-derived bound to anchor a replay record to at all; it instead gets a flat 24 h replay
+window from `received_at`, matching this design's own ±24 h backfill-adjacent tolerance elsewhere. A
+caller retrying a request (e.g. after a `5xx`) must sign the retry with a FRESH nonce — reusing the
+original request's nonce makes a legitimate retry indistinguishable from a replay.
 
 Event: `{id (required, ≤64), subject (≤256), type ([a-z_.]+ ≤64), at (RFC3339 UTC, ±24 h unless
 backfill scope), links? {email_hash?, card_fingerprint_hash?, ip24_hash?, asn?, ua_hash?,
