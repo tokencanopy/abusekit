@@ -645,3 +645,20 @@ func TestReplay_FirstDayBurstThenQuietBand(t *testing.T) {
 	}
 	assertBand(t, "first_day_burst_then_quiet", view.Score, 0.56, 0.62)
 }
+
+// TestReplay_EstablishedProductCopyBrandMentionStaysLow replays
+// eval/fixtures/established_product_copy_brand_mention.jsonl — round 2's
+// R7 required outcome: an established (2-month-old), paid account
+// routinely sending ordinary product-update copy that happens to mention
+// a brand ("Our product now integrates with Glowbank Calendar" — not a
+// lure, and not a phrase any community/integration gate exempts) must not
+// get a PERMANENT subject_brand_match lift from that routine mention.
+// ageDecayFactor discounts it to its 0.2 floor by this account's age, so
+// this fixture stays low.
+func TestReplay_EstablishedProductCopyBrandMentionStaysLow(t *testing.T) {
+	view := runReplay(t, "established_product_copy_brand_mention.jsonl", "acct_example_established_product_copy_1")
+	if view.Tier != "low" {
+		t.Errorf("established_product_copy_brand_mention: tier = %q (score %v), want low\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "established_product_copy_brand_mention", view.Score, 0.0, 0.2)
+}

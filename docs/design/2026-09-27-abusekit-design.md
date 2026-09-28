@@ -423,6 +423,15 @@ captures — and all exclude a future-dated event (bounded by `now`, the same as
 - **S2 (double-counting):** `subject_brand_match` excludes any brand already credited by
   `name_brand_match`, capping the combined per-brand contribution of the two features at whichever
   one counted it first.
+- **[round 2] R7 (generic brands in subjects):** `subject_brand_match` is multiplied by
+  `ageDecayFactor` (the SAME function R1's volume features use), so an established sender's routine
+  product copy mentioning a generic big-tech brand ("...integrates with `<brand>` Calendar") is
+  discounted, not a permanent lift, as the account ages — floored at 0.2, never a hard 0, the
+  identical trade-off R1 already accepted for volume. Chosen over the alternative (treating a fixed
+  list of generic brands — apple, google, microsoft, amazon, stripe — as subject-exempt unless
+  another lure signal is present): age-decay fixes the underlying problem for EVERY brand, not just
+  five named ones, needs no definition of "another lure signal" to implement, and reuses a mechanism
+  already reviewed and tested for the identical purpose elsewhere in this same PR.
 - **S7 (webmail volume):** `webmail_sends_1h` is computed directly from the trailing window, never
   as `webmail_recipient_share * sends_1h` — the share is a lifetime ratio and the sum is a trailing
   window, so their product tracks neither quantity correctly. Every sum caps its per-event

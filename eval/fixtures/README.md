@@ -227,3 +227,11 @@ bounded which weight.
     so the burst has aged out of `sends_10m_max`/`sends_1h`/
     `webmail_sends_1h`/`distinct_recipients_1h`'s current window
     entirely, isolating the one feature (a permanent fact) that hasn't.
+
+- **S2b's round 2 (R7)** age-decays `subject_brand_match` (the same
+  `ageDecayFactor` R1 already applies to the volume features), so an
+  established sender's routine product copy mentioning a generic brand
+  doesn't read as a permanent lift forever. `established_product_copy_brand_mention.jsonl`
+  is the required fixture: a 2-month-old paid account routinely sending
+  "Our product now integrates with Glowbank Calendar" (ordinary product
+  copy, not a lure) — stays low.

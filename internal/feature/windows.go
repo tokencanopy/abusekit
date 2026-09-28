@@ -913,15 +913,20 @@ func exemptSubjectBrands(events []event.Event, brands BrandSet) map[string]struc
 // round: caps the combined per-brand contribution of name_brand_match
 // and subject_brand_match) and any brand in exemptBrands (R2 fix round:
 // exemptSubjectBrands' precise, per-brand integration-name exemption —
-// see its own doc comment), capped at subjectBrandMatchCap. A self-send
-// (isSelfSend) is excluded (round 2, R4, matching the design's own
-// [S2b] amendment: every send-volume/webmail feature measures reach to
-// OTHER recipients, and a self-test rehearsal mentioning a brand in its
-// own subject line is not evidence of a lure reaching anyone). content.sent
-// is already a windowed event type, so this decaying window's rescore
-// scheduling is already covered with no code change. Future-dated events
-// are excluded by withinWindow.
-func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration, brands BrandSet, alreadyNamed, exemptBrands map[string]struct{}) float64 {
+// see its own doc comment), capped at subjectBrandMatchCap, then
+// multiplied by ageDecayFactor (round 2, R7 fix round — see its own doc
+// comment for why: an established sender's routine product copy
+// mentioning a generic big-tech brand, e.g. "...integrates with <brand>
+// Calendar", must not read as a PERMANENT lift forever; the SAME smooth,
+// never-zero age discount R1 already applies to the volume features
+// applies here too). A self-send (isSelfSend) is excluded (round 2, R4,
+// matching the design's own [S2b] amendment: every send-volume/webmail
+// feature measures reach to OTHER recipients, and a self-test rehearsal
+// mentioning a brand in its own subject line is not evidence of a lure
+// reaching anyone). content.sent is already a windowed event type, so
+// this decaying window's rescore scheduling is already covered with no
+// code change. Future-dated events are excluded by withinWindow.
+func subjectBrandMatch(events []event.Event, now, firstSeenAt time.Time, window time.Duration, brands BrandSet, alreadyNamed, exemptBrands map[string]struct{}) float64 {
 	matched := make(map[string]struct{})
 	for _, e := range events {
 		if e.Type != "content.sent" || isSelfSend(e) || !withinWindow(e.At, now, window) {
@@ -941,5 +946,5 @@ func subjectBrandMatch(events []event.Event, now time.Time, window time.Duration
 			matched[name] = struct{}{}
 		}
 	}
-	return saturate(len(matched), subjectBrandMatchCap)
+	return saturate(len(matched), subjectBrandMatchCap) * ageDecayFactor(firstSeenAt, now)
 }

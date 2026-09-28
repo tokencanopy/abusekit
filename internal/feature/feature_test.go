@@ -1092,7 +1092,7 @@ func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
 	// S1: "tracking" inside the SUBJECT LINE itself must not suppress the
 	// match (only the account's own resource/agent name can).
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal package tracking update"})}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != 1 {
 		t.Errorf("subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
 	}
@@ -1106,7 +1106,7 @@ func TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand(t *testing.T) {
 	brands := mechanismBrands() // PayPal (+ alias), Apple, Amazon, Stripe, Wells Fargo, Bank of America
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account was flagged, also check Stripe"})}
 	exempt := map[string]struct{}{"PayPal": {}}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, exempt)
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, exempt)
 	if got != 1 {
 		t.Errorf("subject_brand_match = %v, want 1 (Stripe must still count; only PayPal is exempt)", got)
 	}
@@ -1116,7 +1116,7 @@ func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
 	brands := smallTestBrands()
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
 	alreadyNamed := map[string]struct{}{"PayPal": {}}
-	got := subjectBrandMatch(events, at(time.Hour), time.Hour, brands, alreadyNamed, nil)
+	got := subjectBrandMatch(events, at(time.Hour), base, time.Hour, brands, alreadyNamed, nil)
 	if got != 0 {
 		t.Errorf("subject_brand_match = %v, want 0 (S2: already counted by name_brand_match)", got)
 	}
@@ -1125,7 +1125,7 @@ func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
 func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
 	brands := NewBrandSet([]BrandEntry{{Name: "Fictaone"}, {Name: "Fictatwo"}, {Name: "Fictathree"}, {Name: "Fictafour"}})
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Fictaone Fictatwo Fictathree Fictafour update"})}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != subjectBrandMatchCap {
 		t.Errorf("subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
 	}
@@ -1143,9 +1143,39 @@ func TestSubjectBrandMatch_ExcludesSelfSends(t *testing.T) {
 	events := []event.Event{
 		ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account", "recipient_is_own_identity": true}),
 	}
-	got := subjectBrandMatch(events, at(30*time.Minute), time.Hour, brands, nil, nil)
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != 0 {
 		t.Errorf("subject_brand_match (self-send only) = %v, want 0", got)
+	}
+}
+
+// --- Round 2, R7: subject_brand_match is age-decayed, never a permanent
+// lift for an established sender ------------------------------------------
+
+// TestSubjectBrandMatch_AgeDecayed is round 2's R7: an established
+// sender's routine product copy ("...integrates with <brand> Calendar")
+// must not read the same, forever, as a brand-new account's — the
+// IDENTICAL subject-line brand mention reads lower for an old account
+// than for a young one, the same ageDecayFactor mechanism R1 already
+// applies to the volume features.
+func TestSubjectBrandMatch_AgeDecayed(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{ev("c1", "content.sent", 60*24*time.Hour, map[string]any{"subject_line": "Our product now integrates with PayPal Calendar"})}
+	now := at(60*24*time.Hour + 30*time.Minute)
+
+	// Young: firstSeenAt close to the event itself (age ~30min).
+	young := subjectBrandMatch(events, now, at(60*24*time.Hour), time.Hour, brands, nil, nil)
+	if young != 1 {
+		t.Errorf("subject_brand_match (young account) = %v, want 1", young)
+	}
+
+	// Established: firstSeenAt 60 days before the event (age ~60d).
+	old := subjectBrandMatch(events, now, base, time.Hour, brands, nil, nil)
+	if old >= young {
+		t.Errorf("subject_brand_match (established account, same mention) = %v, must read LOWER than a young account's %v", old, young)
+	}
+	if old <= 0 {
+		t.Errorf("subject_brand_match (established account) = %v, want > 0 (never a hard 0 — ageDecayFactor floors at 0.2)", old)
 	}
 }
 

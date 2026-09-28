@@ -263,7 +263,10 @@ type Features struct {
 	// counted by NameBrandMatch (S2 fix round) and any brand exempted by
 	// exemptSubjectBrands (round 2, R2 fix round: only the brand adjacent
 	// to an integration token in a LIVE, agent-kind resource's own name —
-	// not a whole-account exemption), capped at subjectBrandMatchCap.
+	// not a whole-account exemption), capped at subjectBrandMatchCap, then
+	// multiplied by ageDecayFactor (round 2, R7 fix round: an established
+	// sender's routine product copy mentioning a generic big-tech brand
+	// must not read as a permanent lift forever).
 	SubjectBrandMatch float64
 }
 
@@ -458,7 +461,7 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		WebmailRecipientShare:          webmailRecipientShare(events, now, webmail),
 		WebmailSends1h:                 webmailSends1h(events, now, firstSeenAt, windows.OneHour, webmail),
 		DistinctRecipients1h:           distinctRecipients1h(events, now, firstSeenAt, windows.OneHour),
-		SubjectBrandMatch:              subjectBrandMatch(events, now, windows.OneHour, brands, namedBrands, exemptBrands),
+		SubjectBrandMatch:              subjectBrandMatch(events, now, firstSeenAt, windows.OneHour, brands, namedBrands, exemptBrands),
 	}
 
 	return Result{
