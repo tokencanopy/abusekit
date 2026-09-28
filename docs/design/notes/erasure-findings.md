@@ -86,7 +86,7 @@ consolidated fix list) so a future S3b design doesn't have to rediscover them fr
 - List endpoint sort direction: ascending on an append-only ordering key (not `current_scored_at`
   DESC) so a mutating row can only be seen again, never skipped, during a paginated walk.
 
-`docs/plans/2026-09-27-v0-plan.md` should gain an "S3b" row for this work once a design pass
-addresses the above; migration number `008` is free again on `main` (this branch's own copy of
-`008_subjects_erased_at.sql` is superseded, not renumbered, since a future S3b design may need a
-different schema entirely).
+`docs/plans/2026-09-27-v0-plan.md` now has an "S3b" row (added on `feat/s3-http-surface`/PR #4's fix
+round) for this work, gated on a design pass addressing the above; migration number `008` is free
+again on `main` (this branch's own copy of `008_subjects_erased_at.sql` is superseded, not
+renumbered, since a future S3b design may need a different schema entirely).
