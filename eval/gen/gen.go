@@ -39,6 +39,15 @@ import (
 // eval/fixtures/*.jsonl convention (never a real date).
 var epoch = time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
 
+// labelEventType mirrors eval (package eval, unexported there too)'s own
+// "label"-typed event convention (fix round B1/T4): a row of this type
+// in the events file means "an operator/outcome label was recorded for
+// this subject at this instant", read only by neighbour evidence
+// resolution (linked_labelled_abusive_n), never by feature.Extract
+// itself. Duplicated here rather than imported since eval/gen is its own
+// `package main`, not `package eval`.
+const labelEventType = "label"
+
 // Options controls Generate's output.
 type Options struct {
 	// Seed drives every random choice (domain counts, jitter, decline
@@ -253,6 +262,17 @@ func decisionAtMap(events []event.Event) map[string]string {
 	var firstExternal time.Time
 	haveExternal := false
 	for _, e := range events {
+		if e.Type == labelEventType {
+			// Fix round T4: a `label` event (see churn.go's own use of
+			// it) is never feature-relevant activity — eval's real
+			// loader routes it out of a subject's own event history
+			// entirely (see replay.go's parseEventRows) — so it must
+			// not move this subject's OWN "last event" anchor either,
+			// or its "full" decision point could land far enough past
+			// its own permanent deletion to trip fix round B2's
+			// decision_after_deletion rejection.
+			continue
+		}
 		if e.At.Before(first) {
 			first = e.At
 		}

@@ -98,6 +98,16 @@ func genChurnChain(rng *rand.Rand, kind string, chainIdx, length int) []incarnat
 		}
 
 		b.add(t, "subject.deleted", event.Links{}, map[string]any{"mode": "permanent"})
+		t += time.Duration(10+rng.Intn(20)) * time.Second
+		// Fix round T4: an operator/outcome label recorded shortly after
+		// takedown, so linked_labelled_abusive_n (design §4.2, weight
+		// 1.5) is actually exercised by this corpus at all — B1 closed
+		// off ground-truth leakage into this feature, so without an
+		// EVENT like this one, nothing anywhere in the generated corpus
+		// would ever set it. gen.go's decisionAtMap excludes `label`
+		// events from this incarnation's own "last event" anchor, so
+		// this never trips the B2 decision_after_deletion check.
+		b.add(t, labelEventType, event.Links{}, map[string]any{"label": "abusive"})
 
 		incs = append(incs, incarnation{
 			events: b.events,
