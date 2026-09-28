@@ -12,46 +12,60 @@ import (
 	"github.com/tokencanopy/abusekit/internal/store"
 )
 
-// TestEvaluateSubject_ReachesHighBeforeFirstSend mirrors
-// TestReplay_BurstReachesHighBeforeFirstSend (replay_test.go) but through
-// EvaluateSubject instead of Tick — proving the synchronous path reaches
-// the same verdict the async worker loop does, from onboarding signals
-// alone, strictly before the fixture's first send.
-func TestEvaluateSubject_ReachesHighBeforeFirstSend(t *testing.T) {
+// TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend is design §1
+// success criterion 2(b) / plan.md's S3 "Done when": eval/fixtures/
+// fast.jsonl compresses burst.jsonl's exact shape (fraud-declined
+// attempts, a prepaid success, a quick upgrade, a resource burst,
+// self-send rehearsal) so its first EXTERNAL content.sent lands 30s after
+// signup — "agents and first send inside one minute". This replays only
+// the setup events (everything before that first external send) through
+// the SYNCHRONOUS POST .../evaluate path (never Tick), proving the
+// operator scenario reaches `high` on the call a product makes before its
+// first external send, and records the call's own latency as the "fast"
+// criterion's evidence against design's <=3000ms deadline ceiling.
+func TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	cfg := loadShippedConfig(t)
 
-	all := loadFixture(t, "../../eval/fixtures/burst.jsonl")
+	all := loadFixture(t, "../../eval/fixtures/fast.jsonl")
 	var setup []event.Event
 	for _, e := range all {
-		if e.Type == "content.sent" {
+		if e.Type == "content.sent" && !isSelfSend(e) {
 			break
 		}
 		setup = append(setup, e)
 	}
 	if len(setup) == 0 || len(setup) == len(all) {
-		t.Fatalf("burst.jsonl fixture shape assumption broken: got %d setup events of %d total", len(setup), len(all))
+		t.Fatalf("fast.jsonl fixture shape assumption broken: got %d setup events of %d total", len(setup), len(all))
+	}
+	firstExternalSendAt := firstExternalSendTime(t, all)
+	signupAt := all[0].At
+	if window := firstExternalSendAt.Sub(signupAt); window > time.Minute {
+		t.Fatalf("fast.jsonl fixture shape assumption broken: first external send lands %v after signup, want <= 1 minute", window)
 	}
 	ingestFixture(t, ctx, s, setup)
 
-	now := lastEventAt(setup).Add(2 * time.Second)
+	now := lastEventAt(setup).Add(time.Second)
+	if !now.Before(firstExternalSendAt) {
+		t.Fatalf("fixture timing assumption broken: evaluate instant (%v) is not before the first external send (%v)", now, firstExternalSendAt)
+	}
 	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 
 	start := time.Now()
-	verdict, err := w.EvaluateSubject(ctx, testTenant, "acct_example_burst_1", 3*time.Second)
+	verdict, err := w.EvaluateSubject(ctx, testTenant, "acct_example_fast_1", 3*time.Second)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("EvaluateSubject: %v", err)
 	}
 	if verdict.Tier != "high" {
-		t.Errorf("evaluate (before first send): tier = %q (score %v), want high\nsignals: %+v", verdict.Tier, verdict.Score, verdict.Signals)
+		t.Errorf("fast.jsonl evaluate (before first external send): tier = %q (score %v), want high\nsignals: %+v", verdict.Tier, verdict.Score, verdict.Signals)
 	}
 	if verdict.Degraded {
-		t.Errorf("evaluate (before first send): degraded = true, want false (the local rule should always answer)")
+		t.Errorf("fast.jsonl evaluate: degraded = true, want false (the local rule should always answer)")
 	}
 	// "the design's latency target": the local scorer is a pure in-process
 	// computation with no network call, so a synchronous evaluate call
@@ -60,15 +74,31 @@ func TestEvaluateSubject_ReachesHighBeforeFirstSend(t *testing.T) {
 	if elapsed > time.Second {
 		t.Errorf("evaluate took %v, want comfortably under the 3s deadline (local scorer only)", elapsed)
 	}
-	t.Logf("fast-fixture evaluate latency: %v", elapsed)
+	t.Logf("fast.jsonl evaluate latency: %v (design's deadline ceiling: 3s)", elapsed)
 
-	view, err := s.SubjectView(ctx, testTenant, "acct_example_burst_1", nil)
+	view, err := s.SubjectView(ctx, testTenant, "acct_example_fast_1", nil)
 	if err != nil {
 		t.Fatalf("SubjectView: %v", err)
 	}
 	if view.Tier != "high" {
 		t.Fatalf("expected the committed verdict to also read back as high, got %q", view.Tier)
 	}
+}
+
+func isSelfSend(e event.Event) bool {
+	own, _ := e.Data["recipient_is_own_identity"].(bool)
+	return own
+}
+
+func firstExternalSendTime(t *testing.T, events []event.Event) time.Time {
+	t.Helper()
+	for _, e := range events {
+		if e.Type == "content.sent" && !isSelfSend(e) {
+			return e.At
+		}
+	}
+	t.Fatalf("fixture has no external content.sent event")
+	return time.Time{}
 }
 
 // TestEvaluateSubject_NotFoundForUnseenSubject proves EvaluateSubject

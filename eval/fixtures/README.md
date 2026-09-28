@@ -38,6 +38,9 @@ The seed for each hash actually in the fixtures:
 | `dormant_then_blast.jsonl` | `email_hash` | `dormant-blast-email` |
 | `churn.jsonl` | `email_hash` (all 12 subjects) | `churn-shared-email` |
 | `churn.jsonl` | `card_fingerprint_hash` (all 12 subjects) | `churn-shared-card` |
+| `fast.jsonl` | `email_hash` | `fast-signup-email` |
+| `fast.jsonl` | `card_fingerprint_hash` (declines) | `fast-card-declined` |
+| `fast.jsonl` | `card_fingerprint_hash` (success) | `fast-card-prepaid` |
 
 Regenerate any of these with `printf '%s' '<seed>' \| shasum -a 256` rather
 than editing the hex by hand — an earlier version of `burst.jsonl`,
@@ -60,6 +63,16 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   a signup email hash and a card fingerprint, each created → paid → its
   first `resource.created` → a PERMANENT deletion; every subject from the
   third onward reaches `high` on its own first `resource.created`.
+- `fast.jsonl` — design §1 success criterion 2(b) / plan.md's deferred-to-S3
+  note: the same burst.jsonl shape (fraud-declined attempts, a prepaid
+  success, a quick upgrade, a burst of agent/key creation, self-send
+  rehearsal) compressed so its first EXTERNAL `content.sent` lands 30s
+  after signup — "agents and first send inside one minute" — instead of an
+  hour later. Replayed via the setup events only (everything before that
+  first external send) against the synchronous `POST .../evaluate`
+  endpoint (`internal/worker.TestEvaluateSubject_ReachesHighBeforeFirstSend`),
+  not the worker's async Tick loop — this is what actually satisfies "fast"
+  as distinct from `burst.jsonl`'s own async-within-15s criterion.
 - `benign_transactional.jsonl`, `benign_fast_onboarding.jsonl`,
   `benign_integration_heavy.jsonl` — ordinary accounts (a slow real
   upgrade; a fast but unremarkable developer onboarding; an org wiring up
