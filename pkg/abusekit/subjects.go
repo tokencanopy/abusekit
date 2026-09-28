@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 )
 
@@ -36,8 +35,14 @@ type Subject struct {
 	EventsSinceScore int64      `json:"events_since_score"`
 	ScoredAt         *time.Time `json:"scored_at,omitempty"`
 	Signals          []Signal   `json:"signals"`
-	// EvaluatedNow is true only on Evaluate's response.
+	// EvaluatedNow is true only on Evaluate's response, when it produced a
+	// genuinely fresh round.
 	EvaluatedNow bool `json:"evaluated_now,omitempty"`
+	// EvaluateNote explains why Evaluate did NOT produce a fresh round
+	// (S1 fix round) even though the call itself succeeded (200, not an
+	// error) — currently only "deadline_exceeded". Empty on GET's response
+	// and on a successful (EvaluatedNow true) Evaluate response.
+	EvaluateNote string `json:"evaluate_note,omitempty"`
 }
 
 // ErrNotFound-style checking: callers should check errors.As(err,
@@ -63,10 +68,18 @@ func (c *Client) Subject(ctx context.Context, id string) (Subject, error) {
 const DefaultEvaluateDeadline = 3000 * time.Millisecond
 
 // Evaluate calls POST /v1/subjects/{subject}/evaluate (design §4.4):
-// scores the subject synchronously and returns the fresh verdict.
-// deadline <= 0 uses DefaultEvaluateDeadline; deadline is rounded to
-// whole milliseconds and capped at DefaultEvaluateDeadline (the server
+// scores the subject synchronously when possible and returns the current
+// view either way (S1 fix round: a subject that's class internal/
+// synthetic, busy, or cut short by the deadline is still a 200 with the
+// stored view and EvaluatedNow=false — see Subject.EvaluateNote — not an
+// error). deadline <= 0 uses DefaultEvaluateDeadline; deadline is rounded
+// to whole milliseconds and capped at DefaultEvaluateDeadline (the server
 // rejects anything larger).
+//
+// A 409 (the subject is busy — claimed elsewhere, or in failure backoff)
+// still returns as an *APIError with Code "subject_busy" and a real
+// RetryAfter, since that genuinely is a "try again shortly" condition
+// distinct from "here is the subject's current state."
 //
 // NOT retried: unlike a read, a retried evaluate call could be denied by
 // the server's own 1/s per-subject rate limit (design §4.4) precisely
@@ -91,95 +104,4 @@ func (c *Client) Evaluate(ctx context.Context, id string, deadline time.Duration
 		return Subject{}, fmt.Errorf("abusekit: decode evaluate response: %w", err)
 	}
 	return s, nil
-}
-
-// SubjectListItem is one row of ListSubjects' response.
-type SubjectListItem struct {
-	Subject   string     `json:"subject"`
-	Tier      string     `json:"tier"`
-	Score     float64    `json:"score"`
-	VerdictID int64      `json:"verdict_id,omitempty"`
-	ScoredAt  *time.Time `json:"scored_at,omitempty"`
-}
-
-// ListOptions filters/pages a ListSubjects call (design §4.4). Every field
-// is optional; Limit <= 0 uses the server's own default.
-type ListOptions struct {
-	Tier   string
-	Class  string
-	Since  time.Time
-	Cursor string
-	Limit  int
-}
-
-// ListResult is ListSubjects' response. NextCursor is "" when there is no
-// further page.
-type ListResult struct {
-	Subjects   []SubjectListItem `json:"subjects"`
-	NextCursor string            `json:"-"`
-}
-
-// ListSubjects calls GET /v1/subjects (design §4.4). IDEMPOTENT and
-// retried on a transport error or 429/5xx.
-func (c *Client) ListSubjects(ctx context.Context, opts ListOptions) (ListResult, error) {
-	limit := ""
-	if opts.Limit > 0 {
-		limit = strconv.Itoa(opts.Limit)
-	}
-	since := ""
-	if !opts.Since.IsZero() {
-		since = opts.Since.UTC().Format(time.RFC3339)
-	}
-	query := buildQuery([][2]string{
-		{"tier", opts.Tier},
-		{"class", opts.Class},
-		{"since", since},
-		{"cursor", opts.Cursor},
-		{"limit", limit},
-	})
-
-	respBody, _, err := c.doRetryable(ctx, requestSpec{method: http.MethodGet, path: "/v1/subjects" + query})
-	if err != nil {
-		return ListResult{}, err
-	}
-	var wire struct {
-		Subjects   []SubjectListItem `json:"subjects"`
-		NextCursor *string           `json:"next_cursor"`
-	}
-	if err := json.Unmarshal(respBody, &wire); err != nil {
-		return ListResult{}, fmt.Errorf("abusekit: decode list response: %w", err)
-	}
-	out := ListResult{Subjects: wire.Subjects}
-	if wire.NextCursor != nil {
-		out.NextCursor = *wire.NextCursor
-	}
-	return out, nil
-}
-
-// EraseResult is DELETE /v1/subjects/{subject}'s response (design §4.4).
-type EraseResult struct {
-	Subject       string    `json:"subject"`
-	Erased        bool      `json:"erased"`
-	Mode          string    `json:"mode"`
-	ErasedAt      time.Time `json:"erased_at"`
-	AlreadyErased bool      `json:"already_erased"`
-}
-
-// Delete calls DELETE /v1/subjects/{subject} (design §4.4's legal erasure
-// request; key scope `erase`, operator use only). IDEMPOTENT and retried
-// on a transport error or 429/5xx: a repeat call against an
-// already-tombstoned subject succeeds again with AlreadyErased:true, and
-// a repeat call against an already-purged subject 404s both times
-// (store.EraseSubject's own documented behavior) — either way, retrying
-// never double-erases anything.
-func (c *Client) Delete(ctx context.Context, id string) (EraseResult, error) {
-	respBody, _, err := c.doRetryable(ctx, requestSpec{method: http.MethodDelete, path: "/v1/subjects/" + url.PathEscape(id)})
-	if err != nil {
-		return EraseResult{}, err
-	}
-	var r EraseResult
-	if err := json.Unmarshal(respBody, &r); err != nil {
-		return EraseResult{}, fmt.Errorf("abusekit: decode delete response: %w", err)
-	}
-	return r, nil
 }

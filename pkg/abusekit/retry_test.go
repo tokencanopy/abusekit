@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -104,4 +105,65 @@ func asAPIError(t *testing.T, err error, target **abusekit.APIError) bool {
 		*target = ae
 	}
 	return ok
+}
+
+// TestClient_NegativeMaxRetriesReturnsError is S7 fix round: WithMaxRetries(-1)
+// must surface a clear error, never a silently-empty (nil, nil, nil) from a
+// retry loop whose bound condition is never true.
+func TestClient_NegativeMaxRetriesReturnsError(t *testing.T) {
+	ts, _ := flakyServer(t, 0, `{"subject":"acct_x","tier":"unknown","signals":[]}`)
+
+	c := abusekit.New(ts.URL, "k", "s", abusekit.WithMaxRetries(-1))
+	_, err := c.Subject(context.Background(), "acct_x")
+	if err == nil {
+		t.Fatalf("expected an error for a negative maxRetries, got nil")
+	}
+}
+
+// TestClient_EachAttemptSignsWithAFreshNonce is B1 fix round: every HTTP
+// attempt this client makes (including retries of the identical logical
+// request) must carry its OWN X-Abusekit-Nonce value — reusing one across
+// attempts would make a legitimate retry indistinguishable from a replay
+// to the real server's replay cache (proven end-to-end against the real
+// handler in internal/serve's own TestClient_RetryUsesFreshNonce; this is
+// the client-side unit proof that every attempt's nonce actually differs).
+func TestClient_EachAttemptSignsWithAFreshNonce(t *testing.T) {
+	var nonces []string
+	var mu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		nonces = append(nonces, r.Header.Get("X-Abusekit-Nonce"))
+		n := len(nonces)
+		mu.Unlock()
+		if n <= 2 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal","message":"flaky"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"subject":"acct_x","tier":"unknown","signals":[]}`))
+	}))
+	defer ts.Close()
+
+	c := abusekit.New(ts.URL, "k", "s", abusekit.WithMaxRetries(3))
+	if _, err := c.Subject(context.Background(), "acct_x"); err != nil {
+		t.Fatalf("Subject: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(nonces) != 3 {
+		t.Fatalf("expected 3 attempts, got %d", len(nonces))
+	}
+	seen := map[string]bool{}
+	for _, n := range nonces {
+		if n == "" {
+			t.Fatalf("expected a non-empty nonce on every attempt, got %v", nonces)
+		}
+		if seen[n] {
+			t.Fatalf("expected every attempt's nonce to be unique, got a repeat in %v", nonces)
+		}
+		seen[n] = true
+	}
 }

@@ -258,7 +258,7 @@ func loadShippedBrands(t *testing.T) feature.BrandSet {
 func testKey() config.Key {
 	return config.Key{
 		ID: "test_client_key", Secret: "test-client-secret", Tenant: testTenant, Producer: "test-client-producer",
-		Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeRead: true, config.ScopeLabels: true, config.ScopeErase: true},
+		Scopes: map[config.Scope]bool{config.ScopeEvents: true, config.ScopeRead: true, config.ScopeLabels: true},
 	}
 }
 

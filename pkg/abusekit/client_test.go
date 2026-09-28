@@ -174,7 +174,11 @@ func TestClient_EvaluateReachesHigh(t *testing.T) {
 	}
 }
 
-func TestClient_LabelAndErase(t *testing.T) {
+// TestClient_Label covers POST /v1/labels only — Delete/ListSubjects were
+// pulled from this client in the S3 fix round's scope split (X1): see
+// feat/s3b-list-erasure and docs/design/notes/erasure-findings.md on that
+// branch.
+func TestClient_Label(t *testing.T) {
 	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
 	h := newTestHarness(t, now)
 	c := newTestClient(h, now)
@@ -193,58 +197,6 @@ func TestClient_LabelAndErase(t *testing.T) {
 	}
 	if labelResult.ID == 0 {
 		t.Fatalf("expected a non-zero label id")
-	}
-
-	eraseResult, err := c.Delete(context.Background(), "acct_label")
-	if err != nil {
-		t.Fatalf("Delete: %v", err)
-	}
-	if eraseResult.Mode != "tombstoned" {
-		t.Fatalf("mode = %q, want tombstoned (subject is abusive-labelled)", eraseResult.Mode)
-	}
-
-	// A repeat delete is idempotent.
-	again, err := c.Delete(context.Background(), "acct_label")
-	if err != nil {
-		t.Fatalf("repeat Delete: %v", err)
-	}
-	if !again.AlreadyErased {
-		t.Fatalf("expected AlreadyErased=true on repeat")
-	}
-}
-
-func TestClient_ListSubjectsPagesStably(t *testing.T) {
-	now := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
-	h := newTestHarness(t, now)
-	c := newTestClient(h, now)
-
-	for i := 0; i < 3; i++ {
-		subj := "acct_list_" + string(rune('a'+i))
-		if _, err := c.SendEvents(context.Background(), []abusekit.Event{
-			{ID: "evt-list-" + string(rune('a'+i)), Subject: subj, Type: "subject.created", At: now},
-		}); err != nil {
-			t.Fatalf("SendEvents: %v", err)
-		}
-	}
-
-	seen := map[string]bool{}
-	cursor := ""
-	for {
-		res, err := c.ListSubjects(context.Background(), abusekit.ListOptions{Limit: 1, Cursor: cursor})
-		if err != nil {
-			t.Fatalf("ListSubjects: %v", err)
-		}
-		if len(res.Subjects) != 1 {
-			t.Fatalf("expected one subject per page, got %d", len(res.Subjects))
-		}
-		seen[res.Subjects[0].Subject] = true
-		if res.NextCursor == "" {
-			break
-		}
-		cursor = res.NextCursor
-	}
-	if len(seen) != 3 {
-		t.Fatalf("walked %d subjects, want 3: %v", len(seen), seen)
 	}
 }
 
