@@ -90,3 +90,18 @@ consolidated fix list) so a future S3b design doesn't have to rediscover them fr
 round) for this work, gated on a design pass addressing the above; migration number `008` is free
 again on `main` (this branch's own copy of `008_subjects_erased_at.sql` is superseded, not
 renumbered, since a future S3b design may need a different schema entirely).
+
+**R9 (PR #4's round-2 fix round) — filename trap for whoever picks up S3b:** the real S3b erasure
+migration MUST use a NEW filename, never `008_subjects_erased_at.sql` again, even though that number
+is nominally "free" on `main`. `internal/store`'s migration runner tracks applied migrations by
+filename (see its own applied-migrations table), and this branch's `008_subjects_erased_at.sql` —
+this exact filename, superseded schema and all — was live on `feat/s3-http-surface` for part of PR
+#4's review before the X1 scope split parked it here. Any database that was ever migrated against
+that pre-split state (a developer's local Postgres, a throwaway review/staging environment stood up
+against that commit range) already has a row recording `008_subjects_erased_at.sql` as applied. A
+future S3b migration that reuses that same filename with DIFFERENT contents would silently no-op on
+any such database (the runner sees the filename already applied and skips it) instead of running the
+real, current schema — a much harder bug to notice than a clean "migration already exists" failure,
+since nothing errors; the schema is just quietly wrong. Reusing number `008` with a genuinely
+DIFFERENT filename (e.g. `008_subjects_erasure_ledger.sql`, once S3b's actual design settles on a
+name) is fine — it's the exact filename string that must never be reissued with new contents.
