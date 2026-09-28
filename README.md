@@ -78,6 +78,22 @@ included both; a fix round found the erasure semantics unsafe to ship (see the P
 section) and pulled both back out, preserving that implementation on `feat/s3b-list-erasure` for a
 proper S3b design pass.
 
+### Configuration flags
+
+`cmd/abusekit serve`/`serve --check` load their config from a set of flags (each with an
+`ABUSEKIT_*` env var equivalent): `--rules` (`config/rules.yaml`), `--vendors`
+(`config/vendors.yaml`), `--weights` (the local scorer's `config/local_weights.yaml`), `--brands`
+(`config/brands.yaml`), `--keys` (required, no default), `--database-url` (required, no default).
+Two are S2b additions:
+
+- `--webmail` (env `ABUSEKIT_WEBMAIL_CONFIG`, default `config/webmail.yaml`) — the public list of
+  consumer webmail provider domains `webmail_recipient_share`/`webmail_sends_1h` match against.
+- `--brands-extra` (env `ABUSEKIT_BRANDS_EXTRA_CONFIG`, **no default**) — an optional path to a
+  private, `config/brands.yaml`-shaped brand list, merged (`feature.MergeBrandSets`) alongside the
+  shipped public `--brands` list. Empty (the default) merges in nothing. This is how an operator
+  extends brand matching with names that shouldn't live in this public repo (AGENTS.md's data-
+  boundary rule) — e.g. a customer's own brand, or one under an NDA — without forking the binary.
+
 ### Go client (`pkg/abusekit`)
 
 ```go

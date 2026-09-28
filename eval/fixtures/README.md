@@ -110,6 +110,38 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   caps, which don't touch this fixture at all) can't silently push it into
   `high` without a test noticing.
 
+- **S2b** adds four fixtures for the send-volume/webmail/recipient-hash/
+  subject-brand-match feature family, each addressing a common
+  bulk-phishing shape and each bounding at least one of the new weights
+  (see `config/local_weights.yaml`'s own comments and the PR body's
+  sensitivity-window table):
+  - `webmail_blast.jsonl` — a brand-new account sending, within its first
+    10 minutes, 100 webmail recipients' worth of mail on a single
+    consumer webmail domain, with entirely neutral subject lines (no
+    brand at all) — reaches at least `medium` on volume/webmail
+    concentration alone.
+  - `single_brand_blast_45m.jsonl` — a brand-new account, 240 webmail
+    recipients over 45 minutes, every subject mentioning the identical
+    fictional brand — reaches `high`.
+  - `established_newsletter_burst.jsonl` — a 60-day-old paid newsletter
+    with a real periodic sending history whose most recent send happens
+    to burst 300 webmail recipients in 10 minutes — stays below `medium`
+    (the young-account gate, B1: volume alone must not flag an
+    established sender, and the flag must decay once an account matures
+    rather than persist as a lifetime fact).
+  - `day0_marketplace_seller.jsonl` — a brand-new account whose agent is
+    named after a fictional shop brand, no integration token, sending to
+    30 webmail buyers over its first hour — a plausible day-0 legitimate
+    seller as much as a suspicious blast; also exercises S2 (the agent's
+    own name already credits the brand, so the identical brand mentioned
+    in every subject line must not ALSO count) — stays below `high`.
+
+  These four use `eval/fixtures/test_brands.yaml`, an entirely fictional
+  brand list (public-repo data-boundary rule, AGENTS.md: a replay fixture
+  never references a real brand name), merged alongside the real,
+  public `config/brands.yaml` via `feature.MergeBrandSets` wherever a
+  test needs it (`internal/worker/mutation_test.go`'s `loadTestBrands`).
+
 See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually
 asserts, and `config/local_weights.yaml`'s own comments for which fixture

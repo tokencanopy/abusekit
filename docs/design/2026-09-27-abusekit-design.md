@@ -338,7 +338,9 @@ rules:
              upgrade_delay_min, upgraded, declines_before_first_success, first_funding_prepaid,
              name_brand_match, name_has_at, first_day_distinct_domains, self_send_before_external,
              linked_deleted_n, linked_labelled_abusive_n, fingerprint_seen_on_other_subjects,
-             neighbors_truncated, burst_ratio_24h_vs_lifetime]
+             neighbors_truncated, burst_ratio_24h_vs_lifetime,
+             sends_10m_max, sends_1h, sends_first_day, webmail_recipient_share, webmail_sends_1h,
+             distinct_recipients_1h, subject_brand_match]        # [S2b]
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6
@@ -383,6 +385,54 @@ every count above it read identically — a 30-domain and a 300-domain fan-out s
 now a `log1p(n)` curve instead, scaled so `n=10` reproduces exactly the hard cap's old contribution
 (no weight change needed) while `n=150` scores meaningfully higher — volume sensitivity above the
 old cap is preserved, just compressed rather than flattened to zero.
+
+**[S2b]** Seven more `new_account_velocity` inputs, addressing common bulk-phishing shapes: send
+volume (`sends_10m_max`, `sends_1h`, `sends_first_day`), consumer-webmail concentration
+(`webmail_recipient_share`, `webmail_sends_1h`, `config/webmail.yaml`), distinct-recipient fan-out
+in a trailing window (`distinct_recipients_1h`), and a brand match against the message SUBJECT
+(`subject_brand_match`, in addition to the existing resource/agent name match). All exclude a
+self-send (`recipient_is_own_identity: true`) — these measure reach to OTHER recipients, and a
+self-send would otherwise double-count the rehearsal behaviour `self_send_before_external` already
+captures — and all exclude a future-dated event (bounded by `now`, the same as every other feature).
+- **B1 (established senders):** `sends_10m_max`, `sends_1h`, `webmail_sends_1h` and
+  `distinct_recipients_1h` are gated to 0 once a subject is more than 7 days old
+  (`youngAccountFactor`) — proven, a lifetime-unbounded volume search flags a months-old, paid
+  newsletter's routine burst exactly the same as a brand-new signup's, and the flag never decays
+  once set. `sends_first_day` needs no such gate: it is already permanently anchored to the
+  subject's first day, the same way `first_day_distinct_domains` is, so it can never reflect an
+  established account's CURRENT behaviour in the first place. `webmail_recipient_share` is a
+  lifetime ratio (who an account emails, not how much) and is deliberately NOT gated.
+- **S1 (subject-line matching):** a subject-line brand match is NOT suppressed by an
+  integration-adjacent word ("tracking", "api") inside the subject itself — a bulk-phishing subject
+  routinely and legitimately contains one on purpose, and gating on the subject's own words silently
+  defeated the rule for exactly the subjects it exists to catch. It is suppressed only when the
+  SENDING ACCOUNT's own resource/agent name carries an integration token (the existing gate,
+  relocated to a one-time, account-level decision).
+- **S2 (double-counting):** `subject_brand_match` excludes any brand already credited by
+  `name_brand_match`, capping the combined per-brand contribution of the two features at whichever
+  one counted it first.
+- **S7 (webmail volume):** `webmail_sends_1h` is computed directly from the trailing window, never
+  as `webmail_recipient_share * sends_1h` — the share is a lifetime ratio and the sum is a trailing
+  window, so their product tracks neither quantity correctly. Every sum caps its per-event
+  `recipient_count` (`sendsVolumeCap`), not only the aggregate.
+- **N4 (resource-kind aliases):** `resource.created`'s `kind` field also normalizes common spelling
+  variants for the key resource kind ("api key", "API Key", "api_key", "api_keys", "apikey",
+  "api-key", "keys") to the canonical value — a producer's own convention for this field should
+  never silently read as ordinary, uncounted resource activity.
+- **B3/N1/N2/N3 (brand matching):** tokenizing for brand matching now splits on any Unicode
+  punctuation or symbol rune, not a hand-picked separator list, so a brand immediately followed by
+  `:`, `,`, `!`, `)`, `"` or `/` matches, and a possessive `'s` no longer glues onto the brand word
+  (B3). A brand entry may be marked case-sensitive, for a short brand token that doubles as an
+  ordinary English word or abbreviation (N1). A brand mention inside ordinary community-gathering
+  text ("... group meetup", "... fan club") does not match (N2). Soft hyphen (U+00AD) and invisible
+  separator (U+2063) are stripped alongside the existing zero-width characters (N3).
+- `config/webmail.yaml` is a public list of major consumer webmail provider domains (public exactly
+  like config/brands.yaml is — no different from naming "Gmail" as a company in prose), extended
+  with common country-variant domains (`hotmail.co.uk`, `outlook.fr`, `live.co.uk`, `yahoo.fr`,
+  `yahoo.de`, `yahoo.co.jp`, `mail.ru`, `gmx.de`, `t-online.de`, `libero.it`).
+- `config/brands.yaml` gains an optional companion, `brands_extra` (`cmd/abusekit --brands-extra`):
+  a private, same-shaped brand list merged in at boot (`feature.MergeBrandSets`) — for a brand an
+  operator wants matched but that shouldn't live in this public repo.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
@@ -613,7 +663,17 @@ erasure rules. Migrations embedded, expand-only.
   ("Stripe Webhook Relay", "Google Calendar Sync", "Microsoft Teams Relay") are excluded from the
   shipped list rather than flagged and accepted as noisy — word-boundary matching alone can't tell
   "impersonating Stripe" from "a real Stripe integration named after Stripe"; proper context-aware
-  matching for those is future work.
+  matching for those is future work. **[S2b]** Tokenizing now splits on any Unicode punctuation or
+  symbol rune (not a hand-picked separator list), so a brand immediately followed by punctuation
+  (`:`, `,`, `!`, `)`, `"`, `/`) matches and a possessive `'s` no longer glues onto the brand word
+  (B3); a brand entry may be marked case-sensitive for a short token that doubles as an ordinary
+  English word (N1, e.g. a shipping carrier's all-caps initialism); a brand mentioned inside
+  ordinary community-gathering text ("... group meetup", "... fan club") does not match (N2); soft
+  hyphen and the invisible separator (U+00AD, U+2063) are stripped alongside the existing zero-width
+  characters (N3). A subject-line brand match (as opposed to a resource/agent-name match) is
+  suppressed only by the SENDING ACCOUNT's own name carrying an integration token, never by words
+  inside the subject line itself (S1) — and never double-counts a brand the account's own name
+  already credited (S2).
 - Invalid config → reload rejected, previous config live, `/healthz` reports it.
 - Lost update in the worker → `dirty_seq` compare-and-clear.
 - Clock skew → ±24 h on events (except `backfill` scope), ±5 min on request signatures.
