@@ -167,33 +167,45 @@ func hasIntegrationToken(words []string) bool {
 	return false
 }
 
-// communityTokenWords are words whose presence anywhere in a candidate
-// text mean it is very likely naming an ordinary community/social
-// gathering ("<brand> group meetup", "<brand> fan club") rather than
-// impersonating the brand it mentions — S2b's N2 fix round, the
-// subject-line analogue of integrationTokens: a social-media brand
-// mentioned in the course of describing a real community event around it
-// is common, unremarkable text, not a lure. Applied uniformly to both
-// name and subject-line matching (unlike integrationTokens, S1's fix
-// round does not exempt subject-line matching from this gate — it is a
-// distinct guard against a distinct false-positive shape).
-var communityTokenWords = []string{
-	"group", "meetup", "community", "fans", "chat", "club",
+// communityPhraseWords are contiguous word-SEQUENCES (never a bare single
+// word — round 2's R3 fix round) whose presence anywhere in a candidate
+// SUBJECT LINE mean it is very likely describing an ordinary community/
+// social gathering around the brand it mentions ("<brand> group meetup",
+// "<brand> fan club", "<brand> community event") rather than
+// impersonating it. R3 replaced an earlier, bare-single-word version of
+// this gate ("chat", "group", "fans", "club", "community", "meetup"
+// individually) — proven too broad: an everyday subject like "<brand>:
+// chat with support" or "Join the <brand> group today" has nothing to do
+// with a community gathering, but tripped the old gate anyway on a single
+// word.
+//
+// Applied ONLY to subject-line matching (MatchedBrandNamesForSubject),
+// NEVER to a resource/agent NAME (MatchedBrandNames) — R3: an earlier
+// round applied it to both, which suppressed name_brand_match for an
+// ordinary agent name like "<brand> Support Chat".
+var communityPhraseWords = [][]string{
+	{"group", "meetup"},
+	{"fan", "club"},
+	{"community", "event"},
 }
 
-var communityTokens = buildCommunityTokens()
+var communityPhrases = buildCommunityPhrases()
 
-func buildCommunityTokens() map[string]struct{} {
-	out := make(map[string]struct{}, len(communityTokenWords))
-	for _, w := range communityTokenWords {
-		out[canonicalise(w)] = struct{}{}
+func buildCommunityPhrases() [][]string {
+	out := make([][]string, len(communityPhraseWords))
+	for i, phrase := range communityPhraseWords {
+		words := make([]string, len(phrase))
+		for j, w := range phrase {
+			words[j] = canonicalise(w)
+		}
+		out[i] = words
 	}
 	return out
 }
 
-func hasCommunityToken(words []string) bool {
-	for _, w := range words {
-		if _, ok := communityTokens[w]; ok {
+func hasCommunityPhrase(words []string) bool {
+	for _, phrase := range communityPhrases {
+		if containsSequence(words, phrase) {
 			return true
 		}
 	}
@@ -202,19 +214,19 @@ func hasCommunityToken(words []string) bool {
 
 // Matches reports whether text contains any brand's word sequence, per the
 // word/token-boundary rule documented on BrandSet, gated by
-// integrationTokens (R6 round 2) and communityTokens (S2b's N2 fix round).
-// Tries both the plain (separator-only) tokenization and the camelCase-
-// aware one (see tokenizeCamel) — a brand whose own correctly-cased
-// spelling already contains an internal lower->upper transition (PayPal,
-// FedEx) still matches its plain single-token form via the FIRST pass; a
-// glued compound written with each component capitalized but no separator
-// (WellsFargo, PayPalSupport) only tokenizes into the right words via the
-// SECOND. Checking both independently — rather than only ever using the
-// camelCase-aware one — is deliberate: camelCase-splitting a brand's OWN
-// canonical spelling at definition time (NewBrandSet never does this)
-// would turn "PayPal" into a needle of ["pay","pal"], which would stop
-// matching a candidate that simply writes it in plain lower-case
-// ("paypal") with no case transition to split on at all.
+// integrationTokens (R6 round 2). Tries both the plain (separator-only)
+// tokenization and the camelCase-aware one (see tokenizeCamel) — a brand
+// whose own correctly-cased spelling already contains an internal
+// lower->upper transition (PayPal, FedEx) still matches its plain
+// single-token form via the FIRST pass; a glued compound written with
+// each component capitalized but no separator (WellsFargo, PayPalSupport)
+// only tokenizes into the right words via the SECOND. Checking both
+// independently — rather than only ever using the camelCase-aware one —
+// is deliberate: camelCase-splitting a brand's OWN canonical spelling at
+// definition time (NewBrandSet never does this) would turn "PayPal" into
+// a needle of ["pay","pal"], which would stop matching a candidate that
+// simply writes it in plain lower-case ("paypal") with no case transition
+// to split on at all.
 func (b BrandSet) Matches(text string) bool {
 	return len(b.MatchedBrandNames(text)) > 0
 }
@@ -222,27 +234,29 @@ func (b BrandSet) Matches(text string) bool {
 // MatchedBrandNames returns the set of DISTINCT curated brand names
 // (BrandEntry.Name — an entry matched via an alias still reports its
 // canonical name, never the alias text) whose word sequence appears in
-// text, applying BOTH the integration-token gate and the community-token
-// gate (S2b's N2 fix round). This is the matcher name_brand_match uses
-// against a resource/agent's raw name — see MatchedBrandNamesForSubject
-// for the subject-line-specific variant S1's fix round introduces.
+// text, applying the integration-token gate — this is the matcher
+// name_brand_match uses against a resource/agent's raw name. The
+// community-phrase gate (R3 fix round) does NOT apply here — see
+// MatchedBrandNamesForSubject for the subject-line-specific variant that
+// does.
 //
 // Returns nil (never a non-nil empty map) when nothing matched, matching
 // Go's normal "ranging over a nil map is a no-op, len(nil map) is 0"
 // idiom — callers never need a special nil check before iterating.
 func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
-	return b.matched(text, true)
+	return b.matched(text, true, false)
 }
 
 // MatchedBrandNamesForSubject is subject_brand_match's matcher (S2b's S1
 // fix round): brands are matched WITHOUT gating on words inside the
-// subject line itself (unlike MatchedBrandNames) — a bulk-phishing
-// subject routinely contains "tracking" or "api" on purpose, and the OLD
-// behaviour of gating on the subject's own words silently defeated the
-// rule for exactly the subjects it exists to catch. The community-token
-// gate (N2) still applies — it addresses a different false-positive shape
-// (a social brand mentioned in ordinary community context) that is
-// unrelated to S1's fix.
+// subject line itself the way MatchedBrandNames' integration-token gate
+// does — a bulk-phishing subject routinely contains "tracking" or "api"
+// on purpose, and the OLD behaviour of gating on the subject's own words
+// silently defeated the rule for exactly the subjects it exists to catch.
+// The community-PHRASE gate (R3 fix round) DOES apply here, and only
+// here — it addresses a different false-positive shape (a social brand
+// mentioned in the course of describing an ordinary community gathering)
+// that is unique to subject lines.
 //
 // Deciding WHICH matched brand(s) to then exempt (round 2's R2 fix round:
 // only the brand adjacent to an integration token in the SENDING
@@ -252,20 +266,22 @@ func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
 // resource is ABOUT in the first place, so it can't itself decide the
 // exemption without becoming circular.
 func (b BrandSet) MatchedBrandNamesForSubject(text string) map[string]struct{} {
-	return b.matched(text, false)
+	return b.matched(text, false, true)
 }
 
 // matched is Matches/MatchedBrandNames/MatchedBrandNamesForSubject's
 // shared implementation: applyIntegrationGate selects whether
 // integrationTokens suppresses a match (true for a resource/agent name,
 // false for a subject line already cleared by
-// MatchedBrandNamesForSubject's own account-level check).
-func (b BrandSet) matched(text string, applyIntegrationGate bool) map[string]struct{} {
+// MatchedBrandNamesForSubject's own account-level check);
+// applyCommunityGate selects whether communityPhrases does (false for a
+// name, true for a subject line — R3 fix round).
+func (b BrandSet) matched(text string, applyIntegrationGate, applyCommunityGate bool) map[string]struct{} {
 	if len(b.entries) == 0 {
 		return nil
 	}
-	out := b.matchedNames(tokenize(text), text, applyIntegrationGate)
-	for name := range b.matchedNames(tokenizeCamel(text), text, applyIntegrationGate) {
+	out := b.matchedNames(tokenize(text), text, applyIntegrationGate, applyCommunityGate)
+	for name := range b.matchedNames(tokenizeCamel(text), text, applyIntegrationGate, applyCommunityGate) {
 		if out == nil {
 			out = make(map[string]struct{})
 		}
@@ -274,8 +290,11 @@ func (b BrandSet) matched(text string, applyIntegrationGate bool) map[string]str
 	return out
 }
 
-func (b BrandSet) matchedNames(words []string, original string, applyIntegrationGate bool) map[string]struct{} {
-	if len(words) == 0 || hasCommunityToken(words) {
+func (b BrandSet) matchedNames(words []string, original string, applyIntegrationGate, applyCommunityGate bool) map[string]struct{} {
+	if len(words) == 0 {
+		return nil
+	}
+	if applyCommunityGate && hasCommunityPhrase(words) {
 		return nil
 	}
 	if applyIntegrationGate && hasIntegrationToken(words) {

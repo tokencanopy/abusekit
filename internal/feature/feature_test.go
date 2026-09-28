@@ -890,12 +890,18 @@ func TestLoadBrandsFile_S2bExtraBrands(t *testing.T) {
 
 	mustNotMatch := []string{
 		"it has its ups and downs", // N1: lower-case "ups" must not match
-		"Facebook group meetup",    // N2: community context
 	}
 	for _, name := range mustNotMatch {
 		if brands.Matches(name) {
 			t.Errorf("brands.Matches(%q) = true, want false", name)
 		}
+	}
+
+	// N2/round 2's R3: the community-phrase gate applies to SUBJECT LINES
+	// only, never to a resource/agent name (Matches/MatchedBrandNames) —
+	// see TestBrandSet_NameMatchingNeverCommunityGated for that half.
+	if len(brands.MatchedBrandNamesForSubject("Facebook group meetup")) != 0 {
+		t.Errorf("MatchedBrandNamesForSubject(%q) matched, want none (N2: community context)", "Facebook group meetup")
 	}
 }
 

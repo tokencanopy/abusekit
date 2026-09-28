@@ -288,21 +288,48 @@ func TestBrandSet_CaseSensitiveShortToken(t *testing.T) {
 // social-media brand mentioned as part of describing an ordinary
 // community gathering must not match, the subject-line analogue of
 // integrationTokens.
-func TestBrandSet_CommunityContextSuppressesMatch(t *testing.T) {
+// TestBrandSet_NameMatchingNeverCommunityGated is round 2's R3: the
+// community-context gate applies ONLY to subject-line matching, never to
+// a resource/agent NAME — restores name_brand_match for a name like
+// "<brand> Support Chat" or "<brand> Group Meetup Organizer".
+func TestBrandSet_NameMatchingNeverCommunityGated(t *testing.T) {
+	brands := NewBrandSet([]BrandEntry{{Name: "Fictabook"}})
+	tests := []struct{ name, text string }{
+		{"chat in the name", "Fictabook Support Chat"},
+		{"group meetup phrase in the name", "Fictabook Group Meetup Organizer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !brands.Matches(tt.text) {
+				t.Errorf("Matches(%q) = false, want true — the community gate must never apply to a resource/agent NAME", tt.text)
+			}
+		})
+	}
+}
+
+// TestBrandSet_SubjectCommunityPhraseGate is round 2's R3: the gate
+// matches WHOLE PHRASES ("group meetup", "fan club", "community event"),
+// never a bare single word — proven, a bare "chat" or "group" false-
+// positived on ordinary subjects like "<brand>: chat with support".
+func TestBrandSet_SubjectCommunityPhraseGate(t *testing.T) {
 	brands := NewBrandSet([]BrandEntry{{Name: "Fictabook"}})
 	tests := []struct {
 		name string
 		text string
-		want bool
+		want bool // whether MatchedBrandNamesForSubject should still match
 	}{
 		{"plain mention", "Fictabook password reset", true},
-		{"group meetup", "Fictabook group meetup this Friday", false},
-		{"fan club", "Join the Fictabook fans chat", false},
+		{"chat alone does not suppress", "Fictabook: chat with support", true},
+		{"group alone does not suppress", "Join the Fictabook group today", true},
+		{"group meetup phrase suppresses", "Fictabook group meetup this Friday", false},
+		{"fan club phrase suppresses", "Fictabook fan club newsletter", false},
+		{"community event phrase suppresses", "Fictabook community event this weekend", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := brands.Matches(tt.text); got != tt.want {
-				t.Errorf("Matches(%q) = %v, want %v", tt.text, got, tt.want)
+			got := len(brands.MatchedBrandNamesForSubject(tt.text)) > 0
+			if got != tt.want {
+				t.Errorf("MatchedBrandNamesForSubject(%q) matched=%v, want %v", tt.text, got, tt.want)
 			}
 		})
 	}

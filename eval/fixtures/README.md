@@ -172,3 +172,20 @@ See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually
 asserts, and `config/local_weights.yaml`'s own comments for which fixture
 bounded which weight.
+
+- **S2b's round 2 (R3)** replaced the community-context gate's bare
+  single-word list ("chat", "group", "fans", "club", "community",
+  "meetup" individually — too broad, false-positiving on "<brand>: chat
+  with support") with three whole PHRASES ("group meetup", "fan club",
+  "community event"), and restricted it to subject-line matching only
+  (never a resource/agent name, restoring name_brand_match for a name
+  like "<brand> Support Chat"). `community_group_photo_walk.jsonl` is the
+  required fixture: a day-0 community-group account posting an ordinary
+  update with NO community phrase ("Fictabook photo walk this Saturday")
+  to 80 webmail members in 10 minutes — see
+  `internal/worker/replay_test.go`'s `TestReplay_CommunityGroupPhotoWalkKnownGap`
+  for the documented trade-off this fixture landed on (it reaches `high`;
+  the fixture is structurally close to indistinguishable, on this
+  feature set alone, from a genuine brand-impersonation blast, and R1's
+  blocker-level outcomes were kept intact rather than weakened to spare
+  it).

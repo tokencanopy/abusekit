@@ -8,5 +8,6 @@
 # Same shape as config/brands.yaml; loaded the identical way
 # (feature.LoadBrandsFile).
 brands:
+  - name: Fictabook
   - name: Fictashop
   - name: Glowbank

@@ -507,3 +507,39 @@ func TestReplay_WebmailSpread1hMediumBand(t *testing.T) {
 	}
 	assertBand(t, "webmail_spread_1h", view.Score, 0.65, 0.78)
 }
+
+// TestReplay_CommunityGroupPhotoWalkKnownGap replays eval/fixtures/
+// community_group_photo_walk.jsonl — round 2's R3 required fixture: a
+// day-0 community-group account (a genuine "Fictabook" fan/community
+// persona, not an impersonator) posting an ordinary, non-suspicious
+// update about a real-world activity ("Fictabook photo walk this
+// Saturday" — deliberately no community PHRASE like "group meetup"/"fan
+// club"/"community event", so R3's phrase gate correctly does not
+// suppress the brand match here) to 80 webmail members within 10
+// minutes.
+//
+// DOCUMENTED TRADE-OFF (R3: "if the fixture can't be held below high
+// without losing R1's outcomes, document the trade-off and choose"):
+// this fixture reaches `high`. Structurally it is close to
+// indistinguishable, on THIS feature set alone, from a malicious
+// day-0 brand-impersonation blast (webmail_blast.jsonl,
+// single_brand_blast_45m.jsonl, dormant_branded_burst_8d.jsonl): a
+// brand-new account, no prior sending history, a webmail-concentrated
+// burst of comparable size, and a subject line that matches a curated
+// brand. R1's blocker-level outcomes (a calendar-evadable dormant
+// account must still reach `high` on volume alone, an established
+// sender must not) require sends_10m_max/webmail_sends_1h to carry a
+// day-0, no-history burst most of the way to `high` by themselves —
+// weakening that weight to spare this fixture would also weaken
+// dormant_branded_burst_8d's own required outcome. This v0 feature set
+// has no signal for "a real, ongoing community persona" (that needs
+// something like verified account age/ownership or content semantics
+// beyond phrase-detection) — choosing to keep R1's blocker outcomes
+// intact over this should-fix item's exact tier target, and recording
+// the choice here rather than silently accepting either a weakened
+// blocker or an undocumented regression.
+func TestReplay_CommunityGroupPhotoWalkKnownGap(t *testing.T) {
+	view := runReplay(t, "community_group_photo_walk.jsonl", "acct_example_community_group_1")
+	t.Logf("community_group_photo_walk: tier=%q score=%v (documented known gap — see this test's own doc comment)", view.Tier, view.Score)
+	assertBand(t, "community_group_photo_walk", view.Score, 0.9, 1.0)
+}
