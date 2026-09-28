@@ -114,3 +114,55 @@ See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually
 asserts, and `config/local_weights.yaml`'s own comments for which fixture
 bounded which weight.
+
+## `synthetic/` — the S4 gate corpus (event-replay pair)
+
+`synthetic/events.jsonl` + `synthetic/labels.jsonl` are the corpus `make
+gate`/CI score against (S4, `eval/floors.yaml`) — a much larger, more
+varied corpus than the hand-written narrative fixtures above, generated
+by the seeded command `eval/gen` rather than hand-written line by line:
+
+```
+go run ./eval/gen -seed 20260927 \
+  -out-events eval/fixtures/synthetic/events.jsonl \
+  -out-labels eval/fixtures/synthetic/labels.jsonl
+```
+
+Re-running that exact command reproduces both files byte-for-byte
+(`eval/gen`'s own `TestGenerate_Deterministic`). Every value is
+synthetic and documented by convention, not by a per-fixture seed table
+the way the hand-written fixtures above are:
+
+- **subjects**: `acct_gen_<family>_<index>`, or
+  `acct_gen_churn_<kind>_<chain>_<n>` for a churn incarnation.
+- **domains**: `<slug>.example.test` / `customer-<n>.<slug>.example.test`.
+- **timestamps**: 2031, built up from a fixed epoch (2031-01-01) with
+  small seeded jitter — never a real date.
+- **link hashes**: `sha256("fixture:" + seed)` where `seed` is a
+  descriptive, generator-local string such as `"burst-acct_gen_burst_000-email"`
+  or `"churn-card-chain-0-shared"` (see `eval/gen/gen.go`'s `linkHash` and
+  each family file's own seed-string construction) — same convention as
+  the table above, just computed per-subject instead of hand-typed.
+- **brand names**: from `config/brands.yaml` (impersonation shapes pair a
+  brand with NO integration word — see `eval/gen/abusive.go`'s
+  `impersonationNames`; benign shapes pair one WITH an integration word —
+  `eval/gen/benign.go`'s `integrationAgentNames`).
+
+14 families, 208 subjects total: 154 benign across 7 families (fast
+developer onboarding with self-tests, integration-heavy orgs, day-1
+receipts fan-out to 10–40 domains, support-desk later-day fan-out,
+newsletter-style later-day fan-out, slow upgraders, $0-trial accounts —
+none of which the shipped `config/local_weights.yaml` was tuned
+against, unlike the hand-written benign fixtures above) and 54 abusive
+across burst/fast/dormant-then-blast/slow-operator (6 each) plus three
+churn variants — email-linked, card-linked, device-linked (2 chains of 5
+incarnations each, 10 subjects per kind) — every one of which is in
+`internal/feature`'s default same-tenant link-kind set. See the PR that
+introduced this corpus for the local scorer's measured precision/recall/
+F1/ECE/AUROC against it, and `eval/floors.yaml` for how those numbers
+became the CI gate's floors.
+
+`make gate`/CI never read the private incident corpus (design §1/§4.10):
+that corpus lives in a separate private repository and is scored with
+the exact same `abusekit eval` command, no code changes — see the root
+README's "Evaluation harness" section.
