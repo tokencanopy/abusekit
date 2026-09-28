@@ -423,6 +423,15 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 	// costs nothing extra and stays correct even for a caller (or test)
 	// that hands Extract events out of order — see minAt's doc comment.
 	firstSeenAt, _ := minAt(events, func(event.Event) bool { return true })
+	// [round 2] R8: a producer-supplied subject.created.account_created_at
+	// overrides the derived value above when present — see
+	// accountCreatedAt's own doc comment for why. Every firstSeenAt-keyed
+	// feature below (age decay, burst baselines, first-day windows, next
+	// rescore scheduling) inherits this single override automatically,
+	// since they all read the same local variable.
+	if createdAt, ok := accountCreatedAt(events); ok {
+		firstSeenAt = createdAt
+	}
 
 	ev, err := neighbors.Evidence(ctx, tenant, subject)
 	if err != nil {

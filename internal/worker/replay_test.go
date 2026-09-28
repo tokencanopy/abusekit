@@ -662,3 +662,50 @@ func TestReplay_EstablishedProductCopyBrandMentionStaysLow(t *testing.T) {
 	}
 	assertBand(t, "established_product_copy_brand_mention", view.Score, 0.0, 0.2)
 }
+
+// TestReplay_UnbackfilledEstablishedAccountReadsAsEstablished replays
+// eval/fixtures/unbackfilled_established_account.jsonl — round 2's R8: a
+// real, 60-day-old paid account whose only ingested history (subject.
+// created plus one routine newsletter send) starts the moment abusekit
+// began observing it. Nothing about its EVENT history says it's
+// established — R1's history-relative baseline sees no prior sends, and
+// an un-backfilled minAt-derived firstSeenAt would read this as a
+// brand-new account bursting on day one. The producer-supplied
+// subject.created.account_created_at is the only signal that tells the
+// truth, and it must be enough on its own (no event backfill required)
+// to bring the account back down out of `high`.
+//
+// The comparison variant strips account_created_at from the identical
+// event stream to prove the field is actually load-bearing here, not
+// just present: without it this fixture reaches `high` on burst volume
+// alone (a fresh account fanning out to a hundred recipients in one shot
+// is exactly what R1's history-relative features exist to flag), and with
+// it the very same burst reads as an established sender's routine send
+// and stays `low`.
+func TestReplay_UnbackfilledEstablishedAccountReadsAsEstablished(t *testing.T) {
+	const subject = "acct_example_unbackfilled_established_1"
+
+	withField := runReplay(t, "unbackfilled_established_account.jsonl", subject)
+	if withField.Tier != "low" {
+		t.Errorf("unbackfilled_established_account (with account_created_at): tier = %q (score %v), want low\nsignals: %+v", withField.Tier, withField.Score, withField.Signals)
+	}
+	assertBand(t, "unbackfilled_established_account (with account_created_at)", withField.Score, 0.0, 0.4)
+
+	events := loadFixture(t, filepath.Join(repoRoot(t), "eval", "fixtures", "unbackfilled_established_account.jsonl"))
+	for i := range events {
+		if events[i].Type == "subject.created" {
+			delete(events[i].Data, "account_created_at")
+		}
+	}
+	now := lastEventAt(events).Add(time.Minute)
+	withoutField, result := runReplayAt(t, events, subject, now)
+	if result.Scored != 1 || len(result.Errors) != 0 {
+		t.Fatalf("Tick result = %+v, want exactly one subject scored with no errors", result)
+	}
+	if withoutField.Tier != "high" {
+		t.Errorf("unbackfilled_established_account (without account_created_at): tier = %q (score %v), want high", withoutField.Tier, withoutField.Score)
+	}
+	if withField.Score >= withoutField.Score {
+		t.Errorf("account_created_at should lower the score: with=%v without=%v", withField.Score, withoutField.Score)
+	}
+}

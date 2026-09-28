@@ -508,6 +508,47 @@ func TestEvent_Redact(t *testing.T) {
 				}
 			},
 		},
+
+		// --- [round 2] R8: subject.created's optional account_created_at ---
+
+		{
+			name: "account_created_at accepts a well-formed RFC 3339 instant",
+			typ:  "subject.created",
+			data: map[string]any{"account_created_at": "2031-05-01T00:00:00Z"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["account_created_at"] != "2031-05-01T00:00:00Z" {
+					t.Fatalf("expected the timestamp to pass through unchanged, got %#v", out)
+				}
+			},
+		},
+		{
+			name: "account_created_at accepts a non-UTC offset",
+			typ:  "subject.created",
+			data: map[string]any{"account_created_at": "2031-05-01T00:00:00-07:00"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["account_created_at"] != "2031-05-01T00:00:00-07:00" {
+					t.Fatalf("expected the timestamp to pass through unchanged, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "account_created_at rejects a bare date with no time",
+			typ:      "subject.created",
+			data:     map[string]any{"account_created_at": "2031-05-01"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "account_created_at rejects a non-timestamp string",
+			typ:      "subject.created",
+			data:     map[string]any{"account_created_at": "a while ago"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "account_created_at rejects a Unix epoch number",
+			typ:      "subject.created",
+			data:     map[string]any{"account_created_at": 1935705600.0},
+			wantCode: CodeRedactionFailed,
+		},
 	}
 
 	for _, tc := range tests {

@@ -116,6 +116,81 @@ func TestExtract_LinkedDeletedNSaturates(t *testing.T) {
 	}
 }
 
+// --- [round 2] R8: subject.created's optional account_created_at --------
+
+func TestAccountCreatedAt_PreferredOverEarliestEvent(t *testing.T) {
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "2030-11-02T00:00:00Z"}), // 60 days before base
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	got, ok := accountCreatedAt(events)
+	if !ok {
+		t.Fatalf("expected account_created_at to be found")
+	}
+	want := time.Date(2030, time.November, 2, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("accountCreatedAt = %v, want %v", got, want)
+	}
+}
+
+func TestAccountCreatedAt_AbsentFallsBack(t *testing.T) {
+	events := []event.Event{
+		ev("e1", "subject.created", 0, nil),
+		ev("e2", "content.sent", time.Minute, nil),
+	}
+	if _, ok := accountCreatedAt(events); ok {
+		t.Errorf("expected accountCreatedAt to report absent when no subject.created carries the field")
+	}
+}
+
+func TestAccountCreatedAt_InvalidStringFallsBack(t *testing.T) {
+	// Redact itself rejects a malformed account_created_at at ingest, but
+	// Extract must still degrade gracefully for a caller/test that hands
+	// it a raw, never-redacted event rather than panicking or picking a
+	// garbage time.
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "not-a-timestamp"}),
+	}
+	if _, ok := accountCreatedAt(events); ok {
+		t.Errorf("expected accountCreatedAt to report absent for an unparseable value")
+	}
+}
+
+func TestExtract_AccountCreatedAtOverridesFirstSeenAt(t *testing.T) {
+	// An account onboarded onto abusekit only 5 minutes ago, but whose
+	// producer reports it actually signed up 60 days earlier: every
+	// history-relative/age-decay feature must treat it as 60 days old,
+	// not as brand new — R8's whole point (an un-backfilled established
+	// account otherwise reads identically to a genuinely new one).
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "2030-11-02T00:00:00Z"}), // 60 days before base
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(5*time.Minute), BrandSet{}, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.SubjectAgeH != subjectAgeClampHours {
+		t.Errorf("SubjectAgeH = %v, want the %v clamp ceiling (account_created_at is 60 days before the earliest ingested event)", res.Features.SubjectAgeH, subjectAgeClampHours)
+	}
+}
+
+func TestExtract_NoAccountCreatedAtUsesEarliestEvent(t *testing.T) {
+	// Without the field, behavior is unchanged from before R8: firstSeenAt
+	// is still the earliest ingested event.
+	events := []event.Event{
+		ev("e1", "subject.created", 0, nil),
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(5*time.Minute), BrandSet{}, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.SubjectAgeH != 5.0/60 {
+		t.Errorf("SubjectAgeH = %v, want 5/60 (no account_created_at: age is measured from the earliest ingested event)", res.Features.SubjectAgeH)
+	}
+}
+
 func TestFeatures_MapMatchesNames(t *testing.T) {
 	m := Features{}.Map()
 	if len(m) != len(Names) {

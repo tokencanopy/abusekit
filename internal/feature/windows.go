@@ -143,6 +143,56 @@ func minAt(events []event.Event, keep func(event.Event) bool) (at time.Time, ok 
 	return at, ok
 }
 
+// accountCreatedAt returns the producer-supplied account_created_at from a
+// subject.created event's `data`, when present and parseable, for Extract
+// to prefer over minAt's derived "earliest ingested event" firstSeenAt
+// ([round 2] R8). firstSeenAt is only ever "the moment abusekit itself
+// first observed this subject" — for an already-established account
+// onboarded onto abusekit well after its real signup, that reads as brand
+// new, defeating every one of R1's history-relative/age-decay features
+// exactly for the accounts they exist to protect against a false
+// positive. A producer that knows the subject's actual creation time (its
+// own signup timestamp) can supply it once, on subject.created, and every
+// firstSeenAt-derived feature treats the account as its real age from day
+// one — no backfill of the account's past events required, only this one
+// field. See the design doc's rollout note: this field (or a true
+// historical backfill) is a precondition for history-relative features to
+// behave correctly on accounts that predate abusekit's own deployment.
+//
+// Degrades to "absent" (like dataString/dataNumber/dataBool) rather than
+// erroring on a missing field, a non-string value, or a string that
+// doesn't parse as RFC 3339 — internal/event.Redact rejects a malformed
+// value at ingest (closed format, not just maxLen), but Extract has no
+// way to know an event actually went through Redact, so it stays
+// defensive for a test (or a future caller) that builds an event.Event by
+// hand. Takes the minimum across multiple subject.created events (there's
+// normally only one) for the same reason minAt does: never trust delivery
+// order.
+func accountCreatedAt(events []event.Event) (time.Time, bool) {
+	var (
+		best time.Time
+		ok   bool
+	)
+	for _, e := range events {
+		if e.Type != "subject.created" {
+			continue
+		}
+		s, present := dataString(e.Data, "account_created_at")
+		if !present {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			continue
+		}
+		if !ok || t.Before(best) {
+			best = t
+			ok = true
+		}
+	}
+	return best, ok
+}
+
 // firstPaidUpgradeAt returns the At of the subject's earliest PAID AND
 // ACTIVE subscription.changed event (status == "active" AND
 // amount_minor > 0). B5 fix round: a free-plan change or a cancellation

@@ -140,6 +140,18 @@ var schema = map[string]map[string]fieldSpec{
 		"channel":            {maxLen: 64},
 		"email_domain_class": {maxLen: 32, enum: []string{"webmail", "corporate", "disposable", "unknown"}},
 		"identity_kind":      {maxLen: 64},
+		// [round 2] R8: an optional producer-supplied real account-
+		// creation instant, preferred by internal/feature's Extract over
+		// its own derived "earliest ingested event" firstSeenAt when
+		// present (see accountCreatedAt in internal/feature/windows.go).
+		// Without it, an established account onboarded onto abusekit
+		// well after its real signup reads as brand new, defeating every
+		// history-relative/age-decay feature exactly for the accounts
+		// they exist to protect. Validated exactly against RFC 3339
+		// (format, not just maxLen) so a malformed value fails loudly at
+		// ingest instead of silently failing time.Parse deep inside
+		// feature extraction.
+		"account_created_at": {format: accountCreatedAtRe},
 	},
 	"subject.deleted": {
 		"mode": {maxLen: 16, enum: []string{"trash", "permanent"}},
@@ -230,6 +242,16 @@ func maskEmails(s string) string {
 // blocklisting '@'/'%'/whitespace catches anything else unanticipated
 // too (design's own "a keyed hash the producer holds" contract, §4.3).
 var recipientHashRe = regexp.MustCompile(`^[A-Za-z0-9_:+/=-]{8,128}$`)
+
+// accountCreatedAtRe is subject.created's optional account_created_at
+// format ([round 2] R8): a full RFC 3339 date-time (date, "T", time,
+// optional fractional seconds, and a "Z" or numeric UTC offset) —
+// anything looser (a bare date, a Unix timestamp, free text) is rejected
+// rather than accepted and later failing time.Parse deep inside feature
+// extraction. Deliberately doesn't use time.Parse itself here: Redact's
+// other format fields are all regex-validated, and a regex keeps this
+// field's validation in the same place/style as the rest of the schema.
+var accountCreatedAtRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$`)
 
 // hasControlChar reports whether s contains any Unicode control character
 // (category Cc, which includes NUL and every other C0/C1 control code).

@@ -235,3 +235,16 @@ bounded which weight.
   is the required fixture: a 2-month-old paid account routinely sending
   "Our product now integrates with Glowbank Calendar" (ordinary product
   copy, not a lure) — stays low.
+
+- **S2b's round 2 (R8)** lets a producer supply `subject.created`'s
+  optional `account_created_at`, preferred over the derived "earliest
+  ingested event" `firstSeenAt` whenever present — a precondition for
+  R1/R7's history-relative features to behave correctly on an account
+  that predates abusekit's own deployment. `unbackfilled_established_account.jsonl`
+  is the required fixture: a real, 60-day-old paid account whose only
+  ingested history is its signup plus one routine newsletter send — no
+  backfilled prior-send history at all. `TestReplay_UnbackfilledEstablishedAccountReadsAsEstablished`
+  (`internal/worker/replay_test.go`) replays it twice, with and without
+  `account_created_at` present on the identical event stream, and
+  asserts the field alone moves the outcome from `high` down to `low` —
+  proving it's load-bearing, not merely accepted.

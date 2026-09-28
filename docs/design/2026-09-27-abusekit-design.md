@@ -432,6 +432,20 @@ captures — and all exclude a future-dated event (bounded by `now`, the same as
   another lure signal is present): age-decay fixes the underlying problem for EVERY brand, not just
   five named ones, needs no definition of "another lure signal" to implement, and reuses a mechanism
   already reviewed and tested for the identical purpose elsewhere in this same PR.
+- **[round 2] R8 (rollout: producer-supplied account age):** `subject.created` accepts an optional
+  `account_created_at` (RFC 3339), validated exactly at redaction time. When present, `Extract`
+  prefers it over `firstSeenAt`'s own derived value (the minimum `At` across every ingested event)
+  for every one of R1/R7's history-relative and age-decayed features. Without it, `firstSeenAt` is
+  only ever "the moment abusekit itself first observed this subject" — an already-established
+  account onboarded onto abusekit well after its real signup reads as brand new, and its very first
+  routine send (or first send after onboarding) triggers exactly the false positive R1 and R7 exist
+  to prevent. Supplying this one field is a precondition for correct history-relative scoring on any
+  pre-existing account; the alternative — a true historical backfill of the account's past events —
+  is possible but unnecessary, since `account_created_at` alone is sufficient (a real account whose
+  one large send reaches `high` when un-backfilled correctly reads `low` once the producer supplies
+  its actual signup date, with no event backfill at all). A malformed value is rejected at
+  ingest (closed RFC 3339 format), never silently ignored or left to fail deep inside feature
+  extraction.
 - **S7 (webmail volume):** `webmail_sends_1h` is computed directly from the trailing window, never
   as `webmail_recipient_share * sends_1h` — the share is a lifetime ratio and the sum is a trailing
   window, so their product tracks neither quantity correctly. Every sum caps its per-event
