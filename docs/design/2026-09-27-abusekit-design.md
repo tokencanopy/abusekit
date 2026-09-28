@@ -155,6 +155,18 @@ product ◀─GET score / POST evaluate──────── serve ◀── 
   `linked_max_risk` and `email_hash_seen_on_deleted_subject` remain deferred (not built in v0) —
   see §8's open questions; nothing here currently computes them.
 - Cross-tenant linking is an additive change: drop the tenant column from the index key.
+- **[S2b]** `content.sent`'s `recipient_hash` is a DIFFERENT kind of identity signal than the
+  `links` above: it is an opaque, per-recipient string the PRODUCT computes under its own salt
+  (never an address, never HMAC'd under abusekit's per-tenant link key), scoped to identifying
+  distinct recipients WITHIN one subject's own send history — it is never used for same-tenant
+  neighbour discovery the way `email_hash`/`card_fingerprint_hash`/`device_hash` are. Redaction
+  (§4.3) rejects it outright if it looks like an email address (the same recursive scan every
+  field gets) and caps it at 128 bytes. `distinct_recipients_1h` (§4.5) counts distinct
+  `recipient_hash` values in the trailing 1h window, falling back to ADDING `recipient_count` (not
+  counting the event as a single recipient) for any `content.sent` event that carries no hash at
+  all — motivated by a real phishing campaign whose accounts each mailed ~100 recipients on one
+  webmail domain in minutes, which the pre-[S2b] feature set had no way to distinguish from a
+  single large send.
 
 ### 4.3 Event API
 
@@ -241,10 +253,20 @@ Response `202` `{accepted, duplicates, rejected: [{index, code, message}]}`; cod
 | `subject.deleted` | `mode` (`trash`\|`permanent`) | **[r2]** replaces any DELETE call by products |
 | `payment.attempt` | `outcome` (`succeeded`\|`declined`\|`blocked`), `reason`, `funding` (`prepaid`\|`debit`\|`credit`\|`unknown`), `amount_minor`, `currency` | fingerprint travels in `links` |
 | `subscription.changed` | `plan`, `status`, `amount_minor` | |
-| `resource.created` / `resource.deleted` | `kind`, `name` (≤200, NFKC + confusables skeleton stored alongside), `address_domain` | |
-| `content.sent` | `subject_line` (≤200), `recipient_domain`, `recipient_count`, `recipient_hash` (keyed), `recipient_is_own_identity` (bool, product-computed), `first_link_host` | **[r2]** `recipient_hash` + own-identity flag capture rehearsal-to-self |
+| `resource.created` / `resource.deleted` | `kind`, `name` (≤200, NFKC + confusables skeleton stored alongside), `address_domain` | **[S2b]** `kind`'s producer contract, below |
+| `content.sent` | `subject_line` (≤200), `recipient_domain`, `recipient_count`, `recipient_hash` (keyed, ≤128, opaque — never an address), `recipient_is_own_identity` (bool, product-computed), `first_link_host` | **[r2]** `recipient_hash` + own-identity flag capture rehearsal-to-self |
 | `content.verdict` | `source`, `category`, `score` | product-side scanners |
 | `subject.class` | `class` (`customer`\|`internal`\|`synthetic`) | **[r2]** internal/synthetic subjects are stored but never scored |
+
+**[S2b] `resource.created`/`resource.deleted`'s `kind` producer contract:** `kind` is free text (no
+enum — ingest never enforces this), but every v0 feature that filters by kind (§4.5) recognises a
+fixed vocabulary case/whitespace-insensitively: `key`, `api_key`, `apikey` and `api-key` all mean
+"an API key"; `agent`, `mailbox` and `inbox` all mean "an agent identity". A real phishing campaign
+scored low in part because a producer's own `api_key` spelling was never recognised as a key at
+all, so a burst of key creation read as ordinary (uncounted) resource activity. A producer emitting
+a kind outside this vocabulary is not rejected — it simply doesn't match any kind-specific feature,
+falling back to counting only toward the kind-agnostic totals (`resource_velocity_1h`,
+`resource_total`).
 
 **Redaction [r2]** is a static, versioned schema per event type in code (`ingest/redact.go`):
 listed keys pass with their caps; unlisted keys are dropped (not hashed); any value matching an
@@ -368,6 +390,39 @@ every count above it read identically — a 30-domain and a 300-domain fan-out s
 now a `log1p(n)` curve instead, scaled so `n=10` reproduces exactly the hard cap's old contribution
 (no weight change needed) while `n=150` scores meaningfully higher — volume sensitivity above the
 old cap is preserved, just compressed rather than flattened to zero.
+
+**[S2b] Send-volume, webmail, recipient and subject-line-brand features:** a real phishing campaign
+scored low against the v0 feature set above for three reasons every one of these closes: (1) each
+account mailed ~100 recipients on a single webmail domain within minutes — no distinct-domain
+fan-out for `first_day_distinct_domains` to see; (2) the lure text lived only in the message
+subject line, which no v0 feature read at all (`name_brand_match` only ever reads
+`resource.created`/`deleted`'s `name`); (3) resource kind aliasing (§4.3) undercounted key creation.
+New features, all fed from `content.sent` (`recipient_count` summed, falling back to 1 when absent
+— design's own convention for an unset optional count):
+- `sends_10m_max` — the largest sum of `recipient_count` within ANY 10-minute window across the
+  subject's whole history so far (a historical maximum, order-independent; unlike every `*_1h`/
+  `*_24h` feature it needs no window-exit rescore, since a maximum over already-elapsed windows can
+  only grow as a new event arrives, never decay as time passes with none).
+- `sends_1h` / `sends_first_day` — the same sum over the trailing 1h window and the subject's first
+  24h respectively, the latter anchored to `firstSeenAt` exactly like `first_day_distinct_domains`.
+- `webmail_recipient_share` — the LIFETIME share of sent recipients whose `recipient_domain` is on
+  a public webmail-provider list (`config/webmail.yaml`); `webmail_sends_1h` = `sends_1h` × share,
+  since concentration alone (a legitimate newsletter can be 100% webmail) and volume alone are both
+  weak evidence, but the combination is not.
+- `distinct_recipients_1h` — distinct `content.sent` `recipient_hash` values in the trailing 1h
+  window (§4.2's amendment), falling back to ADDING `recipient_count` for any send with no hash.
+- `subject_brand_match` — the curated brand matcher (§5's homoglyph/brand-matching paragraph)
+  applied to `subject_line` instead of a resource `name`, counting DISTINCT brands matched within
+  the trailing 24h, capped at 3 — the same word/token-boundary rule and integration-token gate as
+  `name_brand_match`.
+
+`sends_10m_max`/`sends_1h`/`sends_first_day`/`distinct_recipients_1h` are capped (not `log1p`-scaled
+like `first_day_distinct_domains`): unlike domain BREADTH, where a legitimate account can plausibly
+reach a large count too, raw send volume separates "a few" from "a hundred" by roughly two orders of
+magnitude, and `log1p` compresses that gap by design — `log1p(3)` is already ~30% of `log1p(100)`,
+which would give an ordinary handful-of-recipients send nearly as much proportional weight as a
+genuine mass blast. A plain cap at 300 (comfortably above any v0 fixture's volume) preserves the raw
+count, and therefore the true gap, up to that ceiling.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
