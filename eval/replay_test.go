@@ -323,6 +323,47 @@ func TestLoadReplayDataset_MissingSliceBeforeAnyEvent(t *testing.T) {
 	}
 }
 
+// TestLoadReplayDataset_SkippedEventTaintsWholeSubject is fix round T2's
+// own acceptance test: acct_1 has one GOOD event and one event row that
+// fails validation (an invalid type) — the subject must be
+// HasSkippedEvents=true, and Run must score it as unscored with
+// ErrorCode "skipped_events" rather than silently scoring it on the one
+// event that DID survive.
+func TestLoadReplayDataset_SkippedEventTaintsWholeSubject(t *testing.T) {
+	events := strings.NewReader(`
+{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}
+{"subject":"acct_1","type":"NOT VALID","at":"2031-01-01T00:01:00Z","data":{}}
+{"subject":"acct_1","type":"resource.created","at":"2031-01-01T00:02:00Z","data":{"kind":"agent","name":"A"}}
+`)
+	labels := strings.NewReader(`{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	if err == nil {
+		t.Fatalf("expected a RowError for the invalid event type, got nil")
+	}
+	if len(rowErrs) != 1 || rowErrs[0].Code != "validate_failed" {
+		t.Fatalf("rowErrs = %v, want exactly one validate_failed violation", rowErrs)
+	}
+	if len(ds.Subjects) != 1 {
+		t.Fatalf("len(Subjects) = %d, want 1 (the skip is per-EVENT, not per-subject)", len(ds.Subjects))
+	}
+	if !ds.Subjects[0].HasSkippedEvents {
+		t.Fatalf("HasSkippedEvents = false, want true")
+	}
+
+	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"resource_total"}}
+	run, err := Run(context.Background(), ds, rule, fake.New(), Options{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(run.Verdicts) != 1 {
+		t.Fatalf("len(Verdicts) = %d, want 1", len(run.Verdicts))
+	}
+	v := run.Verdicts[0]
+	if !v.Unscored || v.ErrorCode != "skipped_events" {
+		t.Fatalf("Verdict = %+v, want Unscored=true ErrorCode=skipped_events", v)
+	}
+}
+
 // hash64 returns a syntactically valid (64 lower-case hex characters)
 // but otherwise arbitrary link hash for test fixtures — internal/event's
 // Validate only checks shape, never that it's a real HMAC.

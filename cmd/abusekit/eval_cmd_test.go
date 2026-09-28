@@ -335,13 +335,17 @@ func TestRunEval_SkipInvalidWritesSkippedRows(t *testing.T) {
 		t.Fatalf("read run.json: %v", err)
 	}
 	var got struct {
-		SkippedRows []map[string]any `json:"skipped_rows"`
+		SkippedRows   []map[string]any `json:"skipped_rows"`
+		SkippedByCode map[string]int   `json:"skipped_by_code"`
 	}
 	if err := json.Unmarshal(b, &got); err != nil {
 		t.Fatalf("unmarshal run.json: %v", err)
 	}
 	if len(got.SkippedRows) == 0 {
 		t.Fatalf("skipped_rows is empty, want at least the acct_missing row reported")
+	}
+	if got.SkippedByCode["zero_events"] == 0 {
+		t.Fatalf("skipped_by_code = %v, want a zero_events entry (fix round T2)", got.SkippedByCode)
 	}
 }
 

@@ -98,6 +98,18 @@ type Subject struct {
 	// before it (see replay.go) — SliceFull is always present (it falls
 	// back to "last event + 1ns" when decision_at.full is absent).
 	Points map[Slice]Point
+	// HasSkippedEvents is true when at least one of this subject's OWN
+	// event rows failed to parse/validate/redact and was dropped (fix
+	// round T2, `--skip-invalid`'s own follow-up bug: scoring the subject
+	// anyway, on whatever events DID survive, would silently score a
+	// PARTIAL history — e.g. a dropped payment.attempt or resource.
+	// created changing declines_before_first_success/resource_total
+	// without anyone knowing). Run treats this unconditionally as
+	// unscored with ErrorCode "skipped_events", regardless of which slice
+	// is requested or whether that slice's Point would otherwise have
+	// resolved. Always false for a label-snapshot corpus (nothing there
+	// is event-shaped) and for a subject with zero skipped rows.
+	HasSkippedEvents bool
 }
 
 // Dataset is Run's fully-resolved input: one Subject per corpus row or
@@ -355,11 +367,21 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 
 		pt, ok := subj.Points[slice]
 		v := Verdict{Subject: subj.ID, Label: subj.Label, Tier: "unknown"} // nit: an unscored verdict's tier is "unknown", never the Go zero value ""
-		if !ok {
+		switch {
+		case subj.HasSkippedEvents:
+			// Fix round T2: checked BEFORE the Points lookup and
+			// unconditionally, regardless of slice or whether that
+			// slice's Point would otherwise have resolved — a subject
+			// with any dropped event row is never scored on its
+			// remaining partial history.
+			v.Unscored = true
+			v.ErrorCode = "skipped_events"
+			rec.unscored = true
+		case !ok:
 			v.Unscored = true
 			v.ErrorCode = "missing_slice"
 			rec.unscored = true
-		} else {
+		default:
 			risk, flagged, unscored, res, errCode, callErr := scoreOne(ctx, rule, scorer, opts, pt)
 			switch {
 			case callErr != nil && errors.Is(callErr, ErrCassetteMiss):

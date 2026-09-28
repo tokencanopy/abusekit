@@ -375,12 +375,27 @@ func toSkippedRowInfo(rowErrs []eval.RowError) []skippedRowInfo {
 	return out
 }
 
+// skippedByCode tallies rowErrs by Code (fix round T2's own
+// `skipped_by_code`) — a quick "what kind of thing got skipped, and how
+// much of it" summary alongside the full skipped_rows detail.
+func skippedByCode(rowErrs []eval.RowError) map[string]int {
+	if len(rowErrs) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(rowErrs))
+	for _, re := range rowErrs {
+		out[re.Code]++
+	}
+	return out
+}
+
 // singleRunOutput is a single scorer's output shape: RunResult's own
-// fields promoted to the top level, plus `skipped_rows` when
-// --skip-invalid dropped any (fix round P2).
+// fields promoted to the top level, plus `skipped_rows`/`skipped_by_code`
+// when --skip-invalid dropped any (fix round P2/T2).
 type singleRunOutput struct {
 	eval.RunResult
-	SkippedRows []skippedRowInfo `json:"skipped_rows,omitempty"`
+	SkippedRows   []skippedRowInfo `json:"skipped_rows,omitempty"`
+	SkippedByCode map[string]int   `json:"skipped_by_code,omitempty"`
 }
 
 // writeEvalOutput writes run.json (a single scorer) or a
@@ -389,11 +404,11 @@ type singleRunOutput struct {
 func writeEvalOutput(path string, names []string, results map[string]eval.RunResult, skippedRows []eval.RowError) error {
 	var payload any
 	if len(names) == 1 {
-		payload = singleRunOutput{RunResult: results[names[0]], SkippedRows: toSkippedRowInfo(skippedRows)}
+		payload = singleRunOutput{RunResult: results[names[0]], SkippedRows: toSkippedRowInfo(skippedRows), SkippedByCode: skippedByCode(skippedRows)}
 	} else {
 		out := make(map[string]singleRunOutput, len(names))
 		for _, n := range names {
-			out[n] = singleRunOutput{RunResult: results[n], SkippedRows: toSkippedRowInfo(skippedRows)}
+			out[n] = singleRunOutput{RunResult: results[n], SkippedRows: toSkippedRowInfo(skippedRows), SkippedByCode: skippedByCode(skippedRows)}
 		}
 		payload = out
 	}

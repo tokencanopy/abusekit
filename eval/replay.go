@@ -175,7 +175,7 @@ type ReplayInput struct {
 // wanting S4's original strict behavior treats a non-nil error as fatal
 // and ignores the Dataset, unchanged.
 func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, benignLabel string) (Dataset, []RowError, error) {
-	eventsBySubject, labelEvents, rowErrs, err := parseEventRows(in.EventsPath, in.Events)
+	eventsBySubject, labelEvents, skippedEventSubjects, rowErrs, err := parseEventRows(in.EventsPath, in.Events)
 	if err != nil {
 		return Dataset{}, nil, err
 	}
@@ -282,12 +282,13 @@ func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, benignLabel stri
 		}
 
 		subjects = append(subjects, Subject{
-			ID:       row.Subject,
-			Label:    row.Label,
-			Category: row.Category,
-			Source:   row.Source,
-			Meta:     map[string]any{"decision_at": resolvedAt, "event_count": len(events)},
-			Points:   points,
+			ID:               row.Subject,
+			Label:            row.Label,
+			Category:         row.Category,
+			Source:           row.Source,
+			Meta:             map[string]any{"decision_at": resolvedAt, "event_count": len(events)},
+			Points:           points,
+			HasSkippedEvents: skippedEventSubjects[row.Subject], // fix round T2
 		})
 		subjectIDs = append(subjectIDs, row.Subject)
 	}
@@ -403,33 +404,66 @@ func stripNullFields(data map[string]any) {
 // every `label`-typed row (fix round B1 — see labelEventType), kept
 // OUT of (a) so it can never be read by feature.Extract as if it were
 // real account activity.
-func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[string][]labelledAt, []RowError, error) {
+// peekSubject leniently recovers a "subject" field from a raw JSON line
+// that failed STRICT decoding (fix round T2) — used only to attribute a
+// dropped row to a subject for HasSkippedEvents tracking; a truly
+// unparseable line (invalid JSON syntax, not just an extra/unknown
+// field) yields "", and that row simply can't be attributed to anyone.
+func peekSubject(raw []byte) string {
+	var probe struct {
+		Subject string `json:"subject"`
+	}
+	if json.Unmarshal(raw, &probe) == nil {
+		return probe.Subject
+	}
+	return ""
+}
+
+func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[string][]labelledAt, map[string]bool, []RowError, error) {
 	events := map[string][]event.Event{}
 	labelEvents := map[string][]labelledAt{}
+	// skippedSubjects (fix round T2) collects every subject that had at
+	// least one DOMAIN-event row dropped — never a `label`-typed row,
+	// which isn't part of feature-relevant activity history at all (see
+	// the bad_label_event case below, which deliberately does not taint
+	// the subject). LoadReplayDataset sets Subject.HasSkippedEvents from
+	// this so such a subject is never scored on its surviving partial
+	// history, in ANY --skip-invalid run.
+	skippedSubjects := map[string]bool{}
 	var rowErrs []RowError
 	err := scanJSONL(r, func(line int, raw []byte) error {
-		fail := func(code, format string, args ...any) error {
+		fail := func(subject, code, format string, args ...any) error {
 			rowErrs = append(rowErrs, RowError{Source: path, Line: line, Code: code, Err: fmt.Errorf(format, args...)})
+			if subject != "" {
+				skippedSubjects[subject] = true
+			}
 			return nil
 		}
 		var row eventRow
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&row); err != nil {
-			return fail("bad_json", "events: invalid JSON or unknown field: %w", err)
+			return fail(peekSubject(raw), "bad_json", "events: invalid JSON or unknown field: %w", err)
 		}
 		if row.Subject == "" || row.Type == "" || row.At == "" {
-			return fail("missing_field", "events: subject, type, and at are all required")
+			return fail(row.Subject, "missing_field", "events: subject, type, and at are all required")
 		}
 		at, err := parseRFC3339(row.At)
 		if err != nil {
-			return fail("bad_at", "events: at: %w", err)
+			return fail(row.Subject, "bad_at", "events: at: %w", err)
 		}
 
 		if row.Type == labelEventType {
 			value, ok := dataStringField(row.Data, "label")
 			if !ok || value == "" {
-				return fail("bad_label_event", "events: subject %q: a %q event needs a non-empty string data.label", row.Subject, labelEventType)
+				// Deliberately NOT tainted via skippedSubjects: a `label`
+				// event is never part of feature-relevant activity
+				// history (see labelEventType's own doc comment), so
+				// dropping one can't produce a partial ACTIVITY history —
+				// only a gap in linked_labelled_abusive_n evidence, a
+				// different and much softer concern T2 doesn't ask for.
+				rowErrs = append(rowErrs, RowError{Source: path, Line: line, Code: "bad_label_event", Err: fmt.Errorf("events: subject %q: a %q event needs a non-empty string data.label", row.Subject, labelEventType)})
+				return nil
 			}
 			labelEvents[row.Subject] = append(labelEvents[row.Subject], labelledAt{at: at, value: value})
 			return nil
@@ -446,18 +480,18 @@ func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[str
 		// fictional-timestamped data has no business being checked
 		// against the real wall clock's ±24h window.
 		if err := e.Validate(event.ValidateOptions{Now: at}); err != nil {
-			return fail("validate_failed", "events: %w", err)
+			return fail(row.Subject, "validate_failed", "events: %w", err)
 		}
 		if err := e.Redact(); err != nil {
-			return fail("redact_failed", "events: %w", err)
+			return fail(row.Subject, "redact_failed", "events: %w", err)
 		}
 		events[row.Subject] = append(events[row.Subject], e)
 		return nil
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("eval: read events file %s: %w", path, err)
+		return nil, nil, nil, nil, fmt.Errorf("eval: read events file %s: %w", path, err)
 	}
-	return events, labelEvents, rowErrs, nil
+	return events, labelEvents, skippedSubjects, rowErrs, nil
 }
 
 type lineLabelRow struct {
