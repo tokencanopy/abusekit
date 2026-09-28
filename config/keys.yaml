@@ -31,12 +31,13 @@ keys:
     producer: e2a-billing
     scopes: [events]
 
-  # The operator UI / dashboard: reads scores, posts labels, and can erase
-  # a subject on a legal request (design §4.4/§4.9).
+  # The operator UI / dashboard: reads scores, posts labels (design §4.9).
+  # Erasure (design §4.4) is not implemented in this slice — see
+  # docs/design/notes/erasure-findings.md on feat/s3b-list-erasure.
   - id: dev_e2a_operator
     secret: "dev-only-secret-e2a-operator-0000000000000000"
     tenant: e2a
-    scopes: [read, labels, erase]
+    scopes: [read, labels]
 
   # A one-off operator backfill script (design §4.12): skips the ±24h
   # clock-skew check (design §4.3/§5) and never fires webhooks.

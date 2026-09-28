@@ -10,7 +10,12 @@ import (
 )
 
 // Scope is one capability a key can be granted (design §4.3: "Key scopes:
-// events, labels, read, backfill" plus §4.4's operator-only "erase").
+// events, labels, read, backfill"). §4.4's operator-only "erase" scope is
+// NOT defined here yet — the erasure endpoint itself was pulled out of S3
+// into its own slice (S3b, branch feat/s3b-list-erasure) after the S3 fix
+// round found its semantics unsafe to ship; see
+// docs/design/notes/erasure-findings.md on that branch. Re-add `erase`
+// alongside that endpoint's real implementation, not before.
 type Scope string
 
 const (
@@ -18,7 +23,6 @@ const (
 	ScopeLabels   Scope = "labels"
 	ScopeRead     Scope = "read"
 	ScopeBackfill Scope = "backfill"
-	ScopeErase    Scope = "erase"
 )
 
 // knownScopes enumerates every scope internal/serve understands, for
@@ -28,7 +32,6 @@ var knownScopes = map[Scope]bool{
 	ScopeLabels:   true,
 	ScopeRead:     true,
 	ScopeBackfill: true,
-	ScopeErase:    true,
 }
 
 // Key is one entry from config/keys.yaml: a shared HMAC secret bound to a

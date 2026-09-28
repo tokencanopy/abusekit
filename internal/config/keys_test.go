@@ -18,7 +18,7 @@ keys:
   - id: prod_e2a_operator
     secret: dev-secret-labels-not-real
     tenant: e2a
-    scopes: [labels, read, erase]
+    scopes: [labels, read]
   - id: prod_e2a_backfill
     secret: dev-secret-backfill-not-real
     tenant: e2a
