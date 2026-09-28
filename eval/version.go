@@ -32,12 +32,32 @@ const AbusekitVersion = "v0-s4-dev"
 // a bump (this repo's own additive-change convention).
 const SchemaVersion = "run.v1"
 
-// gitSHA reads the build's VCS revision from Go's own build-info
-// embedding (automatic since Go 1.18 when built from a git checkout via
-// plain `go build`; see `go help buildvcs`) — no ldflags wiring needed.
-// Returns "" when unavailable (go run, a non-git checkout, or
-// -buildvcs=false), same as AbusekitVersion's own placeholder status.
+// buildGitSHA is empty by default; the Makefile's `gate` target sets it
+// at link time via `-ldflags -X`. Fix round T6: `runtime/debug.
+// ReadBuildInfo`'s vcs.revision reads the ROOT checkout's HEAD, not a
+// nested `git worktree`'s own HEAD, when built from inside
+// `.worktrees/<name>` (a Go toolchain limitation — the VCS stamping walks
+// up to find a single repository root and stops there, never noticing
+// the worktree's own separate HEAD) — every fix round in this PR was
+// built from exactly such a worktree, so gitSHA() silently reported the
+// wrong commit for every `make gate` run until this. -ldflags stamping
+// bypasses the bug entirely: the SHA is baked in at build time from
+// whatever `git rev-parse HEAD` the build's own working directory
+// resolves, not re-derived from embedded VCS metadata at run time.
+var buildGitSHA string
+
+// gitSHA returns buildGitSHA when the binary was built with it stamped in
+// (see buildGitSHA's own doc comment), else falls back to Go's own
+// build-info VCS embedding (automatic since Go 1.18 when built from a git
+// checkout via plain `go build`; see `go help buildvcs`) — correct for a
+// normal, non-nested-worktree checkout, which is why the fallback is kept
+// rather than replaced outright. Returns "" when neither is available (go
+// run, a non-git checkout, -buildvcs=false, and no -ldflags stamping),
+// same as AbusekitVersion's own placeholder status.
 func gitSHA() string {
+	if buildGitSHA != "" {
+		return buildGitSHA
+	}
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		return ""

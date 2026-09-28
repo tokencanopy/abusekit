@@ -177,17 +177,25 @@ type Metrics struct {
 	// UnscoredCount / TruncatedCount are reported separately from the
 	// confusion matrix per design: "unscored counts as a miss [for
 	// recall] ... report the unscored count separately".
-	UnscoredCount  int `json:"unscored_count"`
-	TruncatedCount int `json:"truncated_count"`
-	Total          int `json:"total"`
+	UnscoredCount int `json:"unscored_count"`
+	// MissingSliceCount (fix round T6) is the subset of UnscoredCount
+	// whose ErrorCode is specifically "missing_slice" (subj.Points had no
+	// entry for the requested slice — e.g. a subject with no qualifying
+	// event before decision_at for this slice) — reported separately so
+	// "the corpus doesn't cover this slice for N subjects" is visible
+	// without having to re-derive it from a full run.json's verdict list.
+	MissingSliceCount int `json:"missing_slice_count"`
+	TruncatedCount    int `json:"truncated_count"`
+	Total             int `json:"total"`
 }
 
 func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, totalCostMicro int64, latenciesMS []float64) Metrics {
 	var (
-		tp, fp, tn, fn int
-		unscoredCount  int
-		truncatedCount int
-		aurocPts       []aurocPoint
+		tp, fp, tn, fn    int
+		unscoredCount     int
+		missingSliceCount int
+		truncatedCount    int
+		aurocPts          []aurocPoint
 	)
 
 	tierBuckets := map[string]struct{ tp, fp, fn int }{}
@@ -219,6 +227,9 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 		}
 		if r.unscored {
 			unscoredCount++
+			if r.errorCode == "missing_slice" {
+				missingSliceCount++
+			}
 			if r.positive {
 				fn++ // design: "treat an unscored verdict as a miss for recall"
 				if haveValidTiers {
@@ -267,15 +278,16 @@ func computeMetrics(records []scoredRecord, tiers config.Tiers, replay bool, tot
 	}
 
 	m := Metrics{
-		Threshold:       newPRF(tp, fp, fn),
-		ConfusionMatrix: ConfusionMatrix{TP: tp, FP: fp, TN: tn, FN: fn},
-		ECE:             computeECE(aurocPts, eceBinCount),
-		AUROC:           computeAUROC(aurocPts),
-		Latency:         computeLatency(latenciesMS),
-		CostTotalMicro:  totalCostMicro,
-		UnscoredCount:   unscoredCount,
-		TruncatedCount:  truncatedCount,
-		Total:           len(records),
+		Threshold:         newPRF(tp, fp, fn),
+		ConfusionMatrix:   ConfusionMatrix{TP: tp, FP: fp, TN: tn, FN: fn},
+		ECE:               computeECE(aurocPts, eceBinCount),
+		AUROC:             computeAUROC(aurocPts),
+		Latency:           computeLatency(latenciesMS),
+		CostTotalMicro:    totalCostMicro,
+		UnscoredCount:     unscoredCount,
+		MissingSliceCount: missingSliceCount,
+		TruncatedCount:    truncatedCount,
+		Total:             len(records),
 	}
 	if haveValidTiers {
 		m.TierCuts = map[string]PRF{

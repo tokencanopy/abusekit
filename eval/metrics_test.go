@@ -158,6 +158,29 @@ func TestComputeMetrics_HandComputedConfusionMatrix(t *testing.T) {
 	}
 }
 
+// TestComputeMetrics_MissingSliceCount is fix round T6's own acceptance
+// test: MissingSliceCount tallies only the unscored records whose
+// errorCode is specifically "missing_slice", not every unscored record
+// (a skipped_events or scorer_error unscored record must NOT be counted).
+func TestComputeMetrics_MissingSliceCount(t *testing.T) {
+	records := []scoredRecord{
+		{positive: true, flagged: true, risk: 0.9},
+		{positive: true, unscored: true, errorCode: "missing_slice"},
+		{positive: true, unscored: true, errorCode: "missing_slice"},
+		{positive: false, unscored: true, errorCode: "skipped_events"},
+		{positive: false, unscored: true, errorCode: "scorer_error"},
+	}
+
+	m := computeMetrics(records, config.Tiers{}, false, 0, nil)
+
+	if m.UnscoredCount != 4 {
+		t.Fatalf("UnscoredCount = %d, want 4", m.UnscoredCount)
+	}
+	if m.MissingSliceCount != 2 {
+		t.Fatalf("MissingSliceCount = %d, want 2 (only the two errorCode==\"missing_slice\" records)", m.MissingSliceCount)
+	}
+}
+
 // TestComputeMetrics_TierCuts checks the tier-cut PRF path (a separate
 // confusion matrix at each of medium/high, independent of the rule's own
 // threshold used for the main ConfusionMatrix).

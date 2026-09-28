@@ -289,6 +289,11 @@ type scoredRecord struct {
 	label     string
 	positive  bool // label != rule.BenignLabel
 	unscored  bool
+	// errorCode mirrors Verdict.ErrorCode (fix round T6) — set whenever
+	// unscored is true, so computeMetrics can tally a specific error
+	// code (missing_slice_count) separately from the general
+	// UnscoredCount, without re-deriving it from anything else.
+	errorCode string
 	risk      float64
 	flagged   bool
 	truncated bool
@@ -377,10 +382,12 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 			v.Unscored = true
 			v.ErrorCode = "skipped_events"
 			rec.unscored = true
+			rec.errorCode = v.ErrorCode
 		case !ok:
 			v.Unscored = true
 			v.ErrorCode = "missing_slice"
 			rec.unscored = true
+			rec.errorCode = v.ErrorCode
 		default:
 			risk, flagged, unscored, res, errCode, callErr := scoreOne(ctx, rule, scorer, opts, pt)
 			switch {
@@ -390,10 +397,12 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 				v.Unscored = true
 				v.ErrorCode = "scorer_error"
 				rec.unscored = true
+				rec.errorCode = v.ErrorCode
 			case unscored:
 				v.Unscored = true
 				v.ErrorCode = errCode
 				rec.unscored = true
+				rec.errorCode = v.ErrorCode
 			default:
 				v.Risk = risk
 				v.Flagged = flagged

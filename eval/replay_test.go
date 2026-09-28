@@ -321,6 +321,11 @@ func TestLoadReplayDataset_MissingSliceBeforeAnyEvent(t *testing.T) {
 	if !v.Unscored || v.ErrorCode != "missing_slice" {
 		t.Fatalf("Verdict = %+v, want Unscored=true ErrorCode=missing_slice", v)
 	}
+	// Fix round T6: Metrics.MissingSliceCount tallies this end to end
+	// through Run, not just computeMetrics in isolation.
+	if run.Metrics.MissingSliceCount != 1 {
+		t.Fatalf("Metrics.MissingSliceCount = %d, want 1", run.Metrics.MissingSliceCount)
+	}
 }
 
 // TestLoadReplayDataset_SkippedEventTaintsWholeSubject is fix round T2's

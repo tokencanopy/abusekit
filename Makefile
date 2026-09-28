@@ -46,8 +46,16 @@ fmt:
 # binary when it matches more than one package (Go's own default), so
 # gate builds cmd/abusekit explicitly to a throwaway path instead of
 # depending on `build`.
+#
+# Fix round T6: -ldflags stamps eval.buildGitSHA from THIS build's own
+# working directory, bypassing `runtime/debug.ReadBuildInfo`'s
+# nested-git-worktree bug (see eval/version.go's buildGitSHA doc
+# comment) — `git worktree`'s VCS embedding otherwise silently reports
+# the ROOT checkout's HEAD, not this worktree's, for every `make gate`
+# run. `git rev-parse HEAD` falls back to empty (never fails the build)
+# when run outside a git checkout at all.
 gate:
-	go build -o .gate-abusekit ./cmd/abusekit
+	go build -ldflags "-X github.com/tokencanopy/abusekit/eval.buildGitSHA=$$(git rev-parse HEAD 2>/dev/null)" -o .gate-abusekit ./cmd/abusekit
 	@./.gate-abusekit eval \
 		--dataset eval/fixtures/synthetic/events.jsonl \
 		--labels eval/fixtures/synthetic/labels.jsonl \
