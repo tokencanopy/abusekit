@@ -169,3 +169,32 @@ weights:
   # change that could have pushed it into `high`; left unchanged and
   # reverified to still land at 0.49.
   burst_ratio_24h_vs_lifetime: 0.3
+
+  # S2b: send volume, addressing common bulk-phishing shapes. sends_10m_max
+  # carries the main "burst intensity" signal; sends_1h is a smaller
+  # companion (correlated with sends_10m_max in a genuine burst, the same
+  # velocity/total relationship resource_velocity_1h/resource_total
+  # already have); sends_first_day is a separate time anchor for a
+  # slower first-day ramp the sharper windows don't catch. See PR body's
+  # "which fixture bounded which weight" table for the sensitivity sweep.
+  sends_10m_max: 0.012
+  sends_1h: 0.0008
+  sends_first_day: 0.0008
+
+  # S2b: webmail concentration. webmail_recipient_share is a normalized
+  # ratio (0..1), so its weight is sized like name_brand_match/upgraded,
+  # not like a raw count; webmail_sends_1h is the main webmail-specific
+  # volume signal (deliberately the LARGEST of the new weights: an
+  # established sender's identical volume is already zeroed by
+  # youngAccountFactor, so this weight only ever fires for a genuinely
+  # young account); distinct_recipients_1h is a smaller companion,
+  # correlated with sends_1h/webmail_sends_1h in most fixtures here.
+  webmail_recipient_share: 1.1
+  webmail_sends_1h: 0.014
+  distinct_recipients_1h: 0.0008
+
+  # S2b: a brand mentioned in the message SUBJECT rather than (or, per S2,
+  # in addition to but never double-counted with) the sending resource's
+  # own name — comparable magnitude to name_brand_match since it is the
+  # same kind of evidence, read from a different field.
+  subject_brand_match: 1.5

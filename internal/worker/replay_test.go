@@ -100,7 +100,7 @@ func runReplayAt(t *testing.T, events []event.Event, subject string, now time.Ti
 
 	ingestFixture(t, ctx, s, events)
 
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadTestBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -351,4 +351,73 @@ func TestReplay_SelfSendBrandNameStaysBelowHigh(t *testing.T) {
 		t.Errorf("benign_selfsend_brandname: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
 	assertBand(t, "benign_selfsend_brandname", view.Score, 0.05, 0.35)
+}
+
+// TestReplay_WebmailBlastReachesAtLeastMedium replays eval/fixtures/
+// webmail_blast.jsonl — S2b's B2 fixture: a brand-new account sending 100
+// recipients, all on a single consumer webmail domain, within its first
+// 10 minutes, with entirely neutral subject lines (no brand mentioned at
+// all). Addresses a common bulk-phishing shape on volume and webmail
+// concentration ALONE, with no brand signal to lean on — must reach at
+// least tier "medium".
+func TestReplay_WebmailBlastReachesAtLeastMedium(t *testing.T) {
+	view := runReplay(t, "webmail_blast.jsonl", "acct_example_webmail_blast_1")
+	if view.Tier == "low" {
+		t.Errorf("webmail_blast: tier = low (score %v), want medium or high\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "webmail_blast", view.Score, 0.55, 0.85)
+}
+
+// TestReplay_SingleBrandBlastReachesHigh replays eval/fixtures/
+// single_brand_blast_45m.jsonl — S2b's B2 fixture: a brand-new account
+// sending 240 recipients across consumer webmail domains over 45 minutes,
+// every subject line mentioning the identical fictional brand
+// ("Glowbank" — eval/fixtures/test_brands.yaml, never a real brand name).
+// Combining a repeated brand mention with a sustained volume burst is a
+// stronger signal than either alone (contrast webmail_blast, which has
+// volume but no brand, and day0_marketplace_seller, which has a brand but
+// a much smaller volume) — expected tier: "high".
+func TestReplay_SingleBrandBlastReachesHigh(t *testing.T) {
+	view := runReplay(t, "single_brand_blast_45m.jsonl", "acct_example_single_brand_blast_1")
+	if view.Tier != "high" {
+		t.Errorf("single_brand_blast_45m: tier = %q (score %v), want high\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "single_brand_blast_45m", view.Score, 0.95, 1.0)
+}
+
+// TestReplay_EstablishedNewsletterStaysBelowMedium replays eval/fixtures/
+// established_newsletter_burst.jsonl — S2b's B1 fixture: a 60-day-old,
+// paid, established newsletter sender with a real history of periodic
+// sends, whose most recent send happens to burst 300 recipients (all
+// consumer webmail) within 10 minutes — the exact shape a lifetime-max
+// volume feature with no account-age awareness would flag `high` on
+// alone, and the flag would never decay for an account that keeps
+// operating normally afterward. youngAccountFactor (B1 fix round) zeroes
+// every send-volume feature for an account this far past its first week,
+// so this fixture must stay below tier "medium".
+func TestReplay_EstablishedNewsletterStaysBelowMedium(t *testing.T) {
+	view := runReplay(t, "established_newsletter_burst.jsonl", "acct_example_established_newsletter_1")
+	if view.Tier != "low" {
+		t.Errorf("established_newsletter_burst: tier = %q (score %v), want low\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "established_newsletter_burst", view.Score, 0.0, 0.2)
+}
+
+// TestReplay_Day0MarketplaceSellerStaysBelowHigh replays eval/fixtures/
+// day0_marketplace_seller.jsonl — S2b's B2 fixture: a brand-new account
+// whose agent is named after a fictional shop brand ("Fictashop" —
+// eval/fixtures/test_brands.yaml), no integration token in that name,
+// sending "Your Fictashop order has shipped" to 30 webmail buyers over
+// its first hour — a plausible day-0 legitimate marketplace seller as
+// much as a suspicious blast. Also exercises S2 in a realistic combined
+// scenario: the agent's own name already matches "Fictashop"
+// (name_brand_match=1), so subject_brand_match must NOT also credit the
+// identical brand mentioned in every subject line. Must stay below tier
+// "high".
+func TestReplay_Day0MarketplaceSellerStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "day0_marketplace_seller.jsonl", "acct_example_marketplace_seller_1")
+	if view.Tier == "high" {
+		t.Errorf("day0_marketplace_seller: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "day0_marketplace_seller", view.Score, 0.6, 0.78)
 }

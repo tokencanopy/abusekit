@@ -9,6 +9,11 @@
 # The jev/laya shadow rules from the design §4.5 example arrive with
 # their adapters in S5; adding them here before S5 would fail Load with
 # "unknown scorer" against this slice's registry.
+#
+# S2b adds seven inputs (send volume, webmail, recipient hashing, subject
+# brand match) to this SAME rule, addressing common bulk-phishing shapes —
+# see docs/design's [S2b] amendment to §4.5 and config/local_weights.yaml
+# for each new weight's fixture-verified sensitivity window.
 tiers:
   medium: 0.4
   high: 0.8
@@ -37,6 +42,13 @@ rules:
       - fingerprint_seen_on_other_subjects
       - neighbors_truncated
       - burst_ratio_24h_vs_lifetime
+      - sends_10m_max
+      - sends_1h
+      - sends_first_day
+      - webmail_recipient_share
+      - webmail_sends_1h
+      - distinct_recipients_1h
+      - subject_brand_match
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6

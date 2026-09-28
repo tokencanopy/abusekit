@@ -369,6 +369,145 @@ func TestEvent_Redact(t *testing.T) {
 				}
 			},
 		},
+
+		// --- S2b: S4, recipient_hash format ---------------------------
+
+		{
+			name: "recipient_hash accepts a well-formed keyed hash",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_hash": "AbCdEf12_34:56+78/90=="},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_hash"] != "AbCdEf12_34:56+78/90==" {
+					t.Fatalf("expected the hash to pass through unchanged, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "recipient_hash rejects an '@'",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "abcdef12@34567890"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_hash rejects a '%'",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "abcdef12%34567890"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_hash rejects whitespace",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "abcdef12 34567890"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_hash rejects a value shorter than 8 characters",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "ab12"},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_hash rejects a value longer than 128 characters",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": strings.Repeat("a", 129)},
+			wantCode: CodeRedactionFailed,
+		},
+
+		// --- S2b: S5, subject_line masks an email instead of rejecting --
+
+		{
+			name: "subject_line masks an embedded email instead of rejecting the event",
+			typ:  "content.sent",
+			data: map[string]any{"subject_line": "Please confirm at someone@example.com today"},
+			check: func(t *testing.T, out map[string]any) {
+				got, _ := out["subject_line"].(string)
+				if strings.Contains(got, "@example.com") || strings.Contains(got, "someone") {
+					t.Fatalf("expected the email to be masked, got %#v", got)
+				}
+				if !strings.Contains(got, "@") {
+					t.Fatalf("expected the masked substring to be replaced with \"@\", got %#v", got)
+				}
+				if !strings.Contains(got, "Please confirm at") || !strings.Contains(got, "today") {
+					t.Fatalf("expected the rest of the subject line to survive, got %#v", got)
+				}
+			},
+		},
+		{
+			name: "subject_line with no email is unaffected",
+			typ:  "content.sent",
+			data: map[string]any{"subject_line": "Your order has shipped"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["subject_line"] != "Your order has shipped" {
+					t.Fatalf("expected an unchanged subject line, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "every OTHER field still rejects an embedded email outright (S5 does not widen the exception)",
+			typ:      "content.sent",
+			data:     map[string]any{"first_link_host": "someone@example.com"},
+			wantCode: CodeRedactionFailed,
+		},
+
+		// --- S2b: S6, recipient_hash + recipient_count > 1 is rejected --
+
+		{
+			name: "recipient_hash alone (no recipient_count) is fine",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_hash": "abcdefgh12345678"},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_hash"] != "abcdefgh12345678" {
+					t.Fatalf("expected the hash to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name: "recipient_hash with recipient_count == 1 is fine",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_hash": "abcdefgh12345678", "recipient_count": 1.0},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_count"] != 1.0 {
+					t.Fatalf("expected recipient_count to pass through, got %#v", out)
+				}
+			},
+		},
+		{
+			name:     "recipient_hash with recipient_count > 1 is rejected",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_hash": "abcdefgh12345678", "recipient_count": 2.0},
+			wantCode: CodeRedactionFailed,
+		},
+
+		// --- S2b: N6, recipient_count must be a positive integer -------
+
+		{
+			name:     "recipient_count rejects zero",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_count": 0.0},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_count rejects a negative value",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_count": -3.0},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name:     "recipient_count rejects a fractional value",
+			typ:      "content.sent",
+			data:     map[string]any{"recipient_count": 2.5},
+			wantCode: CodeRedactionFailed,
+		},
+		{
+			name: "recipient_count accepts a positive integer",
+			typ:  "content.sent",
+			data: map[string]any{"recipient_count": 42.0},
+			check: func(t *testing.T, out map[string]any) {
+				if out["recipient_count"] != 42.0 {
+					t.Fatalf("expected recipient_count to pass through, got %#v", out)
+				}
+			},
+		},
 	}
 
 	for _, tc := range tests {

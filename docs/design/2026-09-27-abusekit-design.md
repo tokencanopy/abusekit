@@ -257,6 +257,21 @@ stringification. The schema version that produced a given row is recorded on it
 (`events.redaction_version`) so a later schema change can identify rows redacted under an older
 rule set.
 
+**[S2b]** Four amendments to `content.sent`, bumping `RedactionSchemaVersion` to 2: (a) `recipient_hash`
+must match a closed format, `^[A-Za-z0-9_:+/=-]{8,128}$` — anything containing `@` or `%`, any
+whitespace, or any other out-of-set character is rejected, not truncated (a formatted field's shape
+is exact, so truncating an over-length value first could silently turn an invalid hash into one that
+happens to match); (b) `subject_line` MASKS an email-shaped substring (replacing it with `@`) instead
+of rejecting the whole event the way every other field's embedded-email check still does — a bulk
+lure's subject line is exactly the field most likely to legitimately quote back an address, and
+losing the whole event over it destroys the very evidence the vocabulary exists to capture; (c) a
+`recipient_hash` paired with `recipient_count > 1` is rejected — design's own contract is that a set
+`recipient_hash` represents exactly one recipient; (d) `recipient_count`, if present, must be a
+positive integer. **[S2b]** `resource.created`/`resource.deleted`'s `kind` also normalizes a small,
+documented set of producer spelling variants for the key resource kind (e.g. `api_key`, `api_keys`,
+`api-key`, `apikey`, "api key", `keys`) to the same canonical value, so a producer's own convention
+for naming this field never silently reads as ordinary, uncounted resource activity.
+
 ### 4.4 Score API
 
 `GET /v1/subjects/{subject}` → `200` (a seen-but-unscored subject is `200` with `tier:"unknown"`;

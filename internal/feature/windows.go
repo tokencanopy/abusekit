@@ -558,6 +558,20 @@ func recipientCountOf(e event.Event) float64 {
 	return capAt(n, sendsVolumeCap)
 }
 
+// isSelfSend reports whether e is a content.sent event with
+// recipient_is_own_identity true — every send-volume/webmail/distinct-
+// recipient feature below excludes these: they measure reach to OTHER
+// recipients (design's own "first-day recipient fan-out" framing), and a
+// self-send is, by definition, not a recipient in that sense. Without
+// this exclusion, an account rehearsing several test sends to its own
+// inbox (already SelfSendBeforeExternal's own signal, capped separately)
+// would ALSO inflate every one of these new features, double-counting
+// the identical rehearsal behaviour under two different features.
+func isSelfSend(e event.Event) bool {
+	own, ok := dataBool(e.Data, "recipient_is_own_identity")
+	return ok && own
+}
+
 // sendsInWindow sums recipientCountOf across content.sent events falling
 // within the half-open window (now-window, now] — withinWindow's own
 // convention, which already excludes a future-dated event (N5 fix
@@ -565,7 +579,7 @@ func recipientCountOf(e event.Event) float64 {
 func sendsInWindow(events []event.Event, now time.Time, window time.Duration) float64 {
 	var sum float64
 	for _, e := range events {
-		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+		if e.Type != "content.sent" || isSelfSend(e) || !withinWindow(e.At, now, window) {
 			continue
 		}
 		sum += recipientCountOf(e)
@@ -597,7 +611,7 @@ func sendsFirstDay(events []event.Event, firstSeenAt, now time.Time, window time
 	cutoff := firstSeenAt.Add(window)
 	var sum float64
 	for _, e := range events {
-		if e.Type != "content.sent" {
+		if e.Type != "content.sent" || isSelfSend(e) {
 			continue
 		}
 		if e.At.Before(firstSeenAt) || e.At.After(cutoff) || e.At.After(now) {
@@ -631,7 +645,7 @@ func sends10mMax(events []event.Event, now, firstSeenAt time.Time) float64 {
 	}
 	var pts []point
 	for _, e := range events {
-		if e.Type != "content.sent" || e.At.After(now) {
+		if e.Type != "content.sent" || isSelfSend(e) || e.At.After(now) {
 			continue
 		}
 		pts = append(pts, point{e.At, recipientCountOf(e)})
@@ -669,7 +683,7 @@ func distinctRecipients1h(events []event.Event, now, firstSeenAt time.Time, wind
 	seen := make(map[string]struct{})
 	var fallback float64
 	for _, e := range events {
-		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+		if e.Type != "content.sent" || isSelfSend(e) || !withinWindow(e.At, now, window) {
 			continue
 		}
 		if h, ok := dataString(e.Data, "recipient_hash"); ok && h != "" {
@@ -692,7 +706,7 @@ func distinctRecipients1h(events []event.Event, now, firstSeenAt time.Time, wind
 func webmailRecipientShare(events []event.Event, now time.Time, webmail WebmailSet) float64 {
 	var total, webmailSum float64
 	for _, e := range events {
-		if e.Type != "content.sent" || e.At.After(now) {
+		if e.Type != "content.sent" || isSelfSend(e) || e.At.After(now) {
 			continue
 		}
 		n := recipientCountOf(e)
@@ -721,7 +735,7 @@ func webmailRecipientShare(events []event.Event, now time.Time, webmail WebmailS
 func webmailSends1h(events []event.Event, now, firstSeenAt time.Time, window time.Duration, webmail WebmailSet) float64 {
 	var sum float64
 	for _, e := range events {
-		if e.Type != "content.sent" || !withinWindow(e.At, now, window) {
+		if e.Type != "content.sent" || isSelfSend(e) || !withinWindow(e.At, now, window) {
 			continue
 		}
 		d, ok := dataString(e.Data, "recipient_domain")
