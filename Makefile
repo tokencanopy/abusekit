@@ -53,5 +53,5 @@ gate:
 		--labels eval/fixtures/synthetic/labels.jsonl \
 		--rule new_account_velocity --scorer local --slice full \
 		--floors eval/floors.yaml \
-		--out /tmp/abusekit-gate-run.json; \
-	status=$$?; rm -f .gate-abusekit; exit $$status
+		--out .gate-run.json; \
+	status=$$?; rm -f .gate-abusekit .gate-run.json; exit $$status

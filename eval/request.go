@@ -3,7 +3,6 @@ package eval
 import (
 	"context"
 	"math"
-	"time"
 
 	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/model"
@@ -39,17 +38,15 @@ func buildRequest(rule config.Rule, pt Point, promptVersion string) model.ScoreR
 // returned result).
 func scoreOne(ctx context.Context, rule config.Rule, scorer model.Scorer, opts Options, pt Point) (risk float64, flagged bool, unscored bool, res model.ScoreResult, errCode string, callErr error) {
 	req := buildRequest(rule, pt, opts.promptVersion())
-	start := time.Now()
 	res, err := scorer.Score(ctx, req)
-	elapsed := time.Since(start)
-	if res.LatencyMS == 0 {
-		// A scorer that doesn't report its own latency (the local
-		// scorer's ScoreResult.LatencyMS is always 0 — no I/O to time)
-		// still gets a measured wall-clock figure here, so
-		// Metrics.Latency reflects something for every scorer, not just
-		// ones that self-report.
-		res.LatencyMS = int(elapsed.Milliseconds())
-	}
+	// Fix round nit: "take latency from the scorer when it reports one;
+	// keep it deterministic otherwise" — a wall-clock measurement here
+	// (the original S4 landing's approach) is nondeterministic in
+	// principle even when it happens to round to 0ms in practice, which
+	// would silently threaten determinism_test.go's byte-identical-
+	// apart-from-`at` guarantee. res.LatencyMS is used exactly as the
+	// scorer reported it: 0 for the local scorer (no I/O to time at all),
+	// a live adapter's own measured figure otherwise.
 	if err != nil {
 		return 0, false, true, res, "scorer_error", err
 	}
