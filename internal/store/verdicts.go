@@ -39,6 +39,14 @@ type VerdictRecord struct {
 type SubjectSummary struct {
 	Tier  string
 	Score float64
+	// NextRescoreAt schedules the worker's next visit to this subject even
+	// without a new event (design §4.8: "next_rescore_at = earliest
+	// feature-window expiry" — e.g. a decayed *_1h/*_24h velocity feature
+	// that will change on its own once its window empties, with no new
+	// event to bump dirty_seq). Zero means "nothing scheduled" (stored as
+	// SQL NULL): dirty_seq is what will pick the subject up again, the
+	// next time it has a real event.
+	NextRescoreAt time.Time
 }
 
 // ErrStaleRound is returned by UpsertVerdicts when a newer round already
@@ -72,6 +80,11 @@ var ErrStaleRound = errors.New("store: stale round: a newer round already scored
 // round" beyond that; S3's score API is what actually needs to point at
 // something meaningful here, and can revisit this once the API shape
 // forces the decision.
+//
+// A successful commit also releases this subject's claim lease and clears
+// its whole-pass failure backoff (B3 fix round: claimed_until, fail_count,
+// next_attempt_at) — the scoring pass concluded, so neither should keep
+// gating ClaimDirtySubjects any further.
 //
 // Returns the inserted verdict ids in the same order as records. Records
 // input as empty is a no-op returning (nil, nil) — it does not touch
@@ -110,6 +123,10 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 	}
 
 	lastID := ids[len(ids)-1]
+	var nextRescoreAt *time.Time
+	if !summary.NextRescoreAt.IsZero() {
+		nextRescoreAt = &summary.NextRescoreAt
+	}
 	// S5: only materialize this round's summary if it is at least as new
 	// as whatever scored_seq the subject already has recorded. Without the
 	// "AND scored_seq <= $4" guard, a round that started reading dirty_seq
@@ -126,9 +143,13 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 			current_score      = $2,
 			current_verdict_id = $3,
 			current_scored_at  = now(),
-			scored_seq         = GREATEST(scored_seq, $4)
+			scored_seq         = GREATEST(scored_seq, $4),
+			next_rescore_at    = $7,
+			claimed_until      = NULL,
+			fail_count         = 0,
+			next_attempt_at    = NULL
 		WHERE tenant = $5 AND subject = $6 AND scored_seq <= $4
-	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject)
+	`, summary.Tier, summary.Score, lastID, dirtySeqAtStart, tenant, subject, nextRescoreAt)
 	if err != nil {
 		return nil, fmt.Errorf("store: update subject summary for %s: %w", subject, err)
 	}
@@ -202,6 +223,125 @@ type SubjectView struct {
 	ScoredAt *time.Time
 	// Signals holds each rule's most recent verdict, one per rule name.
 	Signals []SubjectSignal
+}
+
+// LatestVerdict is one rule's most-recently-recorded verdict — the minimum
+// internal/core.RuleState needs to implement input-hash skipping and a
+// `stage: {min_local_risk: ...}` condition (design §4.7) without reaching
+// into the store itself, plus (S11/S6 fix round) enough of the last SCORED
+// round's own result for internal/worker to reuse it — for a call Plan
+// marks input_unchanged — without re-invoking the scorer.
+//
+// This is deliberately narrower than SubjectSignal/SubjectView (S3's
+// HTTP-facing read model): the worker's Plan-building step needs InputHash
+// (which SubjectView never selects, having no reason to expose it over the
+// API) and doesn't need SubjectView's Degraded/Stale bookkeeping, so this
+// is its own small purpose-built query rather than a reuse of
+// SubjectView's.
+type LatestVerdict struct {
+	// InputHash and Status/ErrorCode come from the LITERAL latest row for
+	// this rule, whatever its status — Plan's own input-hash comparison
+	// needs to know what was actually computed last round, unscored or not.
+	InputHash string
+	Status    string
+	ErrorCode string
+
+	// The fields below come from the latest SCORED round specifically
+	// (S11 fix round, proven: a backoff/cost_cap/staged round that left a
+	// rule unscored was hiding a perfectly good risk from an EARLIER round
+	// — e.g. a `stage: {min_local_risk: ...}` gate on a rule that has since
+	// gone quiet — from any other rule's stage gating). This can be an
+	// OLDER row than the one InputHash/Status/ErrorCode came from. Risk nil
+	// means this rule has never been scored at all.
+	Risk        *float64
+	Mode        string
+	Scorer      string
+	Model       string
+	Checkpoint  string
+	Calibration string
+	Reason      string
+	Flagged     bool
+	Probs       map[string]float64
+}
+
+// LatestVerdicts returns each rule's most recent verdict for (tenant,
+// subject), keyed by rule name. A rule never scored for this subject is
+// simply absent from the returned map — the caller's own zero
+// core.RuleState (LastInputHash "", LastRisk nil) is already the correct
+// "never scored" state, so there's nothing useful to return for it.
+func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map[string]LatestVerdict, error) {
+	out := make(map[string]LatestVerdict)
+
+	latestRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (rule) rule, input_hash, status, error_code
+		FROM verdicts
+		WHERE tenant = $1 AND subject = $2
+		ORDER BY rule, scored_at DESC, id DESC
+	`, tenant, subject)
+	if err != nil {
+		return nil, fmt.Errorf("store: query latest verdicts for subject %s: %w", subject, err)
+	}
+	for latestRows.Next() {
+		var rule, inputHash, status, errorCode string
+		if err := latestRows.Scan(&rule, &inputHash, &status, &errorCode); err != nil {
+			latestRows.Close()
+			return nil, fmt.Errorf("store: scan latest verdict row: %w", err)
+		}
+		out[rule] = LatestVerdict{InputHash: inputHash, Status: status, ErrorCode: errorCode}
+	}
+	latestRows.Close()
+	if err := latestRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate latest verdicts for subject %s: %w", subject, err)
+	}
+
+	// S11: a SEPARATE query for the latest row per rule that WAS scored —
+	// this may be an older row than the one above if the rule's most recent
+	// attempt(s) left it unscored.
+	scoredRows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (rule) rule, risk, mode, scorer, model, checkpoint, calibration, reason, flagged, probs
+		FROM verdicts
+		WHERE tenant = $1 AND subject = $2 AND status = 'scored'
+		ORDER BY rule, scored_at DESC, id DESC
+	`, tenant, subject)
+	if err != nil {
+		return nil, fmt.Errorf("store: query latest scored verdicts for subject %s: %w", subject, err)
+	}
+	for scoredRows.Next() {
+		var (
+			rule, mode, scorer, model, checkpoint, calibration, reason string
+			risk                                                       *float64
+			flagged                                                    bool
+			probsJSON                                                  []byte
+		)
+		if err := scoredRows.Scan(&rule, &risk, &mode, &scorer, &model, &checkpoint, &calibration, &reason, &flagged, &probsJSON); err != nil {
+			scoredRows.Close()
+			return nil, fmt.Errorf("store: scan latest scored verdict row: %w", err)
+		}
+		var probs map[string]float64
+		if len(probsJSON) > 0 {
+			if err := json.Unmarshal(probsJSON, &probs); err != nil {
+				scoredRows.Close()
+				return nil, fmt.Errorf("store: decode probs for rule %s: %w", rule, err)
+			}
+		}
+		lv := out[rule] // present already from the pass above (a scored row is also the "latest" row unless a later unscored one exists)
+		lv.Risk = risk
+		lv.Mode = mode
+		lv.Scorer = scorer
+		lv.Model = model
+		lv.Checkpoint = checkpoint
+		lv.Calibration = calibration
+		lv.Reason = reason
+		lv.Flagged = flagged
+		lv.Probs = probs
+		out[rule] = lv
+	}
+	scoredRows.Close()
+	if err := scoredRows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate latest scored verdicts for subject %s: %w", subject, err)
+	}
+
+	return out, nil
 }
 
 // SubjectView returns the read model for (tenant, subject), or

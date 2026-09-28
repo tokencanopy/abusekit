@@ -25,6 +25,7 @@ rules:
       - key_velocity_1h
       - key_total
       - upgrade_delay_min
+      - upgraded
       - declines_before_first_success
       - first_funding_prepaid
       - name_brand_match
@@ -34,6 +35,7 @@ rules:
       - linked_deleted_n
       - linked_labelled_abusive_n
       - fingerprint_seen_on_other_subjects
+      - neighbors_truncated
       - burst_ratio_24h_vs_lifetime
     labels: [benign, suspicious, abusive]
     benign_label: benign

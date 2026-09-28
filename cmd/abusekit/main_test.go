@@ -5,8 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -27,6 +27,7 @@ func shippedConfig(t *testing.T) serveConfig {
 		rulesPath:   filepath.Join(root, "config", "rules.yaml"),
 		vendorsPath: filepath.Join(root, "config", "vendors.yaml"),
 		weightsPath: filepath.Join(root, "config", "local_weights.yaml"),
+		brandsPath:  filepath.Join(root, "config", "brands.yaml"),
 	}
 }
 
@@ -52,6 +53,9 @@ func TestParseServeFlags_Defaults(t *testing.T) {
 	if c.check {
 		t.Errorf("expected check=false by default")
 	}
+	if c.metricsListen != "127.0.0.1:9099" {
+		t.Errorf("metricsListen = %q, want the default 127.0.0.1:9099 (R8 round 2)", c.metricsListen)
+	}
 }
 
 func TestParseServeFlags_CheckFlag(t *testing.T) {
@@ -72,7 +76,7 @@ func TestParseServeFlags_CheckFlag(t *testing.T) {
 func TestBoot_RejectsMissingRulesFile(t *testing.T) {
 	c := shippedConfig(t)
 	c.rulesPath = filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	if _, _, err := boot(context.Background(), c); err == nil {
+	if _, _, _, err := boot(context.Background(), c); err == nil {
 		t.Fatalf("expected boot to fail with a missing rules file")
 	}
 }
@@ -86,37 +90,16 @@ func TestBoot_RejectsInvalidRules(t *testing.T) {
 		t.Fatalf("write bad rules file: %v", err)
 	}
 	c.rulesPath = bad
-	if _, _, err := boot(context.Background(), c); err == nil {
+	if _, _, _, err := boot(context.Background(), c); err == nil {
 		t.Fatalf("expected boot to fail on a rules file referencing an unregistered scorer")
-	}
-}
-
-// TestRunServe_RequiresCheckFlag is S17: `serve` without --check is no
-// longer a blocking placeholder loop — it's an explicit "not implemented
-// yet" error, before ever touching a database (the bogus --database-url
-// here is never dialed).
-func TestRunServe_RequiresCheckFlag(t *testing.T) {
-	c := shippedConfig(t)
-	args := []string{
-		"--database-url", "postgres://unused/should-never-be-dialed",
-		"--rules", c.rulesPath,
-		"--vendors", c.vendorsPath,
-		"--weights", c.weightsPath,
-	}
-	err := runServe(args)
-	if err == nil {
-		t.Fatalf("expected an error when --check is not passed")
-	}
-	if !strings.Contains(err.Error(), "--check") {
-		t.Fatalf("expected the error to mention --check, got: %v", err)
 	}
 }
 
 // TestRunServe_CheckSucceeds is S17's end-to-end path: connect, migrate,
 // validate the shipped config, and return with no error and no blocking —
 // including closing the store's pool on the way out (defer'd inside
-// runServe; a leaked pool would still let this test pass but would show
-// up as a lingering connection in a longer-running suite).
+// runServeWithContext; a leaked pool would still let this test pass but
+// would show up as a lingering connection in a longer-running suite).
 func TestRunServe_CheckSucceeds(t *testing.T) {
 	c := shippedConfig(t)
 	dbURL := testDBURL(t)
@@ -126,13 +109,46 @@ func TestRunServe_CheckSucceeds(t *testing.T) {
 		"--rules", c.rulesPath,
 		"--vendors", c.vendorsPath,
 		"--weights", c.weightsPath,
+		"--brands", c.brandsPath,
 	}
 	if err := runServe(args); err != nil {
 		t.Fatalf("runServe --check: %v", err)
 	}
 }
 
-// TestBoot_ShippedConfigSucceeds is the closest thing S1 has to an
+// TestRunServeWithContext_StartsAndStopsTheWorker is S9 (fix round):
+// `serve` without --check now boots and runs internal/worker's scoring
+// loop until ctx is done, rather than the old S1 placeholder's "not
+// implemented yet" error. A real OS signal would be awkward to test with,
+// so this drives runServeWithContext (the same body runServe wraps with
+// signal.NotifyContext) with a context this test cancels itself, and
+// proves the call returns promptly afterward — Worker.Stop's own
+// "cancels and waits" contract is exercised directly in
+// internal/worker's own test suite; this is the cmd-level wiring proof.
+func TestRunServeWithContext_StartsAndStopsTheWorker(t *testing.T) {
+	c := shippedConfig(t)
+	c.databaseURL = testDBURL(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	done := make(chan error, 1)
+	go func() { done <- runServeWithContext(ctx, c) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServeWithContext: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("runServeWithContext did not return after its context was cancelled")
+	}
+}
+
+// TestBoot_ShippedConfigSucceeds is the closest thing this repo has to an
 // integration test of the whole `serve --check` path: connect, migrate,
 // register `local`, load the real config/*.yaml this repo ships. Skips
 // when no local Postgres is reachable, same as internal/store's tests.
@@ -140,7 +156,7 @@ func TestBoot_ShippedConfigSucceeds(t *testing.T) {
 	c := shippedConfig(t)
 	c.databaseURL = testDBURL(t)
 
-	s, cfg, err := boot(context.Background(), c)
+	s, cfg, deps, err := boot(context.Background(), c)
 	if err != nil {
 		t.Fatalf("boot: %v", err)
 	}
@@ -148,6 +164,9 @@ func TestBoot_ShippedConfigSucceeds(t *testing.T) {
 
 	if len(cfg.Rules) == 0 {
 		t.Fatalf("expected at least one loaded rule")
+	}
+	if deps.neighbors == nil {
+		t.Errorf("expected boot to construct a Neighbors implementation")
 	}
 }
 

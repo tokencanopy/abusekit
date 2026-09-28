@@ -1,0 +1,7 @@
+{"id":"integ-evt-001","subject":"acct_example_integration_heavy_1","type":"subject.created","at":"2031-06-02T00:00:00Z","links":{"email_hash":"5ae10308bfe04adaff61aebf1015078289609de725568f1ab38138f66520cd29"},"data":{"channel":"signup","email_domain_class":"corporate","identity_kind":"organization"}}
+{"id":"integ-evt-002","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:05:00Z","data":{"kind":"agent","name":"Stripe Webhook Relay","address_domain":"acct-integ-1.example.test"}}
+{"id":"integ-evt-003","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:15:00Z","data":{"kind":"agent","name":"Google Calendar Sync","address_domain":"acct-integ-1.example.test"}}
+{"id":"integ-evt-004","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:25:00Z","data":{"kind":"agent","name":"Microsoft Teams Relay","address_domain":"acct-integ-1.example.test"}}
+{"id":"integ-evt-005","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:35:00Z","data":{"kind":"agent","name":"Slack Notifier","address_domain":"acct-integ-1.example.test"}}
+{"id":"integ-evt-006","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:45:00Z","data":{"kind":"agent","name":"Zendesk Sync","address_domain":"acct-integ-1.example.test"}}
+{"id":"integ-evt-007","subject":"acct_example_integration_heavy_1","type":"resource.created","at":"2031-06-02T00:55:00Z","data":{"kind":"key","name":"Integration Key"}}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -39,14 +40,41 @@ const undefinedTable = "42P01"
 // Store wraps a pgxpool.Pool with abusekit's repository methods. The zero
 // value is not usable; construct with New.
 type Store struct {
-	pool *pgxpool.Pool
+	pool       *pgxpool.Pool
+	claimLease time.Duration // 0 means DefaultClaimLease — see claimLeaseOrDefault.
+}
+
+// Option configures a Store at construction time (R4 round 2). Optional:
+// New with no options behaves exactly as it always has.
+type Option func(*Store)
+
+// WithClaimLease overrides DefaultClaimLease — the only production reason
+// to do this would be an unusually large/slow scoring batch, but its main
+// use is a test that needs to observe lease-expiry/extension behavior
+// (queue.go's ClaimDirtySubjects/ExtendClaim) on a human timescale rather
+// than DefaultClaimLease's real 2 minutes.
+func WithClaimLease(d time.Duration) Option {
+	return func(s *Store) { s.claimLease = d }
 }
 
 // New wraps an already-configured pool. It does not apply migrations or
 // otherwise touch the database — call ApplyMigrations explicitly (cmd's
 // `migrate` subcommand and test setup both do this).
-func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+func New(pool *pgxpool.Pool, opts ...Option) *Store {
+	s := &Store{pool: pool}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// claimLeaseOrDefault returns s's configured claim lease, or
+// DefaultClaimLease if none was set via WithClaimLease.
+func (s *Store) claimLeaseOrDefault() time.Duration {
+	if s.claimLease > 0 {
+		return s.claimLease
+	}
+	return DefaultClaimLease
 }
 
 // Close releases the underlying pool's connections. Callers that

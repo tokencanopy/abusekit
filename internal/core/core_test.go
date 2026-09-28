@@ -234,6 +234,55 @@ func TestPlan_CalibrationIDChangeForcesRescore(t *testing.T) {
 	}
 }
 
+// TestPlan_AgeDriftWithinAnHourBucketStillSkips is R7 round 2. Proven:
+// subject_age_h and upgrade_delay_min (internal/feature's B5 fix round)
+// are continuously-drifting elapsed-time features for any subject not yet
+// at their clamp ceiling — they change on literally every tick, even with
+// no new event at all — so hashing them at full precision meant a rule
+// that reads either one (design's shipped new_account_velocity does)
+// NEVER skipped as input_unchanged for exactly the population — new,
+// still-under-clamp accounts — this system most needs to score
+// efficiently. The hash must instead be stable within a 1-hour bucket for
+// subject_age_h and a 60-minute bucket for upgrade_delay_min, so a round
+// with no OTHER relevant change reuses the prior verdict.
+func TestPlan_AgeDriftWithinAnHourBucketStillSkips(t *testing.T) {
+	r := rule("r", config.ModeAdvise, withInputs("subject_age_h", "upgrade_delay_min"))
+
+	first := core.Plan(map[string]float64{"subject_age_h": 5.05, "upgrade_delay_min": 303}, nil, []core.RuleState{{Rule: r}})
+	if first[0].Skip {
+		t.Fatalf("expected the first round not to skip")
+	}
+
+	t.Run("drift within the same hour/60-minute bucket still skips", func(t *testing.T) {
+		second := core.Plan(map[string]float64{"subject_age_h": 5.75, "upgrade_delay_min": 345}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+		if second[0].InputHash != first[0].InputHash {
+			t.Fatalf("expected subject_age_h 5.05->5.75 and upgrade_delay_min 303->345 (same hour/60-min bucket) to hash identically")
+		}
+		if !second[0].Skip || second[0].SkipReason != core.SkipInputUnchanged {
+			t.Fatalf("expected a same-bucket drift to skip as input_unchanged, got skip=%v reason=%q", second[0].Skip, second[0].SkipReason)
+		}
+	})
+
+	t.Run("crossing into the next hour/60-minute bucket does not skip", func(t *testing.T) {
+		third := core.Plan(map[string]float64{"subject_age_h": 6.02, "upgrade_delay_min": 361}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+		if third[0].InputHash == first[0].InputHash {
+			t.Fatalf("expected crossing into hour 6 / minute-bucket 360 to change the input hash")
+		}
+		if third[0].Skip {
+			t.Fatalf("expected a bucket-crossing round to NOT skip")
+		}
+	})
+
+	t.Run("a genuinely different non-time feature is unaffected by quantization", func(t *testing.T) {
+		r2 := rule("r2", config.ModeAdvise, withInputs("subject_age_h", "resource_total"))
+		f1 := core.Plan(map[string]float64{"subject_age_h": 5.05, "resource_total": 3}, nil, []core.RuleState{{Rule: r2}})
+		f2 := core.Plan(map[string]float64{"subject_age_h": 5.75, "resource_total": 4}, nil, []core.RuleState{{Rule: r2, LastInputHash: f1[0].InputHash}})
+		if f2[0].InputHash == f1[0].InputHash {
+			t.Fatalf("expected a real resource_total change to still change the input hash despite subject_age_h's quantization")
+		}
+	})
+}
+
 func TestPlan_StageSubjectAge(t *testing.T) {
 	old := rule("old_gate", config.ModeShadow, withText("t"), withStage(map[string]float64{"max_subject_age_h": 168}))
 

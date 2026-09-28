@@ -74,6 +74,14 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
 	var result AppendResult
+	// permanentDeletions collects subjects whose PERMANENT subject.deleted
+	// event lands in this batch (S2 fix round): after commit, their
+	// same-tenant neighbours get PropagateToNeighbors'd so
+	// linked_deleted_n's now-stale evidence gets rescored. Only "permanent"
+	// (N3 fix round) — a trash-mode deletion doesn't change
+	// linked_deleted_n at all (see NeighborOutcomes), so it has nothing to
+	// propagate.
+	var permanentDeletions []string
 	for i, e := range events {
 		bodyHash, err := e.BodyHash()
 		if err != nil {
@@ -149,6 +157,11 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 				return AppendResult{}, err
 			}
 		}
+		if e.Type == "subject.deleted" {
+			if mode, ok := e.Data["mode"].(string); ok && mode == "permanent" {
+				permanentDeletions = append(permanentDeletions, e.Subject)
+			}
+		}
 
 		result.Accepted = append(result.Accepted, e.ID)
 	}
@@ -156,6 +169,21 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 	if err := tx.Commit(ctx); err != nil {
 		return AppendResult{}, fmt.Errorf("store: commit append transaction: %w", err)
 	}
+
+	// Propagation runs AFTER commit, via the pool rather than tx: it reads
+	// the links table (Neighbors) and must see this batch's own just-
+	// committed link upserts, which an uncommitted transaction's writes are
+	// not visible to from a separate connection. It is deliberately
+	// best-effort and never turns a successful append into a returned
+	// error — AppendEvents' contract ("never a non-empty AppendResult
+	// alongside a non-nil error") is about this batch's own commit, and
+	// propagation failing here doesn't mean anything in the batch didn't
+	// land; a propagation gap also self-heals the next time any of these
+	// subjects has a real event of its own.
+	for _, subject := range dedupe(permanentDeletions) {
+		_ = s.PropagateToNeighbors(ctx, tenant, subject)
+	}
+
 	return result, nil
 }
 
@@ -242,4 +270,24 @@ func (s *Store) EventsForSubject(ctx context.Context, tenant, subject string) ([
 		return nil, fmt.Errorf("store: iterate events for subject %s: %w", subject, err)
 	}
 	return out, nil
+}
+
+// dedupe returns ss with duplicates removed, preserving first-seen order
+// (deterministic, unlike ranging over a map) — used to avoid propagating
+// to the same subject's neighbors twice when a single batch contains more
+// than one permanent subject.deleted event for it.
+func dedupe(ss []string) []string {
+	if len(ss) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ss))
+	out := make([]string, 0, len(ss))
+	for _, s := range ss {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
