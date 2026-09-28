@@ -1,8 +1,6 @@
 package serve
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -50,6 +48,14 @@ type eventsResponse struct {
 	Rejected   []rejectedWire `json:"rejected"`
 }
 
+// codeInternalValidationError is N2 fix round: event.Event.Validate/Redact
+// always return a *event.ValidationError in practice (never a bare error),
+// so the "else" branches below should be unreachable — but if one ever
+// isn't, the per-item code must say so honestly rather than GUESSING
+// "bad_id" (the previous behavior) for a failure that might have nothing
+// to do with the event's id at all.
+const codeInternalValidationError = "internal_validation_error"
+
 // handleEvents is POST /v1/events (design §4.3).
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !acceptsJSON(r) {
@@ -59,15 +65,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	body, sizeErr := readBounded(r, MaxEventBatchBody)
 	if sizeErr != nil {
-		writeError(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf("body exceeds %d bytes", MaxEventBatchBody), nil)
-		return
-	}
-
-	// Rate-limited on the raw header value, before spending any crypto on
-	// a request that's going to be throttled anyway (design: 429
-	// rate_limited + Retry-After).
-	if ok, retryAfter := s.eventsLimiter.Allow(r.Header.Get(HeaderKey), s.now()); !ok {
-		writeRateLimited(w, r, retryAfter)
+		writeBodyReadError(w, r, sizeErr)
 		return
 	}
 
@@ -77,10 +75,21 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// S3 fix round: rate-limited on the AUTHENTICATED key id, after
+	// authenticate succeeds — never on the raw, unverified X-Abusekit-Key
+	// header value. Keying on the trusted header would let an
+	// unauthenticated caller exhaust a REAL producer's bucket just by
+	// sending its key id (no secret needed) in a flood of otherwise-
+	// rejected requests, starving the real producer's own legitimate
+	// traffic. The coarse per-IP preAuthMiddleware (server.go) is what
+	// bounds pre-auth request volume instead.
+	if ok, retryAfter := s.eventsLimiter.Allow(authCtx.Key.ID, s.now()); !ok {
+		writeRateLimited(w, r, retryAfter)
+		return
+	}
+
 	var req eventsRequest
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeStrictJSON(body, &req); err != nil {
 		writeError(w, r, http.StatusBadRequest, "bad_request", "body must be {\"events\":[...]}: "+err.Error(), nil)
 		return
 	}
@@ -108,7 +117,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if errors.As(verr, &ve) {
 				rejected = append(rejected, rejectedWire{Index: i, Code: string(ve.Code), Message: ve.Message})
 			} else {
-				rejected = append(rejected, rejectedWire{Index: i, Code: string(event.CodeBadID), Message: verr.Error()})
+				s.log().Error("serve: event.Validate returned a non-ValidationError", "error", verr, "request_id", authCtx.RequestID)
+				rejected = append(rejected, rejectedWire{Index: i, Code: codeInternalValidationError, Message: "validation failed"})
 			}
 			continue
 		}
@@ -117,7 +127,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if errors.As(rerr, &ve) {
 				rejected = append(rejected, rejectedWire{Index: i, Code: string(ve.Code), Message: ve.Message})
 			} else {
-				rejected = append(rejected, rejectedWire{Index: i, Code: string(event.CodeRedactionFailed), Message: rerr.Error()})
+				s.log().Error("serve: event.Redact returned a non-ValidationError", "error", rerr, "request_id", authCtx.RequestID)
+				rejected = append(rejected, rejectedWire{Index: i, Code: codeInternalValidationError, Message: "redaction failed"})
 			}
 			continue
 		}
@@ -170,18 +181,31 @@ func acceptsJSON(r *http.Request) bool {
 // readBounded reads at most limit+1 bytes from r.Body, returning an error
 // if the body is longer than limit (413) rather than silently truncating
 // it — a truncated batch would otherwise validate/redact successfully
-// against corrupted JSON or a body that just happens to still parse.
+// against corrupted JSON or a body that just happens to still parse. The
+// returned error is either *http.MaxBytesError (too large) or some other
+// read failure (a stalled/reset connection) — see writeBodyReadError for
+// how the two are told apart on the wire (S7 fix round).
 func readBounded(r *http.Request, limit int64) ([]byte, error) {
 	limited := http.MaxBytesReader(nil, r.Body, limit)
 	b, err := io.ReadAll(limited)
 	if err != nil {
-		var mbErr *http.MaxBytesError
-		if errors.As(err, &mbErr) {
-			return nil, mbErr
-		}
 		return nil, err
 	}
 	return b, nil
+}
+
+// writeBodyReadError maps readBounded's error to the wire (S7 fix round):
+// specifically *http.MaxBytesError is 413 payload_too_large; anything else
+// (the client stalled, reset the connection, or otherwise failed to
+// deliver a body it claimed) is 400 bad_request, never mislabeled as "too
+// large" when the real problem was a broken/slow client.
+func writeBodyReadError(w http.ResponseWriter, r *http.Request, err error) {
+	var mbErr *http.MaxBytesError
+	if errors.As(err, &mbErr) {
+		writeError(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", fmt.Sprintf("body exceeds %d bytes", mbErr.Limit), nil)
+		return
+	}
+	writeError(w, r, http.StatusBadRequest, "bad_request", "failed to read request body", nil)
 }
 
 func writeRateLimited(w http.ResponseWriter, r *http.Request, retryAfter time.Duration) {

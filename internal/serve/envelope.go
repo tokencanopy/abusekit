@@ -1,9 +1,11 @@
 package serve
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"regexp"
 )
@@ -78,6 +80,48 @@ func requestID(r *http.Request) string {
 		return v
 	}
 	return "unknown"
+}
+
+// errTrailingData is decodeStrictJSON's error when the body has anything
+// after its first JSON value (S4 fix round).
+var errTrailingData = errors.New("body has trailing data after the JSON value")
+
+// decodeStrictJSON decodes exactly one JSON value from body into v,
+// rejecting unknown fields (json.Decoder.DisallowUnknownFields — api-
+// design's "reject unknown fields on writes") AND any trailing bytes after
+// that value (S4 fix round: `{"a":1}{"a":2}` or `{"a":1}garbage` previously
+// decoded the FIRST value and silently ignored the rest — dec.More()
+// after Decode catches both). Used by every endpoint that accepts a JSON
+// body (events' per-batch decode has its own copy of this same
+// discipline, since it decodes a slice rather than one struct).
+func decodeStrictJSON(body []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errTrailingData
+	}
+	return nil
+}
+
+// recoverMiddleware turns a panicking handler into a clean 500 envelope
+// (S7 fix round) instead of an aborted connection with a raw stack trace
+// potentially reaching the client (net/http's own default recovery logs
+// the stack and closes the connection, but sends no body at all). The
+// panic value is logged server-side with the request id for correlation;
+// the response body itself never contains it or a stack trace.
+func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				s.log().Error("serve: panic recovered", "panic", rec, "request_id", requestID(r), "path", r.URL.Path)
+				writeError(w, r, http.StatusInternalServerError, "internal", "internal error", nil)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func generateRequestID() string {

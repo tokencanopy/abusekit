@@ -1,11 +1,10 @@
 package serve
 
 import (
-	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -55,7 +54,7 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	body, sizeErr := readBounded(r, MaxOtherBody)
 	if sizeErr != nil {
-		writeError(w, r, http.StatusRequestEntityTooLarge, "payload_too_large", "body too large", nil)
+		writeBodyReadError(w, r, sizeErr)
 		return
 	}
 
@@ -65,16 +64,14 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
 	var req labelRequest
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeStrictJSON(body, &req); err != nil {
 		writeError(w, r, http.StatusBadRequest, "bad_request", "invalid body: "+err.Error(), nil)
 		return
 	}
 
-	if !validSubjectParam(req.Subject) {
-		writeError(w, r, http.StatusBadRequest, "bad_request", "subject is required and must be <= 256 bytes", nil)
+	if err := validateSubjectParam(req.Subject); err != nil {
+		writeError(w, r, http.StatusBadRequest, "bad_request", err.Error(), nil)
 		return
 	}
 	if req.Label == "" {
@@ -185,12 +182,15 @@ func containsLabel(labels []string, want string) bool {
 // plus the features as extracted at that time."
 //
 // Split (design: "by link cluster (fallback subject) hashed 80/20") is
-// simplified here to hashing the subject id alone — resolving a subject's
-// full link-cluster identity (its same-tenant Neighbors) into one stable
-// cluster key is deferred; see the S3 PR body's interpretations. This is
-// a documented gap, not a silent shortcut: a later slice can swap in a
-// real cluster key without changing corpus_examples' schema or this
-// method's signature.
+// simplified here to a KEYED hash (N1 fix round: HMAC with
+// s.corpusSplitSecret, never a bare sha256 — an unkeyed hash lets anyone
+// who can guess/enumerate subject ids predict, and therefore game, which
+// split a given id lands in) of the subject id alone — resolving a
+// subject's full link-cluster identity (its same-tenant Neighbors) into
+// one stable cluster key is deferred; see the S3 PR body's
+// interpretations. This is a documented gap, not a silent shortcut: a
+// later slice can swap in a real cluster key without changing
+// corpus_examples' schema or this method's signature.
 func (s *Server) snapshotCorpusExample(ctx context.Context, tenant, subject string, labelID int64, storedEvents []store.StoredEvent) (int64, error) {
 	decisionAt := firstContentSentAt(storedEvents)
 	if decisionAt.IsZero() {
@@ -224,7 +224,7 @@ func (s *Server) snapshotCorpusExample(ctx context.Context, tenant, subject stri
 		DecisionAt: decisionAt,
 		EventSlice: slice,
 		Features:   fr.Features.Map(),
-		Split:      splitFor(subject),
+		Split:      s.splitFor(subject),
 	})
 }
 
@@ -244,9 +244,14 @@ func firstContentSentAt(storedEvents []store.StoredEvent) time.Time {
 	return first
 }
 
-func splitFor(subject string) string {
-	h := sha256.Sum256([]byte(subject))
-	bucket := binary.BigEndian.Uint64(h[:8]) % 100
+// splitFor assigns subject to "train" (80%) or "test" (20%) via an
+// HMAC-SHA256 keyed on s.corpusSplitSecret (N1 fix round) — see
+// snapshotCorpusExample's own doc comment for why this must be keyed.
+func (s *Server) splitFor(subject string) string {
+	mac := hmac.New(sha256.New, s.corpusSplitSecret)
+	mac.Write([]byte(subject))
+	sum := mac.Sum(nil)
+	bucket := binary.BigEndian.Uint64(sum[:8]) % 100
 	if bucket < 80 {
 		return "train"
 	}

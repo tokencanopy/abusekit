@@ -224,6 +224,14 @@ type SubjectView struct {
 	// EventsSinceScore is dirty_seq - scored_seq: how many "bumps" have
 	// happened since the last scoring round started.
 	EventsSinceScore int64
+	// DirtySeq and ScoredSeq are the raw sequence counters EventsSinceScore
+	// is derived from (S2 fix round): internal/serve's ETag needs BOTH raw
+	// values, not just their difference — two different (dirty_seq,
+	// scored_seq) pairs can share the same difference (e.g. (5,5) and
+	// (6,6) both give EventsSinceScore=0) while being genuinely different
+	// states a caller's cached ETag must not treat as equivalent.
+	DirtySeq  int64
+	ScoredSeq int64
 	// ScoredAt is nil for a never-scored subject.
 	ScoredAt *time.Time
 	// Signals holds each rule's most recent verdict, one per rule name.
@@ -385,6 +393,8 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 	}
 	v.ScoredAt = currentScoredAt
 	v.EventsSinceScore = dirtySeq - scoredSeq
+	v.DirtySeq = dirtySeq
+	v.ScoredSeq = scoredSeq
 	// S4: Stale is purely dirty_seq > scored_seq. An earlier version of
 	// this method instead compared subjects.last_event_at (not selected
 	// above — see AppendEvents' touchSubjectTx, which still stamps it for

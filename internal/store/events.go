@@ -187,6 +187,11 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 	return result, nil
 }
 
+// touchSubjectTx's INSERT ... ON CONFLICT DO UPDATE already takes the same
+// row-level lock a plain SELECT ... FOR UPDATE would (S9 fix round: PutLabel
+// added an EXPLICIT lock for the same serialize-with-concurrent-scoring
+// reason; this upsert gets it for free from Postgres's own conflict
+// handling, so no separate lock statement is needed here).
 func touchSubjectTx(ctx context.Context, tx pgx.Tx, tenant, subject string, at time.Time) error {
 	// S7: first_seen_at uses LEAST(existing, new) rather than "whatever was
 	// there at first INSERT" — events don't always arrive in `at` order

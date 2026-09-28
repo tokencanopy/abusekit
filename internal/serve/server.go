@@ -2,6 +2,7 @@ package serve
 
 import (
 	"context"
+	"crypto/rand"
 	"log/slog"
 	"net/http"
 	"time"
@@ -24,14 +25,29 @@ const MaxOtherBody = 64 << 10
 
 // DefaultEventsPerKeyPerSecond is a v0 placeholder per-key request-rate
 // guard on POST /v1/events (design's enumerated 429 rate_limited
-// response) — generous enough not to bother a real producer at v0
+// response), checked AFTER authentication (S3 fix round — see New's own
+// comment on why) — generous enough not to bother a real producer at v0
 // traffic volumes, deliberately round pending real data, matching this
 // repo's other placeholder budget defaults (cmd/abusekit's
 // defaultPerAdapterDailyBudget/defaultPerTenantDailyBudget).
 const DefaultEventsPerKeyPerSecond = 50
 
+// DefaultPreAuthPerIPPerSecond is S3 fix round's coarse, cheap guard
+// applied to every request BEFORE authentication, keyed on the remote IP —
+// bounding how much HMAC-verification work an unauthenticated flood can
+// force this process to do, independent of (and much more generous than)
+// any per-key limit that only applies once a request actually
+// authenticates.
+const DefaultPreAuthPerIPPerSecond = 200
+
 // EvaluateRateLimit is design §4.4's "rate-limited per subject (1/s)".
 const EvaluateRateLimit = time.Second
+
+// limiterSweepInterval is how often the rate limiters and replay cache
+// sweep their expired entries (S3 fix round: a periodic background sweep,
+// not one done inline on every request — see fixedWindowLimiter's own doc
+// comment for why).
+const limiterSweepInterval = time.Minute
 
 // Deps are everything Server needs. Store, Worker, Config and Keys are
 // required; everything else has a documented default — matching
@@ -59,12 +75,26 @@ type Deps struct {
 	// EventsPerKeyPerSecond overrides DefaultEventsPerKeyPerSecond. <= 0
 	// uses the default.
 	EventsPerKeyPerSecond int
+	// PreAuthPerIPPerSecond overrides DefaultPreAuthPerIPPerSecond. <= 0
+	// uses the default.
+	PreAuthPerIPPerSecond int
+
+	// CorpusSplitSecret keys the HMAC internal/serve uses to assign a
+	// labelled subject's corpus_examples row to "train" or "test" (N1 fix
+	// round: a bare, unkeyed hash would let anyone who can guess/enumerate
+	// subject ids predict, and therefore game, which split they land in).
+	// Empty generates a random one at construction — reproducible WITHIN
+	// one running process, but not stable across a restart; a deployment
+	// that wants a stable split across restarts (e.g. for corpus/harness
+	// reproducibility, S4) should supply one from a real secret store.
+	CorpusSplitSecret []byte
 }
 
 // Server holds abusekit's HTTP handlers' dependencies. Construct with New;
 // the zero value is not usable. Server is safe for concurrent use — every
 // handler is stateless beyond the shared, mutex-guarded replay/rate-limit
-// caches.
+// caches. Call Close when done with it to stop the background sweep
+// goroutines New starts.
 type Server struct {
 	store  *store.Store
 	worker *worker.Worker
@@ -77,12 +107,16 @@ type Server struct {
 	nowFn  func() time.Time
 	logger *slog.Logger
 
-	replay        *replayCache
-	evalLimiter   *fixedWindowLimiter
-	eventsLimiter *fixedWindowLimiter
+	replay         *replayCache
+	evalLimiter    *fixedWindowLimiter
+	eventsLimiter  *fixedWindowLimiter
+	preAuthLimiter *fixedWindowLimiter
+
+	corpusSplitSecret []byte
 }
 
-// New validates deps and returns a Server.
+// New validates deps, returns a Server, and starts its background sweep
+// goroutines (replay cache, rate limiters) — call Close to stop them.
 func New(deps Deps) (*Server, error) {
 	if deps.Store == nil {
 		return nil, errRequired("Deps.Store")
@@ -103,20 +137,58 @@ func New(deps Deps) (*Server, error) {
 	if eventsPerSec <= 0 {
 		eventsPerSec = DefaultEventsPerKeyPerSecond
 	}
+	preAuthPerSec := deps.PreAuthPerIPPerSecond
+	if preAuthPerSec <= 0 {
+		preAuthPerSec = DefaultPreAuthPerIPPerSecond
+	}
+	corpusSplitSecret := deps.CorpusSplitSecret
+	if len(corpusSplitSecret) == 0 {
+		corpusSplitSecret = make([]byte, 32)
+		if _, err := rand.Read(corpusSplitSecret); err != nil {
+			return nil, err
+		}
+	}
 
-	return &Server{
-		store:         deps.Store,
-		worker:        deps.Worker,
-		cfg:           deps.Config,
-		keys:          deps.Keys,
-		neighbors:     deps.Neighbors,
-		brands:        deps.Brands,
-		nowFn:         deps.Now,
-		logger:        deps.Logger,
-		replay:        newReplayCache(),
-		evalLimiter:   newFixedWindowLimiter(1, EvaluateRateLimit),
-		eventsLimiter: newFixedWindowLimiter(eventsPerSec, time.Second),
-	}, nil
+	nowFn := deps.Now
+	now := func() time.Time {
+		if nowFn != nil {
+			return nowFn()
+		}
+		return time.Now().UTC()
+	}
+
+	s := &Server{
+		store:          deps.Store,
+		worker:         deps.Worker,
+		cfg:            deps.Config,
+		keys:           deps.Keys,
+		neighbors:      deps.Neighbors,
+		brands:         deps.Brands,
+		nowFn:          deps.Now,
+		logger:         deps.Logger,
+		replay:         newReplayCache(),
+		evalLimiter:    newFixedWindowLimiter(1, EvaluateRateLimit),
+		eventsLimiter:  newFixedWindowLimiter(eventsPerSec, time.Second),
+		preAuthLimiter: newFixedWindowLimiter(preAuthPerSec, time.Second),
+
+		corpusSplitSecret: corpusSplitSecret,
+	}
+	s.replay.startSweeper(limiterSweepInterval, now)
+	s.evalLimiter.startSweeper(limiterSweepInterval, now)
+	s.eventsLimiter.startSweeper(limiterSweepInterval, now)
+	s.preAuthLimiter.startSweeper(limiterSweepInterval, now)
+	return s, nil
+}
+
+// Close stops the background sweep goroutines New started. Safe to call
+// once; not required for correctness (the goroutines hold no resources
+// that leak beyond process exit), but good hygiene for a test or a
+// short-lived Server, and for cmd/abusekit's own graceful shutdown.
+func (s *Server) Close() {
+	s.replay.Stop()
+	s.evalLimiter.Stop()
+	s.eventsLimiter.Stop()
+	s.preAuthLimiter.Stop()
 }
 
 func (s *Server) now() time.Time {
@@ -140,21 +212,43 @@ func errRequired(field string) error { return requiredErr(field) }
 
 // Handler returns the full routed HTTP handler (Go 1.22+ ServeMux method+
 // path-parameter patterns — no router dependency, matching AGENTS.md's
-// minimal-footprint convention). withRequestID wraps every route so every
-// response, including one from a route that doesn't match at all, gets a
-// resolved X-Request-Id.
+// minimal-footprint convention). Middleware order (outermost first):
+// withRequestID (every response, including a 404/429 before any handler
+// runs, gets a resolved X-Request-Id) → recoverMiddleware (S7 fix round: a
+// panicking handler becomes a clean 500 envelope, never a raw stack trace
+// or a bare connection drop) → the coarse per-IP pre-auth limiter (S3 fix
+// round) → the mux itself.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/events", s.handleEvents)
-	mux.HandleFunc("GET /v1/subjects", s.handleListSubjects)
 	mux.HandleFunc("GET /v1/subjects/{subject}", s.handleGetSubject)
 	mux.HandleFunc("POST /v1/subjects/{subject}/evaluate", s.handleEvaluate)
-	mux.HandleFunc("DELETE /v1/subjects/{subject}", s.handleEraseSubject)
 	mux.HandleFunc("POST /v1/labels", s.handleLabels)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("/", s.handleNotFound)
 
-	return withRequestID(mux)
+	return withRequestID(s.recoverMiddleware(s.preAuthMiddleware(mux)))
+}
+
+// preAuthMiddleware is S3 fix round's coarse, cheap per-IP guard, applied
+// BEFORE any handler (and therefore before any authenticate call spends
+// HMAC-verification work) — proven necessary: without it, an
+// unauthenticated flood of requests (garbage or replayed signatures, any
+// key id) could force unbounded signature-verification work, and a flood
+// carrying a REAL producer's key id in X-Abusekit-Key specifically could
+// exhaust that key's OWN per-key bucket before ever proving it holds the
+// matching secret — starving the real producer without ever authenticating
+// as them. This limiter is deliberately coarse (IP, not key) and generous
+// (DefaultPreAuthPerIPPerSecond) — the precise per-key/per-subject limits
+// in events.go/subjects.go run AFTER authenticate succeeds.
+func (s *Server) preAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ok, retryAfter := s.preAuthLimiter.Allow(clientIP(r), s.now()); !ok {
+			writeRateLimited(w, r, retryAfter)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // handleNotFound is the catch-all for any path the mux itself didn't
