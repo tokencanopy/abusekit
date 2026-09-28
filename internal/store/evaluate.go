@@ -27,8 +27,39 @@ type ErrBusy struct {
 }
 
 func (e *ErrBusy) Error() string {
-	return "store: subject is busy (claimed or in backoff) until " + e.RetryAt.Format(time.RFC3339)
+	// R8 (round 2 fix round): format RetryAt in UTC explicitly so the wire
+	// value doesn't depend on the server process's local timezone
+	// (RetryAt is typically already UTC coming out of Postgres, but .UTC()
+	// makes that a guarantee rather than an assumption).
+	return "store: subject is busy (claimed or in backoff) until " + e.RetryAt.UTC().Format(time.RFC3339)
 }
+
+// ErrClaimAmbiguous wraps a failure from ClaimSubjectForEvaluate's own
+// COMMIT step specifically (round 2 fix round, R2): once the claim UPDATE
+// has executed inside the transaction, a context deadline/cancellation
+// during tx.Commit(ctx) leaves the outcome genuinely ambiguous — the
+// COMMIT may have already landed durably on the server before the
+// client-side context tore down the connection, or it may not have. The
+// caller (worker.EvaluateSubject) can't tell which happened from the
+// error alone, so it treats this specific error as "may have claimed the
+// subject" and issues a best-effort release with its own timeout,
+// independent of the (already expired) caller context — ReleaseClaim is
+// unconditional and idempotent, so releasing a claim that never actually
+// landed is a harmless no-op. This is deliberately NOT used for ErrBusy,
+// ErrNotFound, or ErrNotScorable: those are returned before any commit is
+// attempted (or, for the lost-race case, after a definitive
+// zero-rows-affected UPDATE), so there is nothing of ours to release —
+// treating them as ambiguous too would risk releasing a DIFFERENT,
+// legitimate concurrent claimant's lease.
+type ErrClaimAmbiguous struct {
+	Err error
+}
+
+func (e *ErrClaimAmbiguous) Error() string {
+	return "store: evaluate-claim commit outcome is ambiguous: " + e.Err.Error()
+}
+
+func (e *ErrClaimAmbiguous) Unwrap() error { return e.Err }
 
 // ClaimSubjectForEvaluate claims exactly (tenant, subject) for a
 // synchronous POST .../evaluate call (design §4.4), sharing the EXACT same
@@ -113,7 +144,9 @@ func (s *Store) ClaimSubjectForEvaluate(ctx context.Context, tenant, subject str
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return DirtySubject{}, fmt.Errorf("store: commit evaluate-claim transaction: %w", err)
+		// R2 (round 2 fix round): wrap distinctly from the other error
+		// paths above — see ErrClaimAmbiguous.
+		return DirtySubject{}, &ErrClaimAmbiguous{Err: fmt.Errorf("store: commit evaluate-claim transaction: %w", err)}
 	}
 	return d, nil
 }

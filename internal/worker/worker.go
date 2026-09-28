@@ -388,6 +388,20 @@ func (w *Worker) Tick(ctx context.Context) (TickResult, error) {
 // adapter-budget reservation.
 func elevated(tier string) bool { return tier == "medium" || tier == "high" }
 
+// countTrue counts the true values in bs — computeVerdict's R3 (round 2
+// fix round) omitted-call filter uses it to size the filtered slices
+// exactly, and to skip the filtering pass entirely when nothing was
+// omitted.
+func countTrue(bs []bool) int {
+	n := 0
+	for _, b := range bs {
+		if b {
+			n++
+		}
+	}
+	return n
+}
+
 // scoreOutcome carries safeScore's goroutine result back to its caller.
 type scoreOutcome struct {
 	result model.ScoreResult
@@ -449,7 +463,11 @@ func safeScoreCall(ctx context.Context, scorer model.Scorer, req model.ScoreRequ
 // for anything else (the caller, Tick, records this as a whole-pass
 // failure via store.RecordSubjectFailure — B3 fix round).
 func (w *Worker) scoreSubject(ctx context.Context, d store.DirtySubject, now time.Time) (bool, error) {
-	verdict, records, nextRescoreAt, err := w.computeVerdict(ctx, ctx, d, now, false)
+	// syncOnly is always false here, so the returned syncOnlyDeferred flag
+	// (R3, round 2 fix round) is always false too — Tick always fully
+	// validates every rule against d.DirtySeq, never deferring any of them
+	// the way EvaluateSubject's syncOnly path can.
+	verdict, records, nextRescoreAt, _, err := w.computeVerdict(ctx, ctx, d, now, false)
 	if err != nil {
 		return false, err
 	}
@@ -526,6 +544,29 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 	now := w.deps.now()
 	d, err := w.deps.Store.ClaimSubjectForEvaluate(ctx, tenant, subject, now)
 	if err != nil {
+		// R2 (round 2 fix round): this early return happens BEFORE the
+		// release-on-not-committed defer below is even registered, so it
+		// needs its own release. Ordinarily that would be wrong — we never
+		// actually claimed anything on this path — but store.ErrClaimAmbiguous
+		// specifically means the claim's COMMIT itself raced ctx expiring:
+		// the UPDATE may have landed durably on the server even though we
+		// got an error back. Best-effort release with a context independent
+		// of ctx (which is likely already expired/cancelled — that's how we
+		// got here) and a short bound of its own; ReleaseClaim is
+		// unconditional and idempotent, so if the commit never actually
+		// landed this is a harmless no-op. Proven necessary: without this,
+		// a claim left behind by an ambiguous commit sits for the full
+		// ~2-minute lease with nothing to release it — neither a later
+		// evaluate call nor the worker's own Tick can touch the subject
+		// until the lease itself expires.
+		var ambiguous *store.ErrClaimAmbiguous
+		if errors.As(err, &ambiguous) {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), releaseClaimTimeout)
+			if rerr := w.deps.Store.ReleaseClaim(releaseCtx, tenant, subject); rerr != nil {
+				w.deps.logger().Error("worker: release ambiguous evaluate claim failed", "tenant", tenant, "error", rerr)
+			}
+			cancel()
+		}
 		return false, err
 	}
 
@@ -561,7 +602,7 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 		defer cancel()
 	}
 
-	verdict, records, nextRescoreAt, cvErr := w.computeVerdict(ctx, scoreCtx, d, now, true)
+	verdict, records, nextRescoreAt, syncOnlyDeferred, cvErr := w.computeVerdict(ctx, scoreCtx, d, now, true)
 	if cvErr != nil {
 		// A context error here means the round couldn't even get through
 		// its DB-read/plan phase before ctx itself (the caller's own,
@@ -586,7 +627,41 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 		return false, err
 	}
 
-	if _, upErr := w.deps.Store.UpsertVerdicts(ctx, tenant, subject, d.DirtySeq, records, store.SubjectSummary{
+	// R3 (round 2 fix round): every call this round could have made was
+	// omitted (every configured rule is non-local, syncOnly, with no prior
+	// scored result to carry forward — never true of v0's shipped config,
+	// which always has at least the local rule, but reachable with a
+	// smaller test/future config). UpsertVerdicts itself treats an empty
+	// records slice as a no-op that "does not touch subjects at all" (its
+	// own doc comment) — including never clearing claimed_until — so
+	// calling it here would leave committed=true below with nothing
+	// actually committed, leaking this claim for its full lease. Skip it
+	// outright and report "nothing evaluated," not a failure: the deferred
+	// release above (committed is still false) hands the subject straight
+	// back.
+	if len(records) == 0 {
+		return false, nil
+	}
+
+	// R3 (round 2 fix round): dirtySeqAtStart is what UpsertVerdicts
+	// advances scored_seq TO (GREATEST(scored_seq, dirtySeqAtStart)) — a
+	// round that deferred a non-local rule (carried its last result
+	// forward, or omitted it for lack of one) never actually validated
+	// that rule against d.DirtySeq's inputs, so advancing scored_seq up to
+	// d.DirtySeq would wrongly tell ClaimDirtySubjects' dirty-seq check
+	// this subject is fully caught up — starving that rule of ever
+	// getting a genuine (non-syncOnly) round. Passing d.ScoredSeq instead
+	// is a no-op on scored_seq (GREATEST(scored_seq, d.ScoredSeq) can only
+	// ever be scored_seq itself, since d.ScoredSeq IS scored_seq as of the
+	// claim), which leaves dirty_seq > scored_seq exactly as it already
+	// was — the subject stays claimable by the worker's own Tick for that
+	// rule's real round, while current_tier/current_score/the verdict rows
+	// themselves still land normally either way.
+	dirtySeqAtStart := d.DirtySeq
+	if syncOnlyDeferred {
+		dirtySeqAtStart = d.ScoredSeq
+	}
+	if _, upErr := w.deps.Store.UpsertVerdicts(ctx, tenant, subject, dirtySeqAtStart, records, store.SubjectSummary{
 		Tier:          verdict.Tier,
 		Score:         verdict.Score,
 		NextRescoreAt: nextRescoreAt,
@@ -631,10 +706,10 @@ func (w *Worker) EvaluateSubject(ctx context.Context, tenant, subject string, de
 // existing vendor verdict with "unscored" just because evaluate can't
 // synchronously refresh it); only a non-local rule with NO prior scored
 // result at all is marked unscored/"sync_scorer_unsupported".
-func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubject, now time.Time, syncOnly bool) (core.Verdict, []store.VerdictRecord, time.Time, error) {
+func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubject, now time.Time, syncOnly bool) (core.Verdict, []store.VerdictRecord, time.Time, bool, error) {
 	storedEvents, err := w.deps.Store.EventsForSubject(ctx, d.Tenant, d.Subject)
 	if err != nil {
-		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load events: %w", err)
+		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("load events: %w", err)
 	}
 	events := make([]event.Event, len(storedEvents))
 	for i, se := range storedEvents {
@@ -644,12 +719,12 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	windows := feature.DefaultWindows(now)
 	fr, err := feature.Extract(ctx, d.Tenant, d.Subject, events, w.deps.Neighbors, windows, w.deps.Brands)
 	if err != nil {
-		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("extract features: %w", err)
+		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("extract features: %w", err)
 	}
 
 	latest, err := w.deps.Store.LatestVerdicts(ctx, d.Tenant, d.Subject)
 	if err != nil {
-		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load latest verdicts: %w", err)
+		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("load latest verdicts: %w", err)
 	}
 
 	currentRuleNames := make([]string, len(w.deps.Config.Rules))
@@ -684,7 +759,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	// queried by name a live rule actually has), but there's no reason to
 	// keep it either.
 	if err := w.deps.Store.PruneRuleState(ctx, d.Tenant, d.Subject, currentRuleNames); err != nil {
-		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("prune rule_state: %w", err)
+		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("prune rule_state: %w", err)
 	}
 
 	calls := core.Plan(fr.Features.Map(), nil, ruleStates) // N1 fix round: nil Text — v0 has no text-input rule registered yet (S5 adds the first one); Plan's own doc comment covers what a non-nil map would do.
@@ -712,6 +787,21 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	// re-score. "" means no override (use call.InputHash as normal).
 	inputHashOverride := make([]string, len(calls))
 
+	// omit marks a call index for exclusion from this round entirely (R3,
+	// round 2 fix round) — set only for a syncOnly non-local rule with no
+	// prior scored result to carry forward (see below). Filtered out of
+	// calls/outcomes/results/inputHashOverride together, right before
+	// core.Combine, so Combine never sees (and verdicts history never
+	// records) a rule evaluate never actually asked a question.
+	omit := make([]bool, len(calls))
+
+	// syncOnlyDeferred is set whenever THIS round left a non-local rule
+	// either carried forward or omitted rather than genuinely re-run
+	// against the CURRENT inputs (R3, round 2 fix round) — see its use
+	// after this loop, where it holds back scored_seq so the subject
+	// stays claimable for that rule's real, non-syncOnly round.
+	syncOnlyDeferred := false
+
 	for i, call := range calls {
 		r := call.Rule
 
@@ -723,20 +813,29 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		// score/tier computation even though nothing about the rule's own
 		// last real answer changed. Instead, carry the rule's latest
 		// SCORED result forward exactly as SkipInputUnchanged already does
-		// below, so its risk still counts toward this round's tier. Only a
-		// rule with no prior scored result at all falls back to
-		// "sync_scorer_unsupported" (nothing to carry forward). Checked
+		// below, so its risk still counts toward this round's tier. Checked
 		// before the stage/backoff/skip logic below so a staged or
 		// backed-off non-local rule is handled identically to any other
 		// non-local rule under evaluate.
 		if syncOnly && r.Scorer != "local" {
+			syncOnlyDeferred = true
 			if lv, ok := latest[r.Name]; ok && lv.Status == "scored" {
 				res := model.ScoreResult{Probs: lv.Probs, Model: lv.Model, Checkpoint: lv.Checkpoint, Render: call.Request.RenderVersion}
 				results[i] = &res
 				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason}
 				inputHashOverride[i] = lv.InputHash
 			} else {
-				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "sync_scorer_unsupported"}
+				// R3 (round 2 fix round): nothing to carry forward, and
+				// evaluate can't run this scorer live — omit the rule from
+				// this round entirely rather than recording a synthetic
+				// "sync_scorer_unsupported" attempt that never happened.
+				// Proven necessary: that synthetic verdict row made it look
+				// like this rule had already been considered and found
+				// wanting for this dirty_seq, when in truth evaluate never
+				// asked it anything — the worker's own Tick (the only path
+				// that can actually give this rule a first answer) still
+				// needs to see it as due, not already handled.
+				omit[i] = true
 			}
 			continue
 		}
@@ -753,7 +852,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 
 		backoff, err := w.deps.Store.GetRuleBackoff(ctx, d.Tenant, d.Subject, r.Name)
 		if err != nil {
-			return core.Verdict{}, nil, time.Time{}, fmt.Errorf("load rule backoff for %s: %w", r.Name, err)
+			return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("load rule backoff for %s: %w", r.Name, err)
 		}
 		if backoff.InBackoff(now) {
 			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "backoff"}
@@ -798,7 +897,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		if budgeted {
 			allowed, code, berr := w.deps.Budgets.Allow(ctx, r.Scorer, d.Tenant, d.Subject, isElevated, now)
 			if berr != nil {
-				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("check budget for %s: %w", r.Name, berr)
+				return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("check budget for %s: %w", r.Name, berr)
 			}
 			if !allowed {
 				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: code}
@@ -834,32 +933,44 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			if w.deps.Metrics != nil {
 				w.deps.Metrics.IncAdapterErrors(r.Scorer)
 			}
+			// R1 (round 2 fix round): a call cut short by scoreCtx's OWN
+			// deadline (evaluate's deadline_ms) or by the caller's outer ctx
+			// being cancelled is NOT a scorer failure — it's evaluate's own
+			// synchronous budget running out, which can happen to a
+			// perfectly healthy "local" scorer too (syncOnly still calls it
+			// live). Proven necessary: recording it via RecordRuleError put
+			// the RULE itself into backoff (rule_state.retry_at, 30s+) even
+			// though the round it happened in is then ABANDONED below
+			// (scoreCtx.Err() check) and never committed — so a tiny
+			// deadline_ms on one evaluate call was silently poisoning every
+			// SUBSEQUENT normal-deadline evaluate AND the worker's own Tick
+			// for up to 30s, turning a transient budget miss into a real
+			// outage. Marked unscored/deadline_exceeded with no backoff
+			// bookkeeping and no retry scheduling — a future round (this
+			// same evaluate retried, or the worker's own Tick, neither of
+			// which artificially shortens ctx) tries again with a full
+			// budget on its own schedule.
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "deadline_exceeded"}
+				continue
+			}
 			retryAt := now.Add(backoffDuration(backoff.Attempts + 1))
 			if rerr := w.deps.Store.RecordRuleError(ctx, d.Tenant, d.Subject, r.Name, retryAt, err.Error()); rerr != nil {
-				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("record rule error for %s: %w", r.Name, rerr)
+				return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("record rule error for %s: %w", r.Name, rerr)
 			}
-			// S1 fix round: a scorer call cut short by scoreCtx's own
-			// deadline (evaluate's deadline_ms, or the caller's outer ctx)
-			// is reported distinctly from a genuine adapter failure — a
-			// caller can tell "my own deadline was too tight for this rule"
-			// from "the adapter itself errored."
-			errorCode := "adapter_error"
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				errorCode = "deadline_exceeded"
-			}
-			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: errorCode}
+			outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: "adapter_error"}
 			retryCandidates = append(retryCandidates, retryAt)
 			continue
 		}
 
 		if budgeted {
 			if berr := w.deps.Budgets.Record(ctx, r.Scorer, d.Tenant, d.Subject, now); berr != nil {
-				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("record budget usage for %s: %w", r.Name, berr)
+				return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("record budget usage for %s: %w", r.Name, berr)
 			}
 		}
 		if backoff.Attempts > 0 {
 			if cerr := w.deps.Store.ClearRuleBackoff(ctx, d.Tenant, d.Subject, r.Name); cerr != nil {
-				return core.Verdict{}, nil, time.Time{}, fmt.Errorf("clear rule backoff for %s: %w", r.Name, cerr)
+				return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("clear rule backoff for %s: %w", r.Name, cerr)
 			}
 		}
 
@@ -877,6 +988,28 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: reason}
 	}
 
+	// R3 (round 2 fix round): drop every omitted index from calls,
+	// outcomes, results and inputHashOverride TOGETHER, in lockstep, right
+	// before Combine — everything downstream (Combine's own len(Signals)
+	// == len(calls) check, and the records loop below, which re-walks
+	// calls by index) must never see an omitted rule at all.
+	if n := countTrue(omit); n > 0 {
+		filteredCalls := make([]core.Call, 0, len(calls)-n)
+		filteredOutcomes := make([]core.RuleOutcome, 0, len(calls)-n)
+		filteredResults := make([]*model.ScoreResult, 0, len(calls)-n)
+		filteredInputHashOverride := make([]string, 0, len(calls)-n)
+		for i := range calls {
+			if omit[i] {
+				continue
+			}
+			filteredCalls = append(filteredCalls, calls[i])
+			filteredOutcomes = append(filteredOutcomes, outcomes[i])
+			filteredResults = append(filteredResults, results[i])
+			filteredInputHashOverride = append(filteredInputHashOverride, inputHashOverride[i])
+		}
+		calls, outcomes, results, inputHashOverride = filteredCalls, filteredOutcomes, filteredResults, filteredInputHashOverride
+	}
+
 	verdict := core.Combine(outcomes, core.CombineParams{
 		Tiers:                       w.deps.Config.Tiers,
 		MinScoredAdvise:             w.deps.Config.MinScoredAdvise,
@@ -884,7 +1017,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	}, w.deps.Calibration)
 
 	if len(verdict.Signals) != len(calls) {
-		return core.Verdict{}, nil, time.Time{}, fmt.Errorf("worker: internal/core.Combine returned %d signals for %d calls", len(verdict.Signals), len(calls))
+		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("worker: internal/core.Combine returned %d signals for %d calls", len(verdict.Signals), len(calls))
 	}
 	if w.deps.Metrics != nil {
 		w.deps.Metrics.IncVerdictsByTier(verdict.Tier)
@@ -894,7 +1027,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 	for i, call := range calls {
 		sig := verdict.Signals[i]
 		if sig.Rule != call.Rule.Name {
-			return core.Verdict{}, nil, time.Time{}, fmt.Errorf("worker: signal/call order mismatch at index %d: got rule %q, want %q", i, sig.Rule, call.Rule.Name)
+			return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("worker: signal/call order mismatch at index %d: got rule %q, want %q", i, sig.Rule, call.Rule.Name)
 		}
 		var probs map[string]float64
 		if results[i] != nil {
@@ -942,5 +1075,5 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		}
 	}
 
-	return verdict, records, nextRescoreAt, nil
+	return verdict, records, nextRescoreAt, syncOnlyDeferred, nil
 }
