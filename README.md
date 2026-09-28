@@ -115,7 +115,17 @@ Two corpus shapes (design §4.6), both JSONL:
   Each subject's feature vector is rebuilt from events STRICTLY BEFORE its decision_at, using
   internal/feature with same-tenant neighbour evidence resolved from an in-memory index built from
   the dataset's own links — evaluated as of each subject's own decision point, never as of the end
-  of the whole dataset (see `eval/neighbors.go`'s `evidenceAsOf`).
+  of the whole dataset (see `eval/neighbors.go`'s `evidenceAsOf`). Same-tenant `linked_labelled_
+  abusive_n` evidence comes ONLY from `label`-typed rows in the events file (never from the labels
+  file's own ground truth being evaluated — fix round B1), and a labels row is rejected (exit 2) if
+  its slices aren't in `first_send <= early_15m <= full` order or its decision_at falls after the
+  subject's own permanent deletion (fix round B2). `--split train|test|all` filters which rows get
+  scored: a snapshot row's own `split` field, or — for replay — a keyed hash of the subject's link
+  cluster (a connected component over every link kind in the dataset), falling back to its own id
+  (fix round S7; a TODO in `eval/replay.go` notes this is independent of `internal/serve`'s own
+  per-subject `corpus_examples.split`, a separate, still-open gap). `--skip-invalid` reports bad
+  rows in run.json's `skipped_rows` instead of failing the whole run (fix round P2; the default
+  stays strict, exit 2 on any bad row).
 
 ```bash
 go build -o abusekit ./cmd/abusekit

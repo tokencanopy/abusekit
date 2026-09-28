@@ -148,19 +148,29 @@ the way the hand-written fixtures above are:
   `impersonationNames`; benign shapes pair one WITH an integration word —
   `eval/gen/benign.go`'s `integrationAgentNames`).
 
-14 families, 208 subjects total: 154 benign across 7 families (fast
+18 families, 286 subjects total: 232 benign across 9 families (fast
 developer onboarding with self-tests, integration-heavy orgs, day-1
 receipts fan-out to 10–40 domains, support-desk later-day fan-out,
-newsletter-style later-day fan-out, slow upgraders, $0-trial accounts —
-none of which the shipped `config/local_weights.yaml` was tuned
-against, unlike the hand-written benign fixtures above) and 54 abusive
-across burst/fast/dormant-then-blast/slow-operator (6 each) plus three
-churn variants — email-linked, card-linked, device-linked (2 chains of 5
-incarnations each, 10 subjects per kind) — every one of which is in
-`internal/feature`'s default same-tenant link-kind set. See the PR that
-introduced this corpus for the local scorer's measured precision/recall/
-F1/ECE/AUROC against it, and `eval/floors.yaml` for how those numbers
-became the CI gate's floors.
+newsletter-style later-day fan-out, slow upgraders, $0-trial accounts,
+plus two fix-round S3 additions — a shared-card household of 2–3
+otherwise-unremarkable members, and a deleted-then-legitimately-
+resigns-up-later pair sharing an email — none of which the shipped
+`config/local_weights.yaml` was tuned against, unlike the hand-written
+benign fixtures above) and 54 abusive across burst/fast/
+dormant-then-blast/slow-operator (6 each, every count and gap seeded
+jitter — fix round S3) plus three churn variants — email-linked,
+card-linked, device-linked (2 chains of 5 incarnations each, 10 subjects
+per kind, now with jittered timing/declines and real sends before each
+incarnation is abandoned) — every one of which is in `internal/feature`'s
+default same-tenant link-kind set. Two more benign single-subject
+families (fix round S3: `benign_prepaid`, `benign_decline_then_success`)
+round out the counter-examples for signals that are real fraud evidence
+in the abusive families but also routine and innocent on their own.
+`eval/gen`'s own `TestGenerate_RecallVariesWithSeed` proves the jitter
+reaches scoring outcomes, not just cosmetic field values. See the PR
+that introduced this corpus (and its fix round) for the local scorer's
+measured precision/recall/F1/ECE/AUROC against it, and `eval/floors.yaml`
+for how those numbers became the CI gate's floors.
 
 `make gate`/CI never read the private incident corpus (design §1/§4.10):
 that corpus lives in a separate private repository and is scored with
