@@ -56,7 +56,7 @@ func TestEvaluateSubject_FastFixtureReachesHighBeforeFirstSend(t *testing.T) {
 	if !now.Before(firstExternalSendAt) {
 		t.Fatalf("fixture timing assumption broken: evaluate instant (%v) is not before the first external send (%v)", now, firstExternalSendAt)
 	}
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestEvaluateSubject_NotFoundForUnseenSubject(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadShippedConfig(t)
 	now := time.Date(2031, time.January, 1, 0, 0, 0, 0, time.UTC)
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestEvaluateSubject_SyntheticSubjectIsNotScorable(t *testing.T) {
 	appendEvent(t, ctx, s, "mon-a", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
 	appendEvent(t, ctx, s, "mon-a", "subject.class", now.Add(time.Second), event.Links{}, map[string]any{"class": "synthetic"})
 
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestEvaluateSubject_AlreadyClaimedSurfacesBusyWithRealRetryAfter(t *testing
 		t.Fatalf("ClaimDirtySubjects: %v", err)
 	}
 
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestEvaluateSubject_RespectsDeadline(t *testing.T) {
 
 	appendEvent(t, ctx, s, "acct_eval_deadline_exceeded", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
 	slow := delayingStore{Store: s, delay: 200 * time.Millisecond}
-	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -425,7 +425,7 @@ func TestEvaluateSubject_RespectsDeadline(t *testing.T) {
 	}
 
 	appendEvent(t, ctx, s, "acct_eval_deadline_ok", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
-	w2, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w2, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -451,7 +451,7 @@ func TestEvaluateSubject_ReleasesClaimOnCancelledContext(t *testing.T) {
 	appendEvent(t, context.Background(), s, "acct_eval_cancelled", "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
 
 	slow := delayingStore{Store: s, delay: 50 * time.Millisecond}
-	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -528,7 +528,7 @@ func TestEvaluateSubject_ShortDeadlineDoesNotBackoffRule(t *testing.T) {
 	// (the local scorer is a pure in-process computation, normally far too
 	// fast to ever observe an expired 1ms deadline on its own).
 	slow := delayingStore{Store: s, delay: 50 * time.Millisecond}
-	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: slow, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -669,7 +669,7 @@ func TestEvaluateSubject_ReleasesAmbiguousClaimCommit(t *testing.T) {
 
 	appendEvent(t, ctx, s, subject, "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
 
-	w, err := New(Deps{Store: ambiguousClaimStore{Store: s}, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: ambiguousClaimStore{Store: s}, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -683,7 +683,7 @@ func TestEvaluateSubject_ReleasesAmbiguousClaimCommit(t *testing.T) {
 	// call through before swapping its result) — without R2's fix this
 	// leaves the subject claimed for the full lease. A plain follow-up
 	// call, through an UNWRAPPED store, must not see *store.ErrBusy.
-	w2, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w2, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -721,7 +721,7 @@ func TestEvaluateSubject_ShortDeadlineDuringClaimNeverLeaksLease(t *testing.T) {
 
 	appendEvent(t, context.Background(), s, subject, "subject.created", now, event.Links{}, map[string]any{"channel": "signup"})
 
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

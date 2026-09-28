@@ -41,6 +41,12 @@ The seed for each hash actually in the fixtures:
 | `fast.jsonl` | `email_hash` | `fast-signup-email` |
 | `fast.jsonl` | `card_fingerprint_hash` (declines) | `fast-card-declined` |
 | `fast.jsonl` | `card_fingerprint_hash` (success) | `fast-card-prepaid` |
+| `webmail_blast.jsonl` | `email_hash` | `webmail-blast-email` |
+| `subject_lure_only.jsonl` | `email_hash` | `lure-only-email` |
+| `benign_newsletter_webmail.jsonl` | `email_hash` | `newsletter-webmail-email` |
+| `benign_newsletter_webmail.jsonl` | `card_fingerprint_hash` | `newsletter-card` |
+| `benign_support_desk_webmail.jsonl` | `email_hash` | `support-desk-email` |
+| `benign_shop_integration_subject.jsonl` | `email_hash` | `shop-integration-email` |
 
 Regenerate any of these with `printf '%s' '<seed>' \| shasum -a 256` rather
 than editing the hex by hand — an earlier version of `burst.jsonl`,
@@ -109,6 +115,34 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   Committed so a FUTURE weight change (as opposed to R1's feature-level
   caps, which don't touch this fixture at all) can't silently push it into
   `high` without a test noticing.
+
+- `webmail_blast.jsonl`, `subject_lure_only.jsonl` (**[S2b]**) — the two
+  fixtures that must reach `high` on the [S2b] send-volume/webmail/
+  subject-line-brand features alone, motivated by a real phishing
+  campaign that scored low under the pre-[S2b] feature set: 1 agent + 1
+  key, then 100 recipients on a single public webmail domain (gmail.com —
+  a public provider name, not customer data) within ~8 minutes, brand
+  words in the subject lines, no brand in the agent's own name
+  (`webmail_blast.jsonl`); and neutral agent names, brand words in the
+  subject line, 40 sends to a single NON-webmail domain over ~29 minutes,
+  with no webmail signal at all (`subject_lure_only.jsonl`) — proving
+  `subject_brand_match` plus modest volume is sufficient on its own,
+  without any help from the webmail features.
+- `benign_newsletter_webmail.jsonl`, `benign_support_desk_webmail.jsonl`,
+  `benign_shop_integration_subject.jsonl` (**[S2b]**) — three more accounts
+  that must never reach `high`, each isolating one [S2b] false-positive
+  risk: a legitimate newsletter to webmail recipients (a 3-day-old account
+  with a real credit-card payment, 200 sends over ~6 hours,
+  `webmail_recipient_share=1.0`, no brand mention) proves webmail
+  concentration alone isn't abuse; a support desk replying to webmail
+  customers at a steady 20/hour on day 2 (past the first-day window)
+  proves steady, modest-volume webmail traffic isn't abuse; a shop sending
+  "Your Etsy order #N shipped" order confirmations through an agent
+  literally named "Etsy Integration" (the existing integration-token gate
+  already covers the agent-NAME side; `subject_brand_match=1` still fires
+  on every subject line, since that gate is independent per field) proves
+  a single repeated subject-line brand mention in an otherwise ordinary
+  transactional pattern isn't abuse either.
 
 See `internal/worker/replay_test.go`, `replay_churn_test.go`,
 `ablation_test.go` and `mutation_test.go` for what each fixture actually

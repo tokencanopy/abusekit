@@ -169,3 +169,87 @@ weights:
   # change that could have pushed it into `high`; left unchanged and
   # reverified to still land at 0.49.
   burst_ratio_24h_vs_lifetime: 0.3
+
+  # [S2b] Send-volume, webmail, recipient and subject-line-brand features
+  # (docs/design's [S2b] amendment) — motivated by a real phishing
+  # campaign that scored low: every account mailed ~100 recipients on one
+  # webmail domain in minutes (no distinct-domain fan-out for
+  # first_day_distinct_domains to see), and the lure text lived only in
+  # subject lines. New fixtures: eval/fixtures/webmail_blast.jsonl (1
+  # agent + 1 key, 100 recipients on gmail.com in ~8 minutes, brand words
+  # in the subject line, no brand in the agent name — must reach `high`)
+  # and eval/fixtures/subject_lure_only.jsonl (neutral agent names, brand
+  # words in the subject line, 40 sends to a single non-webmail domain
+  # over ~29 minutes — must ALSO reach `high`, proving subject-line-brand
+  # evidence works without any webmail signal at all). "Must stay below
+  # `high`" guards: benign_newsletter_webmail.jsonl (a 3-day-old account,
+  # real credit-card payment, 200 sends to webmail recipients over ~6h —
+  # webmail volume alone is not abuse), benign_support_desk_webmail.jsonl
+  # (20 replies/hour to webmail customers on day 2 — steady low-volume
+  # webmail traffic is not abuse), benign_shop_integration_subject.jsonl
+  # (an agent named "Etsy Integration" sending "Your Etsy order #N
+  # shipped" order confirmations — a single subject-line brand mention in
+  # an otherwise ordinary transactional pattern is not abuse on its own).
+  #
+  # sends_10m_max/sends_1h/sends_first_day/distinct_recipients_1h are all
+  # RAW COUNTS capped at internal/feature.sendsVolumeCap (300), not
+  # log1p-scaled (see that constant's own doc comment for why log1p was
+  # the wrong shape here) — every weight below is small specifically
+  # because these are raw counts that reach the hundreds for a real blast.
+  #
+  # sends_10m_max carries the bulk of the send-volume signal (the
+  # sharpest discriminator: webmail_blast's 100-in-one-window vs.
+  # benign_receipts_fanout's pre-existing 5, benign_selfsend_brandname's
+  # 8, benign_self_send_only's 8 — none of which come close). Bounded on
+  # the low side by benign_receipts_fanout (round 2's own regression
+  # fixture, sends_10m_max=5, must stay under its existing 0.4 ceiling —
+  # the tightest existing margin any [S2b] weight touches) and
+  # benign_fast_onboarding (sends_10m_max=2, must stay under its existing
+  # 0.45 ceiling); bounded on the high side by webmail_blast (100) and
+  # subject_lure_only (14) both needing to clear `high` with real margin.
+  sends_10m_max: 0.013
+
+  # sends_1h/sends_first_day/distinct_recipients_1h are deliberately small
+  # supporting signals, not primary discriminators: they are largely
+  # redundant with sends_10m_max for every committed fixture (a fixture
+  # dense enough to trip sends_10m_max is usually dense enough to move
+  # these too), and a bigger weight on any of them alone pushed
+  # benign_receipts_fanout (sends_1h=distinct_recipients_1h=30,
+  # sends_first_day=30) or benign_variant_a past their existing ceilings
+  # during tuning. See mutation_test.go's isolatedWeightScenarios for the
+  # synthetic scenario proving each is still individually load-bearing —
+  # no committed replay fixture is sensitive enough to any ONE of these
+  # three alone to prove it by itself.
+  sends_1h: 0.001
+  sends_first_day: 0.001
+  distinct_recipients_1h: 0.001
+
+  # webmail_recipient_share is a flat 0..1 concentration signal, bounded
+  # on the low side by benign_newsletter_webmail and
+  # benign_support_desk_webmail both reaching share=1.0 (100% webmail
+  # recipients) and needing to stay comfortably low regardless — proving
+  # concentration ALONE, without volume, is weak evidence, exactly the
+  # design's own reasoning for adding webmail_sends_1h alongside it.
+  webmail_recipient_share: 0.15
+
+  # webmail_sends_1h = sends_1h * webmail_recipient_share is the
+  # combination term design calls for: bounded the same way as
+  # sends_10m_max, by the same benign_receipts_fanout/benign_variant_a
+  # ceilings on the low side (though those two carry share=0, so this
+  # feature is 0 for them — its ceiling pressure in practice comes from
+  # benign_newsletter_webmail=33 and benign_support_desk_webmail=20, both
+  # needing to stay low) and webmail_blast=100 on the high side.
+  webmail_sends_1h: 0.008
+
+  # subject_brand_match is the primary lure-CONTENT discriminator — the
+  # one signal name_brand_match structurally cannot see (it only ever
+  # reads resource.created/deleted's `name`, never subject_line). Bounded
+  # on the low side by benign_shop_integration_subject (a single Etsy
+  # mention in an ordinary order-confirmation subject line, value=1, must
+  # stay low given its otherwise-benign profile) and on the high side by
+  # BOTH webmail_blast and subject_lure_only (value=2 each — two distinct
+  # brands per fixture) needing to clear `high`, subject_lure_only
+  # especially: it carries NO webmail signal at all, so this weight
+  # (combined with its own modest sends_10m_max=14) has to do most of the
+  # work alone.
+  subject_brand_match: 2.6

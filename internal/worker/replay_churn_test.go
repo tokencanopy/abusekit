@@ -46,7 +46,7 @@ func TestReplay_ChurnHighFromThirdSubjectOnward(t *testing.T) {
 		ingestFixture(t, ctx, s, onboarding)
 		now := lastEventAt(onboarding).Add(time.Second)
 
-		w, err := New(Deps{Store: s, Config: cfg, Neighbors: neighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+		w, err := New(Deps{Store: s, Config: cfg, Neighbors: neighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 		if err != nil {
 			t.Fatalf("subject %d: New: %v", i+1, err)
 		}

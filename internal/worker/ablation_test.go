@@ -44,6 +44,20 @@ func fullFeatureVector() map[string]float64 {
 		"fingerprint_seen_on_other_subjects": 0.25,
 		"neighbors_truncated":                0.25,
 		"burst_ratio_24h_vs_lifetime":        0.2,
+		// [S2b] representative non-zero values for the send-volume/
+		// webmail/recipient/subject-brand features — modest counts (not
+		// blast-scale), and a fractional 0.25 for subject_brand_match
+		// matching name_brand_match's own fractional-representative
+		// convention above (both are really small integers in real data;
+		// 0.25 keeps this vector in the sigmoid's sensitive middle rather
+		// than saturating it, exactly like name_brand_match's choice).
+		"sends_10m_max":           5,
+		"sends_1h":                30,
+		"sends_first_day":         30,
+		"webmail_recipient_share": 0.25,
+		"webmail_sends_1h":        5,
+		"distinct_recipients_1h":  30,
+		"subject_brand_match":     0.25,
 	}
 }
 

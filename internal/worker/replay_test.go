@@ -100,7 +100,7 @@ func runReplayAt(t *testing.T, events []event.Event, subject string, now time.Ti
 
 	ingestFixture(t, ctx, s, events)
 
-	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Now: func() time.Time { return now }})
+	w, err := New(Deps{Store: s, Config: cfg, Neighbors: feature.NoNeighbors, Brands: loadShippedBrands(t), Webmail: loadShippedWebmail(t), Now: func() time.Time { return now }})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -351,4 +351,84 @@ func TestReplay_SelfSendBrandNameStaysBelowHigh(t *testing.T) {
 		t.Errorf("benign_selfsend_brandname: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
 	}
 	assertBand(t, "benign_selfsend_brandname", view.Score, 0.05, 0.35)
+}
+
+// TestReplay_WebmailBlastReachesHigh replays eval/fixtures/
+// webmail_blast.jsonl — [S2b], the fixture directly motivated by a real
+// phishing campaign that scored low: 1 agent + 1 key, then 100 recipients
+// on a single webmail domain (gmail.com) within ~8 minutes, brand words
+// (PayPal, TikTok) in the subject lines, no brand in the agent's own
+// name. No payment/upgrade signals at all — this must reach `high` on
+// the [S2b] features alone (sends_10m_max, webmail_recipient_share/
+// webmail_sends_1h, subject_brand_match), which is exactly what the
+// pre-[S2b] feature set could not see.
+func TestReplay_WebmailBlastReachesHigh(t *testing.T) {
+	view := runReplay(t, "webmail_blast.jsonl", "acct_example_webmail_blast_1")
+	if view.Tier != "high" {
+		t.Errorf("webmail_blast: tier = %q (score %v), want high\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "webmail_blast", view.Score, 0.9, 1.0)
+}
+
+// TestReplay_SubjectLureOnlyReachesHigh replays eval/fixtures/
+// subject_lure_only.jsonl — [S2b]: neutral agent names (no name_brand_match
+// at all), brand words (Instagram, Facebook) in the subject line, 40 sends
+// to a SINGLE non-webmail domain over ~29 minutes. Deliberately carries NO
+// webmail signal (webmail_recipient_share/webmail_sends_1h are both 0),
+// proving subject_brand_match plus modest send volume alone — without any
+// help from the webmail features — is enough to reach `high`.
+func TestReplay_SubjectLureOnlyReachesHigh(t *testing.T) {
+	view := runReplay(t, "subject_lure_only.jsonl", "acct_example_lure_only_1")
+	if view.Tier != "high" {
+		t.Errorf("subject_lure_only: tier = %q (score %v), want high\nsignals: %+v", view.Tier, view.Score, view.Signals)
+	}
+	assertBand(t, "subject_lure_only", view.Score, 0.85, 1.0)
+}
+
+// TestReplay_NewsletterWebmailStaysBelowHigh replays eval/fixtures/
+// benign_newsletter_webmail.jsonl — [S2b]: a 3-day-old account with a real
+// (non-prepaid) credit-card payment sending 200 newsletter emails to
+// webmail recipients (gmail.com/yahoo.com, webmail_recipient_share=1.0)
+// over ~6 hours, no brand mention at all. Proves webmail CONCENTRATION
+// alone, without a subject-line brand mention and without a dense
+// sub-10-minute burst, is not enough to reach `high` — an ordinary
+// newsletter send pattern many legitimate senders share.
+func TestReplay_NewsletterWebmailStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_newsletter_webmail.jsonl", "acct_example_newsletter_webmail_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_newsletter_webmail: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_newsletter_webmail", view.Score, 0.0, 0.12)
+}
+
+// TestReplay_SupportDeskWebmailStaysBelowHigh replays eval/fixtures/
+// benign_support_desk_webmail.jsonl — [S2b]: a support desk replying to
+// webmail customers at a steady 20/hour on day 2 (past the first-day
+// window: sends_first_day=0), no brand mention, no burst. Proves steady,
+// modest-volume webmail traffic on an established (if young) account is
+// not, by itself, abuse evidence.
+func TestReplay_SupportDeskWebmailStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_support_desk_webmail.jsonl", "acct_example_support_desk_webmail_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_support_desk_webmail: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_support_desk_webmail", view.Score, 0.0, 0.1)
+}
+
+// TestReplay_ShopIntegrationSubjectStaysBelowHigh replays eval/fixtures/
+// benign_shop_integration_subject.jsonl — [S2b]: an agent literally named
+// "Etsy Integration" (name_brand_match=0, the integration-token gate
+// already covers the NAME side) sending "Your Etsy order #N shipped"
+// order confirmations, ten days after signup, at an ordinary pace (at
+// most a handful per hour, never more than 1 per 10-minute window).
+// subject_brand_match=1 (Etsy, matched every time but only ever ONE
+// distinct brand) fires on every send, proving a single, repeated
+// subject-line brand mention in an otherwise ordinary transactional
+// pattern does not, on its own, reach `high`.
+func TestReplay_ShopIntegrationSubjectStaysBelowHigh(t *testing.T) {
+	view := runReplay(t, "benign_shop_integration_subject.jsonl", "acct_example_shop_integration_1")
+	if view.Tier == "high" {
+		t.Errorf("benign_shop_integration_subject: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "benign_shop_integration_subject", view.Score, 0.0, 0.15)
 }

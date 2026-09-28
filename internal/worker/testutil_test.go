@@ -77,8 +77,8 @@ func loadShippedConfig(t *testing.T) *config.Config {
 
 // loadShippedBrands loads the real config/brands.yaml this repo ships
 // (S3 fix round) — used alongside loadShippedConfig by every replay test
-// so name_brand_match is exercised against the actual curated list, not
-// silently held at 0 by an unset Deps.Brands.
+// so name_brand_match/subject_brand_match are exercised against the
+// actual curated list, not silently held at 0 by an unset Deps.Brands.
 func loadShippedBrands(t *testing.T) feature.BrandSet {
 	t.Helper()
 	root := repoRoot(t)
@@ -87,6 +87,21 @@ func loadShippedBrands(t *testing.T) feature.BrandSet {
 		t.Fatalf("load brands.yaml: %v", err)
 	}
 	return brands
+}
+
+// loadShippedWebmail [S2b] loads the real config/webmail.yaml this repo
+// ships — used alongside loadShippedConfig/loadShippedBrands by every
+// replay test so webmail_recipient_share/webmail_sends_1h are exercised
+// against the actual shipped provider list, not silently held at 0 by an
+// unset Deps.Webmail.
+func loadShippedWebmail(t *testing.T) feature.WebmailSet {
+	t.Helper()
+	root := repoRoot(t)
+	webmail, err := feature.LoadWebmailFile(filepath.Join(root, "config", "webmail.yaml"))
+	if err != nil {
+		t.Fatalf("load webmail.yaml: %v", err)
+	}
+	return webmail
 }
 
 // newFakeRuleConfig builds a *config.Config with exactly one advise rule,

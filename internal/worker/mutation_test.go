@@ -46,6 +46,15 @@ var goldenWeightSigns = map[string]int{
 	"fingerprint_seen_on_other_subjects": 1,
 	"neighbors_truncated":                1,
 	"burst_ratio_24h_vs_lifetime":        1,
+	// [S2b]: every one of these is a non-negative count/share, so more of
+	// it is never LESS risky — all seven are positive.
+	"sends_10m_max":           1,
+	"sends_1h":                1,
+	"sends_first_day":         1,
+	"webmail_recipient_share": 1,
+	"webmail_sends_1h":        1,
+	"distinct_recipients_1h":  1,
+	"subject_brand_match":     1,
 }
 
 // TestLocalWeights_GoldenSignsAndNonZero is R2 round 2's static half of
@@ -130,7 +139,7 @@ func (f fakeNeighborsWith) Evidence(context.Context, string, string) (feature.Ne
 // content.sent), and returns the resulting feature map. ev is the
 // same-tenant linking evidence to report (feature.NeighborEvidence{} for
 // every fixture except churn's).
-func extractFixture(t *testing.T, brands feature.BrandSet, fixtureFile string, after time.Duration, stopBeforeContentSent bool, ev feature.NeighborEvidence) map[string]float64 {
+func extractFixture(t *testing.T, brands feature.BrandSet, webmail feature.WebmailSet, fixtureFile string, after time.Duration, stopBeforeContentSent bool, ev feature.NeighborEvidence) map[string]float64 {
 	t.Helper()
 	events := loadFixture(t, filepath.Join(repoRoot(t), "eval", "fixtures", fixtureFile))
 	if stopBeforeContentSent {
@@ -144,7 +153,7 @@ func extractFixture(t *testing.T, brands feature.BrandSet, fixtureFile string, a
 		events = setup
 	}
 	now := lastEventAt(events).Add(after)
-	res, err := feature.Extract(context.Background(), testTenant, "subject", events, fakeNeighborsWith{ev}, feature.DefaultWindows(now), brands, feature.WebmailSet{})
+	res, err := feature.Extract(context.Background(), testTenant, "subject", events, fakeNeighborsWith{ev}, feature.DefaultWindows(now), brands, webmail)
 	if err != nil {
 		t.Fatalf("feature.Extract(%s): %v", fixtureFile, err)
 	}
@@ -161,32 +170,43 @@ func extractFixture(t *testing.T, brands feature.BrandSet, fixtureFile string, a
 func mutationScenarios(t *testing.T) []mutationScenario {
 	t.Helper()
 	brands := loadShippedBrands(t)
+	webmail := loadShippedWebmail(t)
 
 	churnEvents := loadFixture(t, filepath.Join(repoRoot(t), "eval", "fixtures", "churn.jsonl"))
 	const eventsPerSubject = 5
 	subject3Onboarding := churnEvents[2*eventsPerSubject : 2*eventsPerSubject+4]
 	now3 := lastEventAt(subject3Onboarding).Add(time.Second)
-	res3, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_3", subject3Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 2, FingerprintShared: true}}, feature.DefaultWindows(now3), brands, feature.WebmailSet{})
+	res3, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_3", subject3Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 2, FingerprintShared: true}}, feature.DefaultWindows(now3), brands, webmail)
 	if err != nil {
 		t.Fatalf("feature.Extract(churn subject 3): %v", err)
 	}
 	subject6Onboarding := churnEvents[5*eventsPerSubject : 5*eventsPerSubject+4]
 	now6 := lastEventAt(subject6Onboarding).Add(time.Second)
-	res6, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_6", subject6Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 5, FingerprintShared: true}}, feature.DefaultWindows(now6), brands, feature.WebmailSet{})
+	res6, err := feature.Extract(context.Background(), testTenant, "acct_example_churn_6", subject6Onboarding, fakeNeighborsWith{feature.NeighborEvidence{DeletedCount: 5, FingerprintShared: true}}, feature.DefaultWindows(now6), brands, webmail)
 	if err != nil {
 		t.Fatalf("feature.Extract(churn subject 6): %v", err)
 	}
 
 	scenarios := []mutationScenario{
-		{"reference_operator", extractFixture(t, brands, "reference_operator.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.99, 1.0},
-		{"benign_transactional", extractFixture(t, brands, "benign_transactional.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.05},
-		{"burst_before_send", extractFixture(t, brands, "burst.jsonl", 15*time.Second, true, feature.NeighborEvidence{}), 0.9, 1.0},
-		{"burst_final", extractFixture(t, brands, "burst.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
-		{"benign_fast_onboarding", extractFixture(t, brands, "benign_fast_onboarding.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.15, 0.45}, // upper edge widened, D2 round 3 — see replay_test.go's TestReplay_BenignFastOnboardingStaysBelowHigh
-		{"benign_integration_heavy", extractFixture(t, brands, "benign_integration_heavy.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.05, 0.35},
-		{"dormant_then_blast", extractFixture(t, brands, "dormant_then_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.8, 0.98},
+		{"reference_operator", extractFixture(t, brands, webmail, "reference_operator.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.99, 1.0},
+		{"benign_transactional", extractFixture(t, brands, webmail, "benign_transactional.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.05},
+		{"burst_before_send", extractFixture(t, brands, webmail, "burst.jsonl", 15*time.Second, true, feature.NeighborEvidence{}), 0.9, 1.0},
+		{"burst_final", extractFixture(t, brands, webmail, "burst.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
+		{"benign_fast_onboarding", extractFixture(t, brands, webmail, "benign_fast_onboarding.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.15, 0.45}, // upper edge widened, D2 round 3 — see replay_test.go's TestReplay_BenignFastOnboardingStaysBelowHigh
+		{"benign_integration_heavy", extractFixture(t, brands, webmail, "benign_integration_heavy.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.05, 0.35},
+		{"dormant_then_blast", extractFixture(t, brands, webmail, "dormant_then_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.8, 0.98},
 		{"churn_subject_3", res3.Features.Map(), 0.8, 0.95},
 		{"churn_subject_saturated", res6.Features.Map(), 0.9, 1.0},
+		// [S2b] send-volume/webmail/recipient/subject-brand fixtures — see
+		// replay_test.go's TestReplay_WebmailBlastReachesHigh /
+		// TestReplay_SubjectLureOnlyReachesHigh / TestReplay_*StaysBelowHigh
+		// for why each band is what it is; kept in sync deliberately, not
+		// derived, same convention as every scenario above.
+		{"webmail_blast", extractFixture(t, brands, webmail, "webmail_blast.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
+		{"subject_lure_only", extractFixture(t, brands, webmail, "subject_lure_only.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.85, 1.0},
+		{"benign_newsletter_webmail", extractFixture(t, brands, webmail, "benign_newsletter_webmail.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.12},
+		{"benign_support_desk_webmail", extractFixture(t, brands, webmail, "benign_support_desk_webmail.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.1},
+		{"benign_shop_integration_subject", extractFixture(t, brands, webmail, "benign_shop_integration_subject.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.15},
 	}
 	return append(scenarios, isolatedWeightScenarios()...)
 }
@@ -252,6 +272,31 @@ func isolatedWeightScenarios() []mutationScenario {
 		{"isolated_neighbors_truncated", withTarget("neighbors_truncated", 1), 0.27, 0.35},
 		// burst_ratio_24h_vs_lifetime: base=0.293, zeroed=0.235.
 		{"isolated_burst_ratio_24h_vs_lifetime", withTarget("burst_ratio_24h_vs_lifetime", 1.0), 0.27, 0.35},
+
+		// [S2b]: none of the committed wide fixtures are individually
+		// sensitive enough to any ONE of these six weights alone to prove
+		// it's load-bearing (TestLocalWeights_GoldenSignsAndNonZero already
+		// proves each is configured, non-zero and correctly signed) — same
+		// reason as the eight above. zeroed=0.235 throughout (the same
+		// shared backdrop).
+		//
+		// sends_10m_max: base=0.530, zeroed=0.235.
+		{"isolated_sends_10m_max", withTarget("sends_10m_max", 100), 0.45, 0.60},
+		// sends_1h: base=0.293, zeroed=0.235. 300 = internal/feature's
+		// unexported sendsVolumeCap (the send-volume features' shared
+		// ceiling) — literal here since it isn't importable from this
+		// package.
+		{"isolated_sends_1h", withTarget("sends_1h", 300), 0.27, 0.35},
+		// sends_first_day: base=0.293, zeroed=0.235 (also at sendsVolumeCap).
+		{"isolated_sends_first_day", withTarget("sends_first_day", 300), 0.27, 0.35},
+		// webmail_recipient_share: base=0.263, zeroed=0.235. Capped at its
+		// own natural ceiling of 1.0 (a share), unlike the raw counts above.
+		{"isolated_webmail_recipient_share", withTarget("webmail_recipient_share", 1.0), 0.25, 0.30},
+		// webmail_sends_1h: base=0.604, zeroed=0.235.
+		{"isolated_webmail_sends_1h", withTarget("webmail_sends_1h", 200), 0.50, 0.70},
+		// distinct_recipients_1h: base=0.293, zeroed=0.235 (also at
+		// sendsVolumeCap).
+		{"isolated_distinct_recipients_1h", withTarget("distinct_recipients_1h", 300), 0.27, 0.35},
 	}
 }
 
