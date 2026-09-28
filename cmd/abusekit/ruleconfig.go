@@ -24,6 +24,13 @@ type ruleConfigPaths struct {
 	brandsPath  string
 }
 
+// testExtraScorers is declared here (not in a _test.go file) because it
+// must exist in every build, production included, for loadRuleConfig to
+// reference it — see loadRuleConfig's own doc comment. Its zero value
+// (nil) is a no-op; nothing outside this package's tests ever assigns to
+// it.
+var testExtraScorers []model.Scorer
+
 // loadRuleConfig builds the scorer registry (local, from weightsPath),
 // loads and validates rules.yaml against it and vendors.yaml, and loads
 // the brand list — the same sequence `boot` runs before it ever connects
@@ -42,6 +49,16 @@ func loadRuleConfig(p ruleConfigPaths) (*config.Config, *model.Registry, feature
 	registry := model.NewRegistry()
 	if err := registry.Register(localScorer); err != nil {
 		return nil, nil, feature.BrandSet{}, err
+	}
+	// testExtraScorers is a test-only hook (review round 2, T1: "inject a
+	// fake non-local scorer into the registry") — nil in every real
+	// invocation; only a _test.go file in this package ever sets it, to
+	// exercise the CLI's own non-local-scorer-needs-a-cassette refusal
+	// and cassette-miss handling without a real vendor adapter.
+	for _, s := range testExtraScorers {
+		if err := registry.Register(s); err != nil {
+			return nil, nil, feature.BrandSet{}, err
+		}
 	}
 
 	vendorsData, err := os.ReadFile(p.vendorsPath)

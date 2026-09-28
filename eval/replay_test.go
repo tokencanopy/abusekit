@@ -1,10 +1,14 @@
 package eval
 
 import (
+	"context"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/model/fake"
 )
 
 // TestLoadReplayDataset_StrictlyBeforeDecisionAt proves an event AT or
@@ -118,6 +122,204 @@ func TestLoadReplayDataset_TextFieldExtraction(t *testing.T) {
 	}
 	if got := pt.Text["first_link_host"]; len(got) != 1 || got[0] != "verify.example.test" {
 		t.Fatalf("first_link_host = %v, want [\"verify.example.test\"]", got)
+	}
+}
+
+// pointsByID is a small test helper: subject id -> its Points map, for
+// DeepEqual comparisons across two loads of "the same dataset except one
+// label value".
+func pointsByID(ds Dataset) map[string]map[Slice]Point {
+	out := make(map[string]map[Slice]Point, len(ds.Subjects))
+	for _, s := range ds.Subjects {
+		out[s.ID] = s.Points
+	}
+	return out
+}
+
+// relabelFixtureEvents is shared by the two relabelling tests below:
+// acct_a and acct_b share an email_hash, each with one resource.created.
+const relabelFixtureEvents = `
+{"subject":"acct_a","type":"subject.created","at":"2031-02-01T00:00:00Z","links":{"email_hash":"` + "REPLACED" + `"},"data":{"channel":"signup"}}
+{"subject":"acct_a","type":"resource.created","at":"2031-02-01T00:01:00Z","data":{"kind":"agent","name":"A"}}
+{"subject":"acct_b","type":"subject.created","at":"2031-02-01T00:02:00Z","links":{"email_hash":"` + "REPLACED" + `"},"data":{"channel":"signup"}}
+{"subject":"acct_b","type":"resource.created","at":"2031-02-01T00:03:00Z","data":{"kind":"agent","name":"B"}}
+`
+
+func relabelEvents() string {
+	return strings.ReplaceAll(relabelFixtureEvents, "REPLACED", hash64("relabel-shared-email"))
+}
+
+// TestLoadReplayDataset_RelabellingGroundTruthDoesNotChangeFeatures is
+// fix round B1's own acceptance test (task brief / review): relabelling
+// acct_a's ground truth from "abusive" to "suspicious" — both POSITIVE
+// under benign_label "benign", so nothing about the binary ground-truth
+// split changes — must leave every subject's Points byte-for-byte
+// DeepEqual, because linked_labelled_abusive_n (and every other feature)
+// is computed ENTIRELY from the events file plus `label`-typed rows in
+// it, never from labels.jsonl's own ground truth being evaluated.
+func TestLoadReplayDataset_RelabellingGroundTruthDoesNotChangeFeatures(t *testing.T) {
+	load := func(acctALabel string) Dataset {
+		t.Helper()
+		labels := strings.NewReader(`
+{"subject":"acct_a","label":"` + acctALabel + `","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
+{"subject":"acct_b","label":"abusive","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
+`)
+		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+		if err != nil {
+			t.Fatalf("LoadReplayDataset(%s): %v (rowErrs=%v)", acctALabel, err, rowErrs)
+		}
+		return ds
+	}
+
+	dsAbusive := load("abusive")
+	dsSuspicious := load("suspicious")
+
+	pa, ps := pointsByID(dsAbusive), pointsByID(dsSuspicious)
+	if !reflect.DeepEqual(pa["acct_a"], ps["acct_a"]) {
+		t.Errorf("acct_a's OWN Points changed when its own label changed:\n abusive=%+v\n suspicious=%+v", pa["acct_a"], ps["acct_a"])
+	}
+	if !reflect.DeepEqual(pa["acct_b"], ps["acct_b"]) {
+		t.Errorf("acct_b's Points changed when acct_a's label changed:\n abusive=%+v\n suspicious=%+v", pa["acct_b"], ps["acct_b"])
+	}
+}
+
+// TestLoadReplayDataset_FlippingLaterSubjectsLabelChangesNothing is the
+// review's second B1 acceptance test: acct_a's decision point (00:03) is
+// EARLIER than acct_b's underlying activity — flipping acct_b's ground
+// truth (abusive <-> benign) must not change acct_a's features at all,
+// since acct_a's own Point was already fully resolved before acct_b's
+// label (or even acct_b's later events) could possibly matter, and
+// because ground truth never feeds features in the first place (B1).
+func TestLoadReplayDataset_FlippingLaterSubjectsLabelChangesNothing(t *testing.T) {
+	load := func(acctBLabel string) Point {
+		t.Helper()
+		labels := strings.NewReader(`
+{"subject":"acct_a","label":"abusive","source":"operator","decision_at":{"full":"2031-02-01T00:01:30Z"}}
+{"subject":"acct_b","label":"` + acctBLabel + `","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
+`)
+		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+		if err != nil {
+			t.Fatalf("LoadReplayDataset(%s): %v (rowErrs=%v)", acctBLabel, err, rowErrs)
+		}
+		return pointsByID(ds)["acct_a"][SliceFull]
+	}
+
+	withAbusive := load("abusive")
+	withBenign := load("benign")
+	if !reflect.DeepEqual(withAbusive, withBenign) {
+		t.Errorf("acct_a's Points changed when acct_b's (a LATER subject's) label flipped:\n abusive=%+v\n benign=%+v", withAbusive, withBenign)
+	}
+}
+
+// TestLoadReplayDataset_LabelEventChronologyPerSlice proves
+// linked_labelled_abusive_n comes from a `label`-typed EVENT (fix round
+// B1), visible only strictly before the asked-for slice's own
+// decision_at: "poster" posts a label event at 00:20; "target" (linked by
+// email) has an early_15m decision point at 00:15 (BEFORE the label
+// event: must NOT see it) and a full decision point at 00:30 (AFTER it:
+// must see it).
+func TestLoadReplayDataset_LabelEventChronologyPerSlice(t *testing.T) {
+	shared := hash64("label-event-shared-email")
+	events := strings.NewReader(`
+{"subject":"poster","type":"subject.created","at":"2031-03-01T00:00:00Z","links":{"email_hash":"` + shared + `"},"data":{"channel":"signup"}}
+{"subject":"poster","type":"label","at":"2031-03-01T00:20:00Z","data":{"label":"abusive"}}
+{"subject":"target","type":"subject.created","at":"2031-03-01T00:01:00Z","links":{"email_hash":"` + shared + `"},"data":{"channel":"signup"}}
+{"subject":"target","type":"resource.created","at":"2031-03-01T00:02:00Z","data":{"kind":"agent","name":"X"}}
+`)
+	labels := strings.NewReader(`
+{"subject":"target","label":"benign","source":"operator","decision_at":{"early_15m":"2031-03-01T00:15:00Z","full":"2031-03-01T00:30:00Z"}}
+`)
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	if err != nil {
+		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
+	}
+	pts := pointsByID(ds)["target"]
+
+	if got := pts[SliceEarly15m].Features["linked_labelled_abusive_n"]; got != 0 {
+		t.Errorf("early_15m (BEFORE poster's label event) linked_labelled_abusive_n = %v, want 0", got)
+	}
+	if got := pts[SliceFull].Features["linked_labelled_abusive_n"]; got != 1 {
+		t.Errorf("full (AFTER poster's label event) linked_labelled_abusive_n = %v, want 1", got)
+	}
+}
+
+// TestLoadReplayDataset_SliceOrderRejected proves fix round B2: a labels
+// row whose first_send is chronologically AFTER its early_15m is
+// rejected with Code "slice_order", naming the labels file and its own
+// 1-based line number (fix round P1) — not the events file, and not some
+// other line.
+func TestLoadReplayDataset_SliceOrderRejected(t *testing.T) {
+	events := strings.NewReader(`{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}`)
+	labels := strings.NewReader("\n" + `{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"first_send":"2031-01-01T00:20:00Z","early_15m":"2031-01-01T00:10:00Z","full":"2031-01-01T01:00:00Z"}}`)
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	if err == nil {
+		t.Fatalf("expected a slice_order RowError, got nil")
+	}
+	if len(rowErrs) != 1 || rowErrs[0].Code != "slice_order" {
+		t.Fatalf("rowErrs = %v, want exactly one slice_order violation", rowErrs)
+	}
+	if rowErrs[0].Source != "labels.jsonl" || rowErrs[0].Line != 2 {
+		t.Fatalf("rowErrs[0] = %+v, want Source=labels.jsonl Line=2", rowErrs[0])
+	}
+}
+
+// TestLoadReplayDataset_DecisionAfterDeletionRejected proves fix round
+// B2: a decision_at meaningfully (not just the 1ns "this event WAS the
+// deletion" allowance) after the subject's own permanent deletion is
+// rejected with Code "decision_after_deletion".
+func TestLoadReplayDataset_DecisionAfterDeletionRejected(t *testing.T) {
+	events := strings.NewReader(`
+{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}
+{"subject":"acct_1","type":"subject.deleted","at":"2031-01-01T00:05:00Z","data":{"mode":"permanent"}}
+`)
+	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	if err == nil {
+		t.Fatalf("expected a decision_after_deletion RowError, got nil")
+	}
+	if len(rowErrs) != 1 || rowErrs[0].Code != "decision_after_deletion" {
+		t.Fatalf("rowErrs = %v, want exactly one decision_after_deletion violation", rowErrs)
+	}
+}
+
+// TestLoadReplayDataset_MissingSliceBeforeAnyEvent proves fix round B2:
+// a decision point strictly before the subject's first event produces NO
+// Point for that slice (not a spurious all-zero-feature one) — and, end
+// to end through eval.Run, that subject×slice comes back Unscored with
+// ErrorCode "missing_slice": excluded from precision, counted as a miss
+// for recall, never scored as a confident "low".
+func TestLoadReplayDataset_MissingSliceBeforeAnyEvent(t *testing.T) {
+	events := strings.NewReader(`
+{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:10:00Z","data":{"channel":"signup"}}
+{"subject":"acct_1","type":"resource.created","at":"2031-01-01T00:11:00Z","data":{"kind":"agent","name":"X"}}
+`)
+	// early_15m is set BEFORE the subject's very first event; full
+	// resolves normally (auto: last event + 1ns).
+	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"early_15m":"2031-01-01T00:00:00Z"}}`)
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	if err != nil {
+		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
+	}
+	pts := ds.Subjects[0].Points
+	if _, ok := pts[SliceEarly15m]; ok {
+		t.Fatalf("early_15m has a Point despite zero qualifying events; want none")
+	}
+	if _, ok := pts[SliceFull]; !ok {
+		t.Fatalf("full has no Point; want one (it resolves normally)")
+	}
+
+	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"resource_total"}}
+	scorer := fake.New()
+	run, err := Run(context.Background(), ds, rule, scorer, Options{Slice: SliceEarly15m})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(run.Verdicts) != 1 {
+		t.Fatalf("len(Verdicts) = %d, want 1", len(run.Verdicts))
+	}
+	v := run.Verdicts[0]
+	if !v.Unscored || v.ErrorCode != "missing_slice" {
+		t.Fatalf("Verdict = %+v, want Unscored=true ErrorCode=missing_slice", v)
 	}
 }
 

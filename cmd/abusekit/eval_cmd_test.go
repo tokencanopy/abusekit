@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/tokencanopy/abusekit/eval"
+	"github.com/tokencanopy/abusekit/internal/model/fake"
 )
 
 // syntheticCorpusArgs returns the --dataset/--labels/--rules/... flags
@@ -216,5 +218,190 @@ func TestRunCorpus_RequiresExportSubcommand(t *testing.T) {
 	err = runCorpus([]string{"bogus"})
 	if !errors.As(err, &ec) || ec.code != 2 {
 		t.Fatalf("runCorpus(bogus) = %v, want an exitError with code 2", err)
+	}
+}
+
+// withExtraFakeScorer registers a non-local fake.Scorer named "vendor_fake"
+// for the duration of one test (review round 2, T1's "inject a fake
+// non-local scorer into the registry" — see ruleconfig.go's
+// testExtraScorers), automatically un-registering it via t.Cleanup so
+// tests never leak state into each other.
+func withExtraFakeScorer(t *testing.T) {
+	t.Helper()
+	s := fake.New()
+	s.NameValue = "vendor_fake"
+	testExtraScorers = nil
+	testExtraScorers = append(testExtraScorers, s)
+	t.Cleanup(func() { testExtraScorers = nil })
+}
+
+func TestRunEval_NonLocalScorerRequiresCassetteOrRecord(t *testing.T) {
+	withExtraFakeScorer(t)
+	args := syntheticCorpusArgs(t, "--scorer", "vendor_fake", "--out", filepath.Join(t.TempDir(), "run.json"))
+	err := runEval(args)
+	var ec *exitError
+	if !errors.As(err, &ec) || ec.code != 2 {
+		t.Fatalf("runEval(vendor_fake, no --cassettes/--record) = %v, want an exitError with code 2", err)
+	}
+}
+
+func TestRunEval_NonLocalCassetteMissExitsNonZero(t *testing.T) {
+	withExtraFakeScorer(t)
+	args := syntheticCorpusArgs(t, "--scorer", "vendor_fake", "--cassettes", t.TempDir(), "--out", filepath.Join(t.TempDir(), "run.json"))
+	err := runEval(args)
+	if err == nil {
+		t.Fatalf("runEval(vendor_fake, empty cassette dir, no --record) returned nil, want a cassette-miss error")
+	}
+	var ec *exitError
+	if !errors.As(err, &ec) || ec.code == 0 {
+		t.Fatalf("runEval error = %v, want a non-zero *exitError", err)
+	}
+}
+
+// TestRunEval_SchemaErrorsReportOwnFileAndLine is fix round P1's own
+// acceptance test: an events-file mistake and a labels-file mistake in
+// the SAME run must each be reported against their own real path and
+// their own correct line number, never a bogus concatenated path or the
+// other file's line count.
+func TestRunEval_SchemaErrorsReportOwnFileAndLine(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "my-events.jsonl")
+	labelsPath := filepath.Join(dir, "my-labels.jsonl")
+	if err := os.WriteFile(eventsPath, []byte(
+		"{\"subject\":\"acct_1\",\"type\":\"subject.created\",\"at\":\"2031-01-01T00:00:00Z\",\"data\":{}}\n"+
+			"{\"subject\":\"acct_2\",\"type\":\"NOT VALID\",\"at\":\"2031-01-01T00:01:00Z\",\"data\":{}}\n"), 0o644); err != nil {
+		t.Fatalf("write events: %v", err)
+	}
+	if err := os.WriteFile(labelsPath, []byte(
+		"{\"subject\":\"acct_1\",\"label\":\"benign\",\"source\":\"operator\",\"decision_at\":{\"full\":\"2031-01-01T01:00:00Z\"}}\n"+
+			"{\"subject\":\"acct_missing\",\"label\":\"abusive\",\"source\":\"operator\",\"decision_at\":{\"full\":\"2031-01-01T01:00:00Z\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write labels: %v", err)
+	}
+	root := repoRoot(t)
+	args := []string{
+		"--dataset", eventsPath, "--labels", labelsPath,
+		"--rules", filepath.Join(root, "config", "rules.yaml"),
+		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
+		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
+		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--rule", "new_account_velocity", "--scorer", "local",
+		"--out", filepath.Join(t.TempDir(), "run.json"),
+	}
+	err := runEval(args)
+	if err == nil {
+		t.Fatalf("expected a schema error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, eventsPath+":2:") {
+		t.Errorf("error %q does not name %s:2", msg, eventsPath)
+	}
+	if !strings.Contains(msg, labelsPath+":2:") {
+		t.Errorf("error %q does not name %s:2", msg, labelsPath)
+	}
+}
+
+// TestRunEval_SkipInvalidWritesSkippedRows is fix round P2's own
+// acceptance test.
+func TestRunEval_SkipInvalidWritesSkippedRows(t *testing.T) {
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, "events.jsonl")
+	labelsPath := filepath.Join(dir, "labels.jsonl")
+	if err := os.WriteFile(eventsPath, []byte(
+		"{\"subject\":\"acct_1\",\"type\":\"subject.created\",\"at\":\"2031-01-01T00:00:00Z\",\"data\":{}}\n"+
+			"{\"subject\":\"acct_1\",\"type\":\"resource.created\",\"at\":\"2031-01-01T00:01:00Z\",\"data\":{\"kind\":\"agent\",\"name\":\"A\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write events: %v", err)
+	}
+	if err := os.WriteFile(labelsPath, []byte(
+		"{\"subject\":\"acct_1\",\"label\":\"benign\",\"source\":\"operator\",\"decision_at\":{\"full\":\"2031-01-01T01:00:00Z\"}}\n"+
+			"{\"subject\":\"acct_missing\",\"label\":\"abusive\",\"source\":\"operator\",\"decision_at\":{\"full\":\"2031-01-01T01:00:00Z\"}}\n"), 0o644); err != nil {
+		t.Fatalf("write labels: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "run.json")
+	root := repoRoot(t)
+	args := []string{
+		"--dataset", eventsPath, "--labels", labelsPath,
+		"--rules", filepath.Join(root, "config", "rules.yaml"),
+		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
+		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
+		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--rule", "new_account_velocity", "--scorer", "local", "--skip-invalid",
+		"--out", out,
+	}
+	if err := runEval(args); err != nil {
+		t.Fatalf("runEval(--skip-invalid): %v", err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read run.json: %v", err)
+	}
+	var got struct {
+		SkippedRows []map[string]any `json:"skipped_rows"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal run.json: %v", err)
+	}
+	if len(got.SkippedRows) == 0 {
+		t.Fatalf("skipped_rows is empty, want at least the acct_missing row reported")
+	}
+}
+
+// TestRunEval_NullOptionalFieldsLoadAndDontChangeVerdicts is fix round
+// P3's own acceptance test: an event carrying an explicit JSON null for
+// an optional field must load successfully (not the pre-fix hard
+// failure) AND score IDENTICALLY to the same event with that field
+// omitted entirely — "null" and "absent" are the same thing to this
+// loader, not two different inputs that happen to both work.
+func TestRunEval_NullOptionalFieldsLoadAndDontChangeVerdicts(t *testing.T) {
+	labels := "{\"subject\":\"acct_1\",\"label\":\"benign\",\"source\":\"operator\",\"decision_at\":{\"full\":\"2031-01-01T02:00:00Z\"}}\n"
+
+	runWith := func(t *testing.T, verdictData string) eval.Verdict {
+		t.Helper()
+		dir := t.TempDir()
+		eventsPath := filepath.Join(dir, "events.jsonl")
+		labelsPath := filepath.Join(dir, "labels.jsonl")
+		events := "" +
+			"{\"subject\":\"acct_1\",\"type\":\"subject.created\",\"at\":\"2031-01-01T00:00:00Z\",\"data\":{}}\n" +
+			"{\"subject\":\"acct_1\",\"type\":\"resource.created\",\"at\":\"2031-01-01T00:01:00Z\",\"data\":{\"kind\":\"agent\",\"name\":\"A\"}}\n" +
+			"{\"subject\":\"acct_1\",\"type\":\"content.verdict\",\"at\":\"2031-01-01T00:02:00Z\",\"data\":" + verdictData + "}\n"
+		if err := os.WriteFile(eventsPath, []byte(events), 0o644); err != nil {
+			t.Fatalf("write events: %v", err)
+		}
+		if err := os.WriteFile(labelsPath, []byte(labels), 0o644); err != nil {
+			t.Fatalf("write labels: %v", err)
+		}
+		out := filepath.Join(t.TempDir(), "run.json")
+		root := repoRoot(t)
+		args := []string{
+			"--dataset", eventsPath, "--labels", labelsPath,
+			"--rules", filepath.Join(root, "config", "rules.yaml"),
+			"--vendors", filepath.Join(root, "config", "vendors.yaml"),
+			"--weights", filepath.Join(root, "config", "local_weights.yaml"),
+			"--brands", filepath.Join(root, "config", "brands.yaml"),
+			"--rule", "new_account_velocity", "--scorer", "local",
+			"--out", out,
+		}
+		if err := runEval(args); err != nil {
+			t.Fatalf("runEval(%s): %v", verdictData, err)
+		}
+		b, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("read run.json: %v", err)
+		}
+		var got struct {
+			Verdicts []eval.Verdict `json:"verdicts"`
+		}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("unmarshal run.json: %v", err)
+		}
+		if len(got.Verdicts) != 1 {
+			t.Fatalf("len(Verdicts) = %d, want 1", len(got.Verdicts))
+		}
+		return got.Verdicts[0]
+	}
+
+	withNull := runWith(t, `{"source":"piguard","category":null,"score":null}`)
+	omitted := runWith(t, `{"source":"piguard"}`)
+	if withNull.Risk != omitted.Risk || withNull.Flagged != omitted.Flagged {
+		t.Fatalf("null-fields verdict %+v != omitted-fields verdict %+v", withNull, omitted)
 	}
 }
