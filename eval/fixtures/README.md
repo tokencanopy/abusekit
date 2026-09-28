@@ -205,3 +205,25 @@ bounded which weight.
     of one burst, reaches only `medium` — see
     `internal/worker/replay_test.go`'s `TestReplay_SlowSenderKnownGap`
     and `docs/design`'s own §8 open-questions entry for why.
+
+- **S2b's round 2 (R6)** replaced the isolated synthetic scenarios that
+  used to bound `sends_1h`, `sends_first_day`, `distinct_recipients_1h`
+  and `subject_brand_match` with real replay fixtures — a reviewer's own
+  finding: a synthetic scenario proves a weight moves SOME feature
+  vector's score, but not that the shipped feature-extraction code
+  actually produces that vector for a real fixture. Three DISTINCT
+  fixtures, so a wiring swap between two features would fail a test:
+  - `moderate_volume_single_brand.jsonl` — bounds `subject_brand_match`:
+    modest volume (15 webmail recipients) far too small to reach `high`
+    alone, plus one brand mention.
+  - `repeat_recipient_resend.jsonl` — bounds `sends_1h` AND
+    `distinct_recipients_1h` with DIFFERENT values: the same 5
+    recipients sent to twice within the hour, so `sends_1h`'s sum
+    exceeds `distinct_recipients_1h`'s deduplicated count (every other
+    committed fixture happens to give the two identical values).
+  - `first_day_burst_then_quiet.jsonl` — bounds `sends_first_day`,
+    evaluated 26 hours after the subject's first event (see
+    `internal/worker/replay_test.go`'s `TestReplay_FirstDayBurstThenQuietBand`)
+    so the burst has aged out of `sends_10m_max`/`sends_1h`/
+    `webmail_sends_1h`/`distinct_recipients_1h`'s current window
+    entirely, isolating the one feature (a permanent fact) that hasn't.

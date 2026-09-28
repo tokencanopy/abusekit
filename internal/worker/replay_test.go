@@ -598,3 +598,50 @@ func TestReplay_SlowSenderKnownGap(t *testing.T) {
 		t.Errorf("slow_sender_15_per_hour_6h: tier = high (score %v) — the known gap this test documents (a slow-drip sender never reaching high) no longer holds; update this test's comment if the mechanism changed intentionally", view.Score)
 	}
 }
+
+// TestReplay_ModerateVolumeSingleBrandMediumBand replays eval/fixtures/
+// moderate_volume_single_brand.jsonl — round 2's R6: a real replay
+// fixture bounding subject_brand_match specifically (its volume alone,
+// 15 webmail recipients, is far too small to reach `high` on its own —
+// zeroing subject_brand_match's weight drops this fixture well outside
+// its band, proving the weight load-bearing on a REAL fixture, not only
+// a synthetic scenario).
+func TestReplay_ModerateVolumeSingleBrandMediumBand(t *testing.T) {
+	view := runReplay(t, "moderate_volume_single_brand.jsonl", "acct_example_moderate_brand_1")
+	if view.Tier == "high" {
+		t.Errorf("moderate_volume_single_brand: tier = high (score %v), want low or medium\nsignals: %+v", view.Score, view.Signals)
+	}
+	assertBand(t, "moderate_volume_single_brand", view.Score, 0.6, 0.8)
+}
+
+// TestReplay_RepeatRecipientResendBand replays eval/fixtures/
+// repeat_recipient_resend.jsonl — round 2's R6: a real replay fixture
+// bounding sends_1h and distinct_recipients_1h with DIFFERENT values (the
+// same 5 recipients sent to twice within the hour: sends_1h sums to more
+// than distinct_recipients_1h's deduplicated count), so a wiring swap
+// between the two would be caught here even though every OTHER committed
+// fixture happens to give them identical values.
+func TestReplay_RepeatRecipientResendBand(t *testing.T) {
+	view := runReplay(t, "repeat_recipient_resend.jsonl", "acct_example_repeat_resend_1")
+	assertBand(t, "repeat_recipient_resend", view.Score, 0.855, 0.875)
+}
+
+// TestReplay_FirstDayBurstThenQuietBand replays eval/fixtures/
+// first_day_burst_then_quiet.jsonl evaluated 26 HOURS after the
+// subject's first event (unlike every other replay test's "last event +
+// a short buffer") — round 2's R6: this fixture's burst happened
+// entirely within the subject's first day, but by the time this test
+// evaluates it, that burst is well past currentBurstWindow (24h), so
+// sends_10m_max/sends_1h/webmail_sends_1h/distinct_recipients_1h all read
+// 0 — only sends_first_day (a permanent fact, unaffected by how long ago
+// its own window closed) is non-zero, isolating it as a REAL fixture
+// rather than only a synthetic scenario.
+func TestReplay_FirstDayBurstThenQuietBand(t *testing.T) {
+	events := loadFixture(t, filepath.Join(repoRoot(t), "eval", "fixtures", "first_day_burst_then_quiet.jsonl"))
+	now := events[0].At.Add(26 * time.Hour)
+	view, result := runReplayAt(t, events, "acct_example_first_day_quiet_1", now)
+	if result.Scored != 1 || len(result.Errors) != 0 {
+		t.Fatalf("Tick result = %+v, want exactly one subject scored with no errors", result)
+	}
+	assertBand(t, "first_day_burst_then_quiet", view.Score, 0.56, 0.62)
+}

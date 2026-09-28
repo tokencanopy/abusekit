@@ -239,8 +239,43 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		{"dormant_branded_burst_8d", extractFixture(t, brands, webmail, "dormant_branded_burst_8d.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.9, 1.0},
 		{"paid_launch_5d", extractFixture(t, brands, webmail, "paid_launch_5d.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.4},
 		{"webmail_spread_1h", extractFixture(t, brands, webmail, "webmail_spread_1h.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.65, 0.78},
+
+		// --- Round 2, R6: real replay fixtures bounding sends_1h,
+		// sends_first_day, distinct_recipients_1h and subject_brand_match
+		// (replacing the isolated synthetic scenarios these four used to
+		// need — see isolatedWeightScenarios' own comment). Three
+		// DISTINCT fixtures, each isolating one feature from its
+		// siblings, so swapping which weight applies to which feature
+		// would fail a test:
+		{"moderate_volume_single_brand", extractFixture(t, brands, webmail, "moderate_volume_single_brand.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.6, 0.8},
+		{"repeat_recipient_resend", extractFixture(t, brands, webmail, "repeat_recipient_resend.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.855, 0.875},
+		firstDayBurstThenQuietScenario(t, brands, webmail),
 	}
 	return append(scenarios, isolatedWeightScenarios()...)
+}
+
+// firstDayBurstThenQuietScenario is round 2's R6 fixture bounding
+// sends_first_day specifically: first_day_burst_then_quiet.jsonl's burst
+// happens entirely within the subject's first day, but — unlike
+// extractFixture's usual "lastEventAt + a short buffer" evaluation
+// instant — this scenario evaluates 26 hours after the subject's FIRST
+// event, well past currentBurstWindow (24h): sends_10m_max/sends_1h/
+// distinct_recipients_1h/webmail_sends_1h all read 0 (the burst has aged
+// out of the CURRENT window), isolating sends_first_day (a permanent
+// fact, unaffected by how long ago its own window closed) as the only
+// one of the four with a non-zero value here.
+func firstDayBurstThenQuietScenario(t *testing.T, brands feature.BrandSet, webmail feature.WebmailSet) mutationScenario {
+	t.Helper()
+	events := loadFixture(t, filepath.Join(repoRoot(t), "eval", "fixtures", "first_day_burst_then_quiet.jsonl"))
+	// events[0] is subject.created, the fixture's earliest event (the
+	// file is written in chronological order — see loadFixture's own
+	// contract).
+	now := events[0].At.Add(26 * time.Hour)
+	res, err := feature.Extract(context.Background(), testTenant, "acct_example_first_day_quiet_1", events, feature.NoNeighbors, feature.DefaultWindows(now), brands, webmail)
+	if err != nil {
+		t.Fatalf("feature.Extract(first_day_burst_then_quiet.jsonl): %v", err)
+	}
+	return mutationScenario{"first_day_burst_then_quiet", res.Features.Map(), 0.56, 0.62}
 }
 
 // isolatedWeightScenarios is R2 round 2: eight of the eighteen weights
@@ -304,22 +339,17 @@ func isolatedWeightScenarios() []mutationScenario {
 		{"isolated_neighbors_truncated", withTarget("neighbors_truncated", 1), 0.27, 0.35},
 		// burst_ratio_24h_vs_lifetime: base=0.293, zeroed=0.235.
 		{"isolated_burst_ratio_24h_vs_lifetime", withTarget("burst_ratio_24h_vs_lifetime", 1.0), 0.27, 0.35},
-		// S2b: sends_1h, sends_first_day and distinct_recipients_1h are
-		// deliberately small "companion" weights (correlated with
-		// sends_10m_max/webmail_sends_1h in every committed fixture that
-		// exercises them at all — see local_weights.yaml's own comment),
-		// so none of the wide, realistic fixture bands above is sensitive
-		// enough to prove any ONE of them load-bearing on its own; each
-		// needs its own isolated scenario the same way resource_total/
-		// key_total do. All three share an identical base=0.281,
-		// zeroed=0.235 at the sendsVolumeCap (300) — the same cap, the
-		// same weight, and no other new-feature signal present.
-		{"isolated_sends_1h", withTarget("sends_1h", 300), 0.33, 0.39},
-		{"isolated_sends_first_day", withTarget("sends_first_day", 300), 0.26, 0.32},
-		{"isolated_distinct_recipients_1h", withTarget("distinct_recipients_1h", 300), 0.33, 0.39},
-		// S2b: subject_brand_match at its most common realistic value (a
-		// single mentioned brand) — base=0.579, zeroed=0.235.
-		{"isolated_subject_brand_match", withTarget("subject_brand_match", 1), 0.5, 0.68},
+		// Round 2's R6 fix round replaced the isolated synthetic scenarios
+		// that used to bound sends_1h, sends_first_day,
+		// distinct_recipients_1h and subject_brand_match with REAL replay
+		// fixtures instead (see mutationScenarios' own "Round 2, R6"
+		// block) — a reviewer's own finding: a synthetic-only scenario
+		// proves a weight moves SOME feature vector's score, but not that
+		// the shipped feature-extraction code actually produces that
+		// vector for a real fixture, and three distinct fixtures (rather
+		// than one shared one) mean swapping which weight applies to
+		// which feature is something a real fixture's own band would
+		// actually notice.
 	}
 }
 
@@ -469,5 +499,76 @@ func TestR1_AgeDecayContinuityProbe(t *testing.T) {
 	}
 	if diff := at7d1h - at8d; diff < 0 || diff > maxStep {
 		t.Errorf("score(7d1h)=%.4f -> score(8d)=%.4f moved by %.4f, want a small continuous step (<= %v)", at7d1h, at8d, diff, maxStep)
+	}
+}
+
+// --- Round 2, R6: the ×0.5/×2 sweep, committed as a test -----------------
+
+// s2bWeightNames are the seven weights this PR adds — the ones
+// TestWeightMutation_NewWeightsSurviveHalfAndDoubleSweep sweeps.
+var s2bWeightNames = []string{
+	"sends_10m_max", "sends_1h", "sends_first_day",
+	"webmail_recipient_share", "webmail_sends_1h", "distinct_recipients_1h",
+	"subject_brand_match",
+}
+
+// TestWeightMutation_NewWeightsSurviveHalfAndDoubleSweep is round 2's R6:
+// "commit the ×0.5 and ×2 sweep as a test, or remove the claim from the
+// docs and commits". TestWeightMutation_EveryWeightIsLoadBearing already
+// proves every weight (including these seven) load-bearing via zeroing;
+// this test additionally proves each of the seven NEW weights specifically
+// via scaling, not only zeroing — for each one, scaling it to 0.5x OR 2x
+// (independently) must move at least one committed scenario out of its
+// band.
+func TestWeightMutation_NewWeightsSurviveHalfAndDoubleSweep(t *testing.T) {
+	weights, err := local.LoadWeightsFile(filepath.Join(repoRoot(t), "config", "local_weights.yaml"))
+	if err != nil {
+		t.Fatalf("LoadWeightsFile: %v", err)
+	}
+	scenarios := mutationScenarios(t)
+
+	baseline, err := local.New(weights)
+	if err != nil {
+		t.Fatalf("local.New (baseline): %v", err)
+	}
+	for _, sc := range scenarios {
+		risk := scoreScenario(t, baseline, sc)
+		if !inBand(risk, sc) {
+			t.Fatalf("baseline (unmutated) weights: %s risk = %v, want in [%v, %v] — fix the weights before trusting the sweep", sc.name, risk, sc.min, sc.max)
+		}
+	}
+
+	for _, name := range s2bWeightNames {
+		original, ok := weights.Weight[name]
+		if !ok || original == 0 {
+			t.Fatalf("config/local_weights.yaml is missing or has a zero weight for %q — TestLocalWeights_GoldenSignsAndNonZero should already have caught this", name)
+		}
+
+		brokeSomething := false
+		for _, scale := range []float64{0.5, 2.0} {
+			mutated := weights
+			mutated.Weight = make(map[string]float64, len(weights.Weight))
+			for k, v := range weights.Weight {
+				mutated.Weight[k] = v
+			}
+			mutated.Weight[name] = original * scale
+
+			scorer, err := local.New(mutated)
+			if err != nil {
+				t.Fatalf("local.New (%s x%v): %v", name, scale, err)
+			}
+			for _, sc := range scenarios {
+				if _, ok := sc.features[name]; !ok || sc.features[name] == 0 {
+					continue
+				}
+				risk := scoreScenario(t, scorer, sc)
+				if !inBand(risk, sc) {
+					brokeSomething = true
+				}
+			}
+		}
+		if !brokeSomething {
+			t.Errorf("scaling weight %q to 0.5x or 2x (was %v) did not push any scenario out of its band", name, original)
+		}
 	}
 }

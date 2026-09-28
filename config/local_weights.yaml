@@ -215,7 +215,7 @@ weights:
   # most fixtures here (bound by an isolated synthetic scenario).
   webmail_recipient_share: 1.1
   webmail_sends_1h: 0.006
-  distinct_recipients_1h: 0.002
+  distinct_recipients_1h: 0.0025
 
   # S2b: a brand mentioned in the message SUBJECT rather than (or, per S2,
   # in addition to but never double-counted with) the sending resource's
