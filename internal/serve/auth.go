@@ -5,6 +5,14 @@
 // is store reads/writes and internal/worker.EvaluateSubject; this package
 // exists to translate HTTP into those calls and their results back into
 // HTTP, not to hold business logic of its own.
+//
+// TODO(design §4.4, plan.md's v0 scope): the `subject.tier_changed`
+// webhook is explicitly deferred to v1 ("Out (v1): ... webhooks") and is
+// NOT implemented anywhere in this package — no tier-change detection, no
+// per-tenant target URL/secret config, no retry schedule. A future slice
+// adding it would hook into UpsertVerdicts' tier transition (comparing the
+// previous and new current_tier) and reuse this package's own signing
+// scheme for the outbound POST.
 package serve
 
 import (
