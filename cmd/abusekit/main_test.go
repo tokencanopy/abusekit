@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/tokencanopy/abusekit/internal/worker"
 )
 
 func repoRoot(t *testing.T) string {
@@ -28,6 +31,7 @@ func shippedConfig(t *testing.T) serveConfig {
 		vendorsPath: filepath.Join(root, "config", "vendors.yaml"),
 		weightsPath: filepath.Join(root, "config", "local_weights.yaml"),
 		brandsPath:  filepath.Join(root, "config", "brands.yaml"),
+		keysPath:    filepath.Join(root, "config", "keys.yaml"),
 	}
 }
 
@@ -47,8 +51,11 @@ func TestParseServeFlags_Defaults(t *testing.T) {
 	if c.databaseURL != "postgres://example/db" {
 		t.Errorf("databaseURL = %q", c.databaseURL)
 	}
-	if c.rulesPath != "config/rules.yaml" || c.vendorsPath != "config/vendors.yaml" || c.weightsPath != "config/local_weights.yaml" {
+	if c.rulesPath != "config/rules.yaml" || c.vendorsPath != "config/vendors.yaml" || c.weightsPath != "config/local_weights.yaml" || c.keysPath != "config/keys.yaml" {
 		t.Errorf("unexpected default paths: %+v", c)
+	}
+	if c.listenAddr != ":8080" {
+		t.Errorf("listenAddr = %q, want :8080 by default (S3)", c.listenAddr)
 	}
 	if c.check {
 		t.Errorf("expected check=false by default")
@@ -110,6 +117,7 @@ func TestRunServe_CheckSucceeds(t *testing.T) {
 		"--vendors", c.vendorsPath,
 		"--weights", c.weightsPath,
 		"--brands", c.brandsPath,
+		"--keys", c.keysPath,
 	}
 	if err := runServe(args); err != nil {
 		t.Fatalf("runServe --check: %v", err)
@@ -145,6 +153,55 @@ func TestRunServeWithContext_StartsAndStopsTheWorker(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("runServeWithContext did not return after its context was cancelled")
+	}
+}
+
+// TestRunServeWithContext_ServesTheAPI is S3's cmd-level wiring proof: with
+// a real (OS-assigned, via ":0") listen address, runServeWithContext
+// actually answers /healthz over HTTP while running, and the listener is
+// gone (connection refused) once its context is cancelled and the call has
+// returned — proving startAPIServer's shutdown is wired into the SAME
+// graceful-stop path as the worker's own Stop(), not left dangling.
+func TestRunServeWithContext_ServesTheAPI(t *testing.T) {
+	c := shippedConfig(t)
+	c.databaseURL = testDBURL(t)
+	c.listenAddr = "127.0.0.1:0"
+	c.metricsListen = "" // avoid a second listener neither this test nor its port-discovery needs
+
+	s, cfg, deps, err := boot(context.Background(), c)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands})
+	if err != nil {
+		s.Close()
+		t.Fatalf("worker.New: %v", err)
+	}
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	if err != nil {
+		s.Close()
+		t.Fatalf("startAPIServer: %v", err)
+	}
+	defer s.Close()
+
+	resp, err := http.Get("http://" + apiAddr + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := apiSrv.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	if _, err := http.Get("http://" + apiAddr + "/healthz"); err == nil {
+		t.Fatalf("expected the listener to be gone after Shutdown")
 	}
 }
 
