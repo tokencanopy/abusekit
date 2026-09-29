@@ -1,7 +1,6 @@
 # Generic feature packs, product vocabularies, and declarative custom features
 
-Status: proposed, revision 4, 2026-09-29. This revision answers the verification of revision 3,
-which returned "approve after listed changes". Owner: Josh Zhang.
+Status: proposed, revision 5, 2026-09-29. This revision answers the final check of revision 4. Owner: Josh Zhang.
 
 This document amends [`2026-09-27-abusekit-design.md`](2026-09-27-abusekit-design.md), §4.2,
 §4.3, §4.5, §4.6, §4.8 and §4.10. It is written against `main` at S3, treating two open PRs as
@@ -423,7 +422,7 @@ predicates, `distinct`, `group_by` or `on`.
 | `time_between` | `{from: {type, where, anchor: first\|last}, to: {type, where}, until_now, if_absent}`. `t_A` is the first (or last) matching `from` with `at ≤ now`. `t_B` is the first matching `to` with `t_A ≤ t_B ≤ now`. The value is minutes from `t_A` to `t_B`, or `now − t_A` when `until_now` is set and there is no `t_B`. Absence semantics are below. | A; indexed first/last-match queries |
 | `sequence` | `{a, b, within ≤ 24h, on?: {a: f, b: g}}`: the number of `b` events in the window with an `a` event where `t_a ∈ (t_b − within, t_b]` and, if `on` is set, `a.f == b.g`. Both `on` fields must be `hash` fields with the same `join_domain`. | A; aggregate with a correlated existence test |
 | `group_by` | A modifier on `count`, `distinct` or `sum`: `{field, reduce: max \| {count_gte: k}, max_groups}`. It groups by `field`, applies the op per group, then reduces: `max` takes the largest group value, `count_gte` counts groups at or above `k`. **Exact**: the aggregate engine groups every matching event, so there is no first-come admission for decoys to exploit. `max_groups` (at most 1,000) bounds only the in-memory adapter. Past it, the in-memory adapter uses space-saving (Metwally) with `k = max_groups`. Space-saving over-estimates tracked counts and loses evicted groups. `reduce: max` with a positive sign stays one-sided upward and is flagged `partial` only. `count_gte` can undercount groups whose true count is at or above `k` but that were evicted. A negative `prior_sign` or weight inverts the direction. Those combinations are flagged `partial` **and** `degraded`. Postgres is always exact. | A; `GROUP BY` |
-| `ratio` | `{num, den, if_empty}` over the **pre-transform** values of two non-ratio custom features. Depth 1: no cycles, no ratio of ratios. **Partial propagation:** a `partial` input makes the ratio `partial`. `den` may not be a feature that can go partial (`relative_to_history`, `peak`, `group_by` or `neighbours`); the load fails with `ratio_den_partial_capable`. A partial `num` inherits its own `degraded` status. | D; O(1) |
+| `ratio` | `{num, den, if_empty}` over the **pre-transform** values of two non-ratio custom features. Depth 1: no cycles, no ratio of ratios. **Partial propagation:** a `partial` input makes the ratio `partial`. `den` may not be a feature that can go partial (`relative_to_history`, `peak`, `group_by`, `neighbours` or any class N `first:` feature); the load fails with `ratio_den_partial_capable`. A partial `num` inherits its own `degraded` status. If a partial-capable `num` meets a **negative** ratio sign (the ratio's `prior_sign`, or its weight in any weights file), an upward error in `num` would lower risk. The ratio is then flagged `partial` + `degraded` whenever `num` is partial, the same treatment space-saving gets. | D; O(1) |
 | `neighbours` | `{via: [declared link kinds], where: {deleted: permanent} \| {labelled: abusive} \| {created_within: <dur>} \| {}}`: the number of distinct other same-tenant, same-kind subjects that share a `via` key and meet the condition. **As of `now`**: links with `first_seen ≤ now`, subjects created ≤ now, deletions and labels ≤ now. `created_within` is relative to `now`. This matches `evidenceAsOf` in `eval/neighbors.go`. **`where` is applied before any limit.** The query returns distinct matching subjects up to `K = ⌈T⁻¹(cap)⌉ + 1` (§5.7, saturation), so the count is exact up to saturation. The per-key fan-in cap no longer truncates the counted set. If the query's examined-row budget (default 50,000) runs out before it reaches `K` or finishes, the value is `partial` **and** `degraded`, because an undercount could lower risk. | F/A; one indexed query per `via` set; at most 4 per tenant |
 
 **Absence semantics** (`time_between`, `sequence`)
@@ -664,9 +663,16 @@ following.
 
 **`start`, defined.** The subject's anchor instant is the first of these that exists:
 1. `subject.created.account_created_at`, when the producer supplied it;
-2. the `at` of the **first accepted** `subject.created` event, ordered by `received_at`. Later
-   `subject.created` events never move it;
+2. the `at` of the **first accepted** `subject.created` event. Later `subject.created` events never
+   move it;
 3. `first_received_at`: the minimum **server-assigned** `received_at` over accepted events.
+
+The chosen value is then clamped: `start = min(chosen, first_received_at)`. A producer-supplied
+anchor can therefore never place `start` after the moment abusekit first saw the subject.
+
+**"First accepted"** means the event with the smallest `(received_at, producer, id)`. `received_at`
+is assigned by the server once, at acceptance, and never changes. Event-time orderings (`at`-based
+facts such as `first_success_at`, and every DSL "first") keep `(at, producer, id)`.
 
 The third fallback replaces revision 3's `LEAST(at)`. With `LEAST(at)`, a flood dated in the past
 could move `start` earlier by up to the skew allowance, or without bound under backfill scope. In
@@ -676,21 +682,26 @@ lists and justifies any fixture whose `start` changes because events precede its
 
 **(a) Onboarding facts are maintained at ingest.** `subject_facts(tenant, kind, subject)` is
 updated in the same transaction as the event insert. **The fact row is a deterministic function of
-the accepted event set:** any order of arrival produces the same row. The permutation test in
-§5.7 (a2) checks this. The update rules:
+the accepted event set, with each event's `received_at` held fixed.** Given the same events with
+the same `received_at` values, any processing order or interleaving produces the same row. The
+permutation test in §5.7 (a2) checks this. The update rules:
 
 | Fact | Update |
 | --- | --- |
 | `first_seen_at` (legacy, informational), `first_received_at` | `LEAST(existing, new)` over `at` and over server `received_at`, respectively |
-| `account_created_at`, `first_subject_created_at` | Taken from the first accepted `subject.created`, by `received_at`. Later `subject.created` events never replace them. These feed `start` (above). |
+| `account_created_at`, `first_subject_created_at` | Taken from the first accepted `subject.created`: the smallest `(received_at, producer, id)`. A later-processed event with a smaller key replaces them, so the result doesn't depend on processing order. These feed `start` (above). |
 | `first_success_at`, `first_success_key`, `first_success_funding` | On `payment.attempt{succeeded}`: replace when the event's `(at, producer, id)` is smaller |
 | `payment_counts` | `{succeeded, declined, blocked}`: increment |
-| `declines_before_first_success` | On a `declined` event with `at ≤ first_success_at` (or no success yet): increment. **Recount** whenever `first_success_at` changes, both from absent to `t` and from an earlier move. The recount is Σ of the daily decline counters (a built-in `subject_counters` spec) for days before `day(t)`, plus one boundary-day query using a partial index on declined payment attempts: `(tenant, kind, subject, at) WHERE type = 'payment.attempt' AND data->>'outcome' = 'declined'`, bounded to `day(t)` and `at ≤ t`. Cost: O(days + declines on the boundary day). |
+| `declines_before_first_success` | On a `declined` event with `at ≤ first_success_at` (or no success yet): increment. **Recount** whenever `first_success_at` changes, both from absent to `t` and from an earlier move. The recount is the Σ of the **hourly** decline counters for hours before `hour(t)`, plus one boundary-hour query over `[hour(t), t]`. The counters are a built-in `subject_counters` spec, **primary-subject-only** (see H-A below). The query uses a partial index on declined payment attempts: `(tenant, kind, subject, at) WHERE type = 'payment.attempt' AND data->>'outcome' = 'declined'`. Cost: one indexed SUM over at most 2,160 hourly rows (90-day retention), plus the declines inside a single hour. That bounds the part an attacker controls to one hour's events. |
 | `first_paid_upgrade_at` | `LEAST` over `subscription.changed{status: active, amount_minor > 0}` |
 | `subscription_change_count` | Increment |
 | `first_external_at`, `self_sends_before_first_external` | The same pattern for `content.sent`; capped at 2 when read |
 | `name_brands`, `name_has_at`, `exempt_subject_brands` | Brand ids matched at ingest on `resource.*` names, with the integration-token gate applied |
 
+- **Isolation.** Ingest transactions run at **READ COMMITTED**. On a serialization failure or a
+  deadlock (`40001`, `40P01`), the transaction is retried up to 3 times with jittered backoff. If it
+  still fails, the item is rejected as a whole-request `5xx`, which the producer's outbox retries.
+  Idempotency on `(tenant, producer, id)` makes the retries safe.
 - **Locking (a1).** Every ingest transaction runs in a fixed order:
   1. **Lock the facts row first.** `INSERT … ON CONFLICT (tenant, kind, subject) DO UPDATE SET
      seq = subject_facts.seq + 1 RETURNING *` takes the row lock (or `SELECT … FOR UPDATE` when the
@@ -704,9 +715,11 @@ the accepted event set:** any order of arrival produces the same row. The permut
   Either way, one decline is lost or counted twice. With the lock, T2 blocks until T1 commits, then
   reads the new `t` and increments correctly. T2's event row can't commit before T2 holds the lock,
   so it's never counted twice.
-- **Permutation test (a2).** For every fixture, and for 1,000 random permutations and concurrent
-  interleavings of the fixture's events (run on the Postgres adapter with parallel transactions),
-  the final fact row must be bit-identical.
+- **Permutation test (a2).** Each fixture event's `received_at` is taken from the fixture, so it
+  is fixed rather than wall-clock. For every fixture, and for 1,000 random permutations and
+  concurrent interleavings of its events, the final fact row must be bit-identical. The runs use
+  the Postgres adapter with parallel transactions, each event inserted with its assigned
+  `received_at`.
 - **No onboarding scan is ever byte-capped.** Scoring reads one facts row.
 - **Frozen class N facts are invalidated and recomputed** whenever:
   - `start` changes; the row records the `anchored_start` its values used;
@@ -717,12 +730,22 @@ the accepted event set:** any order of arrival produces the same row. The permut
     `first_received_at`.
   - Onboarding facts (payment, subscription, brand, self-send) are updated **only for the primary
     subject**. They describe the acting account.
-  - Counters are incremented for **every index row** whose `subject_kind` is in the counter spec's
-    `subject_kinds`. That includes `via_parent` rows, so parent-level lifetime totals see child
-    events, matching what class A queries see through `event_subjects`.
+  - **Lifetime** counters are incremented for **every index row** whose `subject_kind` is in the
+    counter spec's `subject_kinds`. That includes `via_parent` rows, so parent-level lifetime
+    totals see child events, matching what class A queries see through `event_subjects`.
+  - **H-A: recount-backing counters are primary-subject-only.** Two kinds of counter spec back a
+    recount: the built-in hourly decline spec, and the counters behind every `before_first` fact
+    spec. These are incremented **only** for the primary subject's index row. `also` and
+    `via_parent` rows never touch them, because the facts they feed are primary-only too. So the
+    incremental path and the recount path always count the same set of events.
+  - **Test (`TestRecountParentChild`):** child `C` (an `api_key` whose parent is `P`) emits 5
+    declines, then `P` gets its first success. Run once with and once without forcing a recount.
+    `P.declines_before_first_success` must be identical both times (0: the declines are `C`'s, not
+    `P`'s), and `C`'s own facts must be unaffected.
 - **Custom `before_first` features** compile to a generic fact spec
   `{count: {type, where}, before: {type, where}}`, kept in the facts row with the same rules:
-  lock-first, recount on `∞ → t` and on earlier moves, and daily counters plus a boundary-day query.
+  lock-first, recount on `∞ → t` and on earlier moves, and primary-only hourly counters plus a
+  boundary-hour query.
   The recount uses the partial expression index for the spec's `count` predicate.
 - **Erasure and re-signup.**
   - A legal erasure (S3b) deletes the subject's facts row and counter rows, except that numeric
@@ -797,9 +820,11 @@ Every `T` is monotone non-decreasing, and so is `P ↦ min(P/B, rc)·d`. A raw p
 is complete.
 
 Stream matching rows newest-first with LIMIT `N = x_sat·⌈W/S⌉`:
-- Every loaded row carries at least one raw unit. Rows with addends ≤ 0 are excluded in the
-  query. Rows are loaded but units summed, so if the limit binds, the loaded rows carry at least
-  `N` units.
+- **"The limit binds"** is determined at run time, never from the static size of `N`: the query
+  asks for `min(N, budget) + 1` rows, and it binds only if it returns more than `min(N, budget)`,
+  meaning matching rows remained beyond the limit.
+- Every loaded row carries at least one raw unit, because rows with addends ≤ 0 are excluded in
+  the query. So if `N` binds (rather than the budget), the loaded rows carry at least `N` units.
 - Split `W` into `⌈W/S⌉` slots of width `S`. By pigeonhole, some slot holds at least `x_sat`
   loaded units.
 - The sub-window `(t − S, t]` ending at that slot's last loaded event covers the whole slot. So
@@ -814,11 +839,18 @@ lower bound on the true baseline, so the `x_sat` sized from it is smaller than t
 
 Either way the result is one-sided upward, flagged `partial`.
 
-The second counter-example is `email.sends_10m_max` with `B = 50`: 5,000 units in one old slot and
-about 302 units in each newer slot. Here `x_sat = 50·300/d`. With `d = 1`, `N = 15,000·144 ≈ 2.2M`
-rows, far above the 50,000-row budget. So the budget binds first, and the feature is `partial` +
-`degraded` rather than silently reporting `v1 ≈ 6`. For fixtures, the budget never binds. In
-production this is an honest degradation, not a wrong value.
+**Both verification counter-examples are exact under this sizing, because their streams run to
+completion:**
+- **`custom.declines_10m_peak`** (log1p, cap 7): `x_sat = ⌈e^7 − 1⌉ = 1,096`, so
+  `N = 1,096 · 144 = 157,824`. The counter-example's stream is about 2,200 rows, which is below
+  both `N` and the 50,000-row budget, so it completes. The peak is exact: `ln 1001 ≈ 6.9`.
+- **`email.sends_10m_max`** (`B = 50`, `rc = 300`, no log1p, cap 300):
+  `x_sat = 50·min(300, T⁻¹(C)/d) = 50·min(300, 300/d)`, which is 15,000 at `d = 1`, so
+  `N = 2.16M`. The stream is 5,000 + 302·143 = 48,186 rows, again below `N` and the budget, so it
+  completes. The value is exact: `v1 = 5,000/50 = 100`.
+
+A budget can bind only when a real stream is longer than the budget at run time. Only then is the
+feature `partial` + `degraded`.
 
 **(c) Hitting a bound sets a flag; it's never a weight.**
 - `Output.Partial` lists features whose own budget was hit. `core.history_truncated` no longer
@@ -835,7 +867,7 @@ production this is an honest degradation, not a wrong value.
 | Legacy `core.linked_*` fan-in cap hit | Value undercounts | `partial` + `degraded` |
 | Space-saving with `count_gte`, or with a negative sign or weight | Value may undercount | `partial` + `degraded` |
 | Class G budget hit | Direction unproven | `partial` + `degraded` |
-| `ratio` with a partial `num` | Inherits `num`'s flags | — |
+| `ratio` with a partial `num` | Inherits `num`'s flags; with a negative ratio sign or weight, always `partial` + `degraded` | — |
 
   Revision 3 claimed that fan-in caps apply only to positively weighted features and therefore err
   upward. **That had the direction backwards:** an undercount lowers a positively weighted value.
@@ -898,7 +930,7 @@ bounded evaluation switched on for e2a (§9).
 | `time_between` | `(−∞, now]`, via indexed first/last-match queries |
 | `sequence` | `a` rows from `(now − W − within, now]`; `b` rows from `(now − W, now]` |
 | `relative_to_history` baseline | `(now − lookback, now − exclude_recent]` |
-| `before_first` | Facts row (§5.7a), plus one boundary-day query on recount |
+| `before_first` | Facts row (§5.7a), plus the hourly-counter sum and one boundary-hour query on recount |
 | `lifetime` | `subject_counters` rows for the spec, minus an indexed `(now, +∞)` query for specs that exclude future-dated events |
 | `neighbours` | `links` index `(tenant, kind, hash)` for each `via` key, with `where` applied, up to `K` distinct subjects, under the examined-row budget |
 
@@ -1432,7 +1464,7 @@ These come after #5 and #7 merge. P1 lands before any S5 or S8 PR (enforced as d
 | P3b | Keys and re-HMAC | `internal/secret` (HKDF, file adapter); re-HMAC of hashes and links with `join_domain`; domain allowlist/HMAC (built-in and declared); pseudonymised non-account and `also` ids; `RedactionSchemaVersion` 3; dev/staging migration job; cross-tenant key test | P3a | Criterion 5 complete; golden exact; migration test |
 | P3c | Config history | `history/`; `abusekit config check`; `tenant_config_versions` | P2 | History CI tests |
 | P3d | Rotation and cloud keys | Dual-key write, read and flip; `__prev` fields; `key_id`; cloud secret-manager adapter | P3b | Equality exact across a simulated rotation; adapter contract test |
-| P4a | Facts and counters | `start` precedence; `subject_facts` and `subject_counters`; the lock-first ingest transaction; recount on `∞ → t` and on earlier moves (daily decline counters plus a boundary-day query on a partial index); onboarding, brand and self-send facts; generic `before_first` fact specs; webmail counters subtracting `(now, +∞)`; anchored freeze using its **own** anchored-range query (legacy Go code over `[start, start + A)`), with invalidation on `start` change or backfill; fact and counter subject assignment for `also`/`via_parent`; retention-aligned counter expiry; backfill with a `retained_from` watermark | P3a | Golden exact (or `start` deviations justified); blocked-payment and pre-dated flood tests (6b); the permutation and concurrent-interleaving test (a2); the lost-decline race test |
+| P4a | Facts and counters | `start` precedence; `subject_facts` and `subject_counters`; the lock-first ingest transaction; READ COMMITTED with bounded retry; recount on `∞ → t` and on earlier moves (primary-only hourly decline counters plus a boundary-hour query on a partial index); `start` clamp and `(received_at, producer, id)` "first accepted"; onboarding, brand and self-send facts; generic `before_first` fact specs; webmail counters subtracting `(now, +∞)`; anchored freeze using its **own** anchored-range query (legacy Go code over `[start, start + A)`), with invalidation on `start` change or backfill; fact and counter subject assignment for `also`/`via_parent`; retention-aligned counter expiry; backfill with a `retained_from` watermark | P3a | Golden exact (or `start` deviations justified); blocked-payment and pre-dated flood tests (6b); the permutation and concurrent-interleaving test with fixture-assigned `received_at` (a2); the lost-decline race test; `TestRecountParentChild` |
 | P4b | Aggregate engine (class A) | `internal/evalengine` (Postgres and in-memory); `count`, `sum`, `share`, `distinct`, `group_by`, `time_between` + `__absent`, `sequence`, `ratio`; pushdown and indexes; conformance | P4a | Reference equality on 10k histories; adapter equivalence |
 | P4c | Class R, budgets, flags, flood | `peak` (with `sum`) under the raw-unit saturation limit per transform (§5.7); `neighbours` exact by saturation; the partial/degraded direction table; `ratio` partial propagation and `ratio_den_partial_capable`; `relative_to_history` with its baseline budget; `partial` in verdicts and the API; pass order; `TestFeatureIndependence`; flood generator and property; cost benchmark. **Then enable bounded evaluation for e2a.** | P4b | Criteria 4 and 6; golden exact under the bounded evaluator |
 | P4d | Rescore control and warm-up | Proportional coalescing; timers only from non-shadow rules; per-tenant budget; warm-up | P4c, P3c | Storm and warm-up tests |
@@ -1740,3 +1772,30 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
 - Q7 and Q22 are revised.
 - Q23 (`start` precedence), Q24 (key-independent `body_hash`) and Q25 (dirty marks beyond the cap)
   are new.
+
+### Revision 5 (addendum, after the final check of revision 4)
+
+- **H-A: parent/child recount.**
+  - The built-in decline counters, and every counter behind a `before_first` recount, are now
+    primary-subject-only. `also` and `via_parent` rows never feed a recount.
+  - `TestRecountParentChild` covers it: child `C` emits 5 declines, then parent `P` gets its first
+    success, and `P`'s value is identical with and without a recount.
+- **H-B: "first accepted" and determinism.**
+  - "First accepted" means the smallest `(received_at, producer, id)`.
+  - The determinism claim is now stated with each event's `received_at` held fixed.
+  - The a2 permutation and concurrency tests take `received_at` from the fixture.
+- **Fix 1: `peak` worked examples.**
+  - Both counter-examples are exact, because their streams complete (about 2,200 and 48,186 rows).
+  - "The limit binds" is decided at run time (more rows remained beyond the limit), never from the
+    static size of `N`.
+  - `x_sat` is corrected to `50·min(300, T⁻¹(C)/d)`.
+- **Fix 4: ingest transactions and the decline recount.**
+  - Ingest transactions run at READ COMMITTED, with up to 3 jittered retries on serialization
+    failure or deadlock.
+  - The boundary-day recount is replaced by hourly decline counters plus one boundary-hour query,
+    so the cost an attacker controls is bounded to one hour's declines.
+- **Fix 7: `ratio`.**
+  - (a) Class N `first:` features join the `ratio_den_partial_capable` rejection list.
+  - (b) A partial-capable `num` combined with a negative ratio sign or weight is flagged
+    `partial` + `degraded`.
+- **Recommended change adopted:** `start = min(chosen, first_received_at)`.
