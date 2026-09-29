@@ -1,7 +1,8 @@
 # Generic feature packs, product vocabularies, and declarative custom features
 
-Status: proposed, revision 6, 2026-09-29. This revision applies an owner decision: abusekit is a
-generic framework, and **the compiled binary contains no domain-specific knowledge** (no email and
+Status: proposed, revision 7, 2026-09-29. Revision 7 applies the focused review of revision 6.
+Revision 6 applied an owner decision: abusekit is a generic
+framework, and **the compiled binary contains no domain-specific knowledge** (no email and
 no e2a concepts). Domain knowledge lives only in declared packs (YAML plus data files). Owner: Josh Zhang.
 
 This document amends [`2026-09-27-abusekit-design.md`](2026-09-27-abusekit-design.md), §4.2,
@@ -248,11 +249,60 @@ exactly as today.
   `address_domain` on `resource.*`. Two enabled packs extending the same name fail with
   `extension_conflict`. Tenant extensions keep the `x_` prefix.
 - **A flat `links` map.** `links` is a map of **declared** link kinds, built-in or pack-declared,
-  so `links.email_hash` stays a top-level key. Revision 2's `links.custom` is dropped. An
-  undeclared key is rejected with `bad_links`. Which kinds count as neighbour evidence is set by
-  `evidence: true` on the declaration, never hard-coded. The email pack marks `email_hash` as
-  evidence, which reproduces today's default of `{email_hash, card_fingerprint_hash,
-  device_hash}` when the email pack is enabled.
+  so `links.email_hash` stays a top-level key. Revision 2's `links.custom` is dropped.
+  - **Neighbour evidence.** Which kinds count as evidence is set by `evidence: true` on the
+    declaration, never hard-coded. The email pack marks `email_hash` as evidence, which
+    reproduces today's default of `{email_hash, card_fingerprint_hash, device_hash}` when the
+    email pack is enabled.
+  - **Canonical serialisation (M1), pinned.**
+    - The legacy kinds are written first, in today's `event.Links` field order: `email_hash`,
+      `card_fingerprint_hash`, `ip24_hash`, `asn`, `ua_hash`, `device_hash`, each omitted when
+      empty.
+    - Any other declared kinds follow, sorted by name.
+    - An empty map serialises as `{}`.
+
+    This keeps the stored `links` bytes and `body_hash` unchanged for every pre-P-E1 event.
+  - **Validation is unchanged for legacy kinds.**
+    - `email_hash` keeps its 64-lowercase-hex check. It is declared as a link kind with
+      `format: hex64`.
+    - A malformed legacy value is still a per-item `bad_links`.
+    - An **unknown link key** is still a whole-request `400 bad_request`. Today strict JSON decoding
+      produces that, and from P-E1 the tenant's declared-kind set does.
+  - **Byte-identity test (`TestWireByteIdentity`).** It replays the whole pre-P-E1 corpus (every
+    committed fixture plus the synthetic corpus, and every error-path contract test) through the
+    old and new ingest paths. For each event it asserts identical stored `links` and `data` bytes,
+    identical `body_hash`, and an identical outcome: accepted, `duplicate`, `conflict`, or the
+    exact error code.
+- **Derived fields (M2).** Fields that ingest computes, such as `x_<field>__in_<set>` and
+  `x_brands`, are stored in a separate `events.derived jsonb` column and never in `data`. They are
+  excluded from the `body_hash` canonical form and from the 8 KiB `data` limit. A set or matcher
+  change recomputes them by backfill (§5.6 warm-up).
+- **`display_name` is opt-in per declared resource kind (L3).** `resource_kinds:
+  {agent: {role: other, display_name: true}}`. The implicit legacy declaration sets
+  `display_name: true` for every kind, including undeclared ones, because the Go `nameBrandMatch`
+  reads every resource name.
+
+**Reference packs are embedded and addressed by content SHA (H4, M5).**
+- The binary embeds `packs/**` (`go:embed`) together with a **release manifest**
+  (`packs/MANIFEST`) that lists each reference pack's `name@x.y.z` and the SHA-256 of its
+  directory.
+- The embedded packs are data, never Go. Loading a reference pack never depends on a mount, so a
+  missing file can't disable one.
+- **A pack counts as a reference pack only if its SHA is in the embedded manifest.** Only those
+  packs may use `compat` options.
+- Reserved pack names (`core`, `brand`, `email`, `card-testing`, `api-credential-abuse`, `custom`,
+  and every manifest name) **can't be shadowed from a tenant mount**. A same-name directory
+  in the mount fails with `pack_shadowing`.
+
+**Fail closed on configuration errors (H4).**
+- If a tenant is in `config_error` (no valid profile: a cold start with a bad profile, or an
+  embedded pack SHA mismatch), `POST /v1/events` for that tenant returns **`503` with
+  `Retry-After` for the whole request**, and code `tenant_config_unavailable`.
+- Ingest never drops fields, never rejects single items, and never stores events under a partial
+  vocabulary. The producer's durable outbox retries.
+- **Test (`TestIngestFailsClosedOnConfigError`):** with the tenant's profile invalid, a valid
+  batch returns 503 and nothing is stored. Once the profile is fixed, the retried batch is stored
+  with bytes identical to a batch that never failed.
 
 **Core neutrality audit.** Every revision-5 core feature was checked:
 
@@ -264,10 +314,27 @@ exactly as today.
 | `core.subject_age_h`, `upgrade_*`, `declines_*`, `first_funding_prepaid`, `resource_*`, `credential_*`, `verdict_max_24h`, `neighbors_truncated` | None | Unchanged |
 | Self-send, webmail and destination logic | Previously Go facts and counters | Now entirely in the email pack, as declared `before_first` fact specs and lifetime share counters over the roles `self`, `recipient` and `destination` |
 
+**Completed audit of non-feature code (M3).** Every item below is fixed in slice P-N0 (the
+cleanup that runs before the neutrality CI) or deleted in P-E2:
+
+| Location | Domain knowledge | Fix | Slice |
+| --- | --- | --- | --- |
+| `internal/worker/reason.go` `renderReason` | Prints email-named features by hand. | Reason is generated generically from the rule's inputs: the top contributing features by `|w·x|`, with their values. `reason_version: 3`. | P-N0 |
+| `pkg/abusekit` `Links.EmailHash` (public Go SDK) | Email link kind in a typed struct. The flat map is a **breaking SDK change**. | Add the module path `pkg/abusekit/v2`, where `Links` is `map[string]string`. v1 is frozen and deprecated but still emits identical wire bytes. e2a's emitter (S6) moves to v2 at its own pace, and v1 is removed one release after that. The v1 identifier sits on the allowlist, keyed by `(file, identifier)`, until then. | P-N0 (v2), P-E2 (allowlist expiry date) |
+| `eval/neighbors.go` `defaultNeighborKinds` | Hard-codes `email_hash`. | Uses the profile's declared evidence kinds. | P-N0 |
+| `eval/gen` | Generates `content.sent` families in Go. | Becomes a data-driven generator. Families are YAML in each pack (`packs/<p>/gen/*.yaml`) or example profile; the Go generator stays neutral. | P-N0 |
+| `internal/feature/store_neighbors.go` `allLinkKinds` | Lists `email_hash`. | Derived from the tenant's declared link kinds. | P-N0 |
+| Brand matcher literals `buildIntegrationTokens` and `buildCommunityPhrases` | Word lists in Go. | Moved to `packs/brand/*.yaml`. | P-N0 |
+| YAML config: `config/rules.yaml`, `local_weights.yaml`, `webmail.yaml`, `brands.yaml` | Email feature names and lists. | Moved to `examples/tenants/reference/`, `packs/email/` and `packs/brand/`. | P-N0 (moves; the golden stays exact) |
+| #7 `--webmail` flag and `ABUSEKIT_WEBMAIL_CONFIG` | An email concept in the CLI and environment. | Deleted in P-E2. For one release the flag and variable are accepted, ignored and logged as deprecated. **Ops migration note:** the hosted compose (S8) removes them in the same release that bumps the email pack pin. | P-E2 |
+| #7 `WebmailSet` dependencies in `serve`, `labels` and `worker` | Webmail threaded through the core. | Deleted; the webmail list is pack data. | P-E2 |
+| #7 `"content.sent"` matches in `windows.go` (`isWindowedEventType`, sends helpers) | Type name in core code. | Core windowed types derive from `Reads`/`activity`. The sends helpers are deleted with the Go email code. | P-E2 |
+| #7 `"agent"` match in `exemptSubjectBrands` (and the `feature.go` comment) | e2a resource-kind name. | Becomes the declared exemption `where: {field: kind, in: [agent]}` in the email pack (§5.5, H1). | P-E2 |
+
 **Roles (field level).**
 - `title`: text matched by `brand.title_match`.
 - `display_name`: an actor-chosen name matched by `brand.name_match`. The core
-  `resource.*.name` field carries it.
+  `resource.*.name` field carries it for every resource kind that opts in (L3).
 - `self`: bool; a self-directed event.
 - `destination`: domain or hash; where an activity lands.
 - `recipient`: hash; a single counterparty. Pairs with `recipient_count`.
@@ -288,18 +355,32 @@ fields explicitly.
 - **Exposed** as features `brand.name_match`, `brand.name_has_at` and `brand.title_match`, and as
   one generic DSL op, **`brand_match`** (§5.5), which declared packs may use.
 
-**Neutrality CI.** P-N (§9) adds three checks, which then gate every slice:
-1. `TestCoreIsDomainNeutral`. It walks the Go AST of every package outside `packs/`, `examples/`
-   and `testdata/`, and fails on any identifier or string literal on
-   `internal/neutrality/denylist.txt` (for example `email`, `webmail`, `recipient`, `subject_line`,
-   `smtp`, `mailbox`, `inbox`, `e2a`). Exceptions come only from `allowlist.txt`, one justified
-   entry per line; the privacy leak detector is the canonical one.
+**Neutrality CI.** Switched on at the end of P-E2 (§9), after the P-N0 cleanup. It then gates
+every slice.
+1. `TestCoreIsDomainNeutral` (M4).
+   - **Scope:** it walks the Go AST of **every** Go file in the module, including Go under
+     `packs/` and `_test.go` files. Test files are scanned too, so domain knowledge can't hide in
+     test helpers. Data files (YAML, JSON, JSONL, text) are not scanned.
+   - **Tokenising:** each identifier and string literal is split on camelCase and snake_case
+     boundaries and on non-alphanumerics, then lowercased. Every token is compared against
+     `internal/neutrality/denylist.txt`: `email`, `webmail`, `recipient`, `subject`+`line`,
+     `smtp`, `mailbox`, `inbox`, `e2a`, `agent`.
+   - **`agent`** is denied except as the second token of `user agent` (`UserAgent`, `user_agent`,
+     `ua_hash` is unaffected). The rule is explicit in the denylist syntax: `agent !after user`.
+   - **Allowlist:** `allowlist.txt` is keyed by `(file, identifier)`, one justified entry per line,
+     with an optional expiry date. The leak scanner gets exactly three entries, all in
+     `internal/vocab/leakscan.go`: `emailRe`, `looksLikeEmail` and `maskEmails`.
+     `emailMaskExemptKey` is deleted. Which field is masked instead of rejected is now the pack's
+     `text` field declaration.
 2. `TestNonEmailProfileEndToEnd`. The binary loads the card-testing reference pack
    (`examples/tenants/tallyport`) with **no email pack**. It ingests that pack's fixtures through
    HTTP and scores them. It asserts that no `email.*` feature is registered, that `content.sent` is
    an undeclared type for that tenant, and that verdicts match the pack's golden replay.
 3. `TestGoRegistryLint`. Every Go `FeatureDef` may read only built-in core types or roles
    (`Reads`). Any type name outside the built-in list fails.
+4. **Runtime enforcement of `Reads`.** A Go pack's `Extract` receives a **filtered event view**
+   that contains only events whose type is in its `Reads`, directly or by role. A Go pack
+   therefore can't observe a pack-declared type even through a generic loop over events.
 
 ### 5.1 Packs
 
@@ -589,37 +670,116 @@ value = transform( v1 · d )
 - `age_decay` defaults to `{full_until: 3d, zero_at: 30d, floor: 0.2}`.
 - `baseline: {peak: {size: 10m}}` overrides the baseline op.
 
-**Generic primitives added in revision 6, so the email pack needs no Go.** Each one is
-domain-neutral and usable by any pack:
+**Generic primitives added in revisions 6 and 7, so the email pack needs no Go.** Each one is
+domain-neutral and usable by any pack.
 
 | Primitive | Semantics |
 | --- | --- |
-| **Baseline override** `baseline: {op, size?, where?}` | The baseline uses its own op, sub-window width and predicate, independent of `cur`. For example, a 1 h sum compared against a prior 10 min peak over *all* non-self rows. |
-| **`distinct` with `on_missing`** `{field, on_missing: ignore \| count \| {sum: {field, default}}}` | Rows without `field` are ignored (the default), counted as one unit each, or contribute a summed field. The value is `count(DISTINCT field) + fallback`. |
-| **Compat options** `compat: {version: 0, window_end: closed, include_future: true}` | Explicit, versioned reproductions of legacy quirks. `window_end: closed` makes an anchored window `[start, start + A]`. `include_future: true` stops excluding `at > now` for that feature. The loader rejects `compat` in tenant `custom.*` features, so only reference packs may freeze a legacy quirk, and each quirk is listed in the pack's changelog. `compat.version` is bumped if a quirk's semantics ever change. |
-| **`share` over `lifetime`** | Numerator and denominator come from two counter specs, with the `(now, +∞)` subtraction (unless `include_future`). |
-| **`brand_match`** `{role: title \| display_name, window, exclude_self, exempt_on_display_name_token: integration, exclude_brands_of: display_name, cap}` | Counts distinct brand ids matched in `role` fields, provided by the brand pack. It can exclude brands whose display-name mention sits next to an integration token, and brands already credited through `display_name`. |
+| **Baseline override** `baseline: {op: count \| sum \| distinct \| peak, size?, where?, sum?: {field, default, cap_each}}` | The baseline uses its own op, sub-window width, predicate and summed field, independent of `cur`. **Only monotone ops are allowed** (count, sum, distinct, peak), so a truncated baseline can only under-estimate (§5.7). `lookback` and `exclude_recent` stay on `relative_to_history`. |
+| **`distinct` with `on_missing`** `{field, on_missing: ignore \| count \| {sum: {field, default, cap_each}}}` | Rows without `field` are ignored (the default), counted as one unit each, or contribute a summed field. The value is `count(DISTINCT field) + fallback`. |
+| **Compat options** (M5): `compat: [<option>, …]` | Explicit, versioned reproductions of legacy quirks. **A closed enum defined in the engine.** Each option has its own conformance test, and adding a new option needs a design change. Options are usable only by manifest-listed reference packs. The v0 options are below. |
+| **`share` over `lifetime`** | Numerator and denominator come from two counter specs, with the `(now, +∞)` subtraction (unless `include_future`). `if_empty` applies as usual. |
+| **`brand_match`** (H1). Signature: `{role: title \| display_name, window, exclude_self, exempt: {type, where, require_token: integration, match_variant: title \| display_name, live_unless: {type, same_field}}, exclude_brands_of: display_name, cap}` | Counts distinct brand ids matched in `role` fields, provided by the brand pack. Detailed below. |
+| **Standalone `age_decay`** (H1, L1) | Without `relative_to_history`, `value = T(min(raw, T⁻¹(cap)) · d)`. With the identity transform this is `min(raw, cap) · d`. `d` is defined exactly below. |
 | **Cross-field constraint** (vocabulary) `constraints: [{if_present: f, then: {field: g, lte: 1}}]` | Validated at redaction. A violation is rejected with `redaction_failed`. |
+| **Pack rescore mode** `rescore: legacy_v0` (H5, a compat option) | Replaces the pack's rescore candidates with Go's `nextRescoreAt` rule, applied to the pack's windowed types. See below. |
 
-**Parity: how every #7 email feature is declared** (`packs/email/pack.yaml`, all over
-`content.sent`, with `self` = `recipient_is_own_identity`):
+**The `compat` enum, v0.** It lists every legacy quirk the email pack needs:
+- `window_end_closed`: an anchored window becomes `[start, start + A]`.
+- `include_future`: stop excluding `at > now` for this feature.
+- `before_first_include_future` (H2): `before_first` counts, and its boundary, include events with
+  `at > now`.
+- `rescore_legacy_v0` (H5): the rescore rule described under "Rescore" below.
+
+**`brand_match` in detail (H1).**
+- **Matcher variant per role**, pinned by the engine:
+  - `title`: community gate on, integration gate off. This is #7's
+    `MatchedBrandNamesForSubject`.
+  - `display_name`: integration gate on, community gate off. This is #7's `MatchedBrandNames`.
+- **Input.** Matching runs on the **stored** value, after masking and truncation, at ingest. It
+  writes `x_brands` into `derived`. A backfill that re-runs the matcher therefore sees exactly
+  what the scorer saw.
+- **Exemption.** `exempt` computes the set of exempt brands **at score time** from the
+  `subject_display_names` fact table. That table holds one row per distinct normalised
+  resource name, with the resource kind, created and deleted counts, the brand ids under each
+  matcher variant, and whether the name has an integration token. Ingest maintains it, so a
+  `resource.deleted` is reflected immediately and nothing needs recomputing.
+- **Exemption rule.** A brand is exempt if all of these hold:
+  - it appears under `match_variant` in the name of a resource matching `exempt.type` and
+    `exempt.where`;
+  - that name satisfies `require_token`;
+  - the name is **live**: no row of `live_unless.type` shares its normalised `same_field`.
+- **`exclude_brands_of: display_name`** removes brands matched under the `display_name` variant in
+  any resource name, live or not. This reproduces #7's `namedBrandNames`.
+- **Counter-example (H1).** A live `kind: key` resource named "Stripe API Key", and a non-self
+  subject "Your Stripe invoice":
+  - Under the `display_name` variant the name matches nothing, because "API" trips the
+    integration gate. So `exclude_brands_of` removes nothing.
+  - The exemption's `where: {field: kind, in: [agent]}` excludes the key.
+  - So `Stripe` counts. Go gives `1·d`, and the declared feature gives `min(1, 3)·d = 1·d`.
+  - A committed parity fixture covers this case.
+- **Cost.** The name table is capped at 10,000 distinct names per subject. Beyond that the feature
+  is `partial` + `degraded`.
+
+**`age_decay`, exactly (L1).** Let `D = now.Sub(start)` be a Go `time.Duration`. Then:
+- `ageDays = D.Hours() / 24`, using Go's `Duration.Hours()`.
+- `v = 1 - (ageDays - full_until_days) / (zero_at_days - full_until_days)`, evaluated in that
+  order. The denominator is computed once, at compile time, as a float64: 27 for the defaults.
+- `d = floor` if `v < floor`; `d = 1` if `v > 1`; otherwise `d = v`.
+- The multiplication by `d` is the last operation before the transform, or the value itself when
+  there is no transform.
+
+This is #7's `ageDecayFactor` expression tree, including the constants `3` and `27`.
+
+**Rescore (H5): the choice is a pack-level `rescore: legacy_v0` mode, not a list of deviations.**
+
+For the email pack, the rescore candidate set is defined to be exactly Go's `nextRescoreAt`
+restricted to the pack's windowed type (`content.sent`):
+- the 1 h and 24 h window exits of **every** in-window `content.sent` event, **self-sends
+  included**, as in Go;
+- the first-day cutover `start + 24h`, while it lies in the future;
+- the earliest future-dated `content.sent`;
+- all coalesced to fixed 5-minute buckets.
+
+It does **not** add `peak` sub-window exits, baseline-boundary exits, or window-proportional
+buckets. The core Go pack contributes the same rule for `resource.created`. The union's minimum is
+therefore Go's `NextRescoreAt` exactly, and the golden asserts it bit for bit. Non-reference packs
+use the normal rescore rules of §5.5.
+
+**Parity: how every #7 email feature is declared.** All of it lives in `packs/email/pack.yaml`,
+over `content.sent`. Every feature declares **`hash_quantum: 0`** (H5), so input hashes equal
+Go's.
+
+Two shorthands used in the table:
+- **`notself`** = `{not: {field: recipient_is_own_identity, eq: true}}`. An absent field counts
+  as not-self, as in Go's `isSelfSend`.
+- **`B10`** = the shared baseline (H3): `baseline: {op: peak, size: 10m, where: notself, sum:
+  {field: recipient_count, default: 1, cap_each: 300}}`, with `relative_to_history: {lookback:
+  30d, exclude_recent: 24h, ratio_cap: 300, age_decay: {}}`.
 
 | Feature | Declaration |
 | --- | --- |
-| `email.sends_10m_max` | `peak: {size: 10m, sum: {field: recipient_count, default: 1, cap_each: 300}, where: not self}`, `window: 24h`; `relative_to_history: {lookback: 30d, exclude_recent: 24h, age_decay: {}, ratio_cap: 300}`; `cap: 300` |
-| `email.sends_1h` | `count` with `sum` (as above) over 1 h, not self; baseline override `{peak, size: 10m, where: not self}`; `ratio_cap: 300`; `age_decay` |
-| `email.webmail_sends_1h` | As `sends_1h`, with `where: {all: [not self, {field: recipient_domain, in_set: webmail}]}`. The baseline override keeps `where: not self`. |
-| `email.distinct_recipients_1h` | `distinct: {field: recipient_hash, on_missing: {sum: {field: recipient_count, default: 1, cap_each: 300}}}` over 1 h, not self; baseline override `{peak, size: 10m, sum: recipient_count}`; `age_decay` |
-| `email.sends_first_day` | `count` with `sum` over `first: 24h`, not self; `compat: {version: 0, window_end: closed}` |
-| `email.first_day_distinct_domains` | `distinct: {field: recipient_domain}` over `first: 24h`; `log1p: {anchored_at: 10}`; `compat: {version: 0, window_end: closed, include_future: true}` |
-| `email.webmail_recipient_share` | `share` over `lifetime`, `sum: recipient_count`, `where: not self`, `match: in_set webmail` |
-| `email.self_send_before_external` | `count: {where: self}`, `before_first: {type: content.sent, where: not self}`, `cap: 2` |
-| `email.subject_brand_match` | `brand_match: {role: title, window: 1h, exclude_self: true, exempt_on_display_name_token: integration, exclude_brands_of: display_name, cap: 3}`; `age_decay` |
+| `email.sends_10m_max` | `peak: {size: 10m, sum: {field: recipient_count, default: 1, cap_each: 300}, where: notself}`, `window: 24h`; `B10`; `cap: 300` |
+| `email.sends_1h` | `count: {sum: {field: recipient_count, default: 1, cap_each: 300}, where: notself}`, `window: 1h`; `B10`; `cap: 300` |
+| `email.webmail_sends_1h` | As `sends_1h`, with `where: {all: [notself, {field: recipient_domain, in_set: webmail}]}`. **The baseline is `B10` unchanged:** all non-self sends, not only webmail. |
+| `email.distinct_recipients_1h` | `distinct: {field: recipient_hash, on_missing: {sum: {field: recipient_count, default: 1, cap_each: 300}}, where: notself}`, `window: 1h`; `B10`; `cap: 300` |
+| `email.sends_first_day` | `count: {sum: {field: recipient_count, default: 1, cap_each: 300}, where: notself}`, `first: 24h`; `compat: [window_end_closed]`; `cap: 1000000` |
+| `email.first_day_distinct_domains` | `distinct: {field: recipient_domain}`, `first: 24h`; `log1p: {anchored_at: 10}`; `compat: [window_end_closed, include_future]`; **`cap: 1000`**, which can never be reached (it would need about e^240 domains) (L2) |
+| `email.webmail_recipient_share` | `share` over `lifetime`, `sum: {field: recipient_count, default: 1, cap_each: 300}`, `where: notself`, `match: {field: recipient_domain, in_set: webmail}`; **`if_empty: 0`** (L2); `cap: 1` |
+| `email.self_send_before_external` (H2) | `count: {where: {field: recipient_is_own_identity, eq: true}}`, `before_first: {type: content.sent, where: {field: recipient_is_own_identity, eq: false}}` (so an absent field is **not** external, as in Go); `compat: [before_first_include_future]`; `cap: 2` |
+| `email.subject_brand_match` (H1) | `brand_match: {role: title, window: 1h, exclude_self: true, exempt: {type: resource.created, where: {field: kind, in: [agent]}, require_token: integration, match_variant: title, live_unless: {type: resource.deleted, same_field: name}}, exclude_brands_of: display_name, cap: 3}`; standalone `age_decay: {}` |
+
+The pack also declares `rescore: legacy_v0` (H5).
 
 **Wire constants and edge conventions.**
 - `cap_each: 300` and `default: 1` reproduce `recipientCountOf`: an invalid or non-positive count
   reads as 1, and each value is capped at 300.
-- `normalizeToken` is the `domain` kind's normalisation.
+- `normalizeToken` (lowercase, then trim) matches the `domain` kind's normalisation for ASCII
+  domains.
+- **IDNA edge case (L2).** The `domain` kind maps a Unicode domain to its punycode form, which
+  the legacy code did not. A Unicode spelling and its punycode twin would count as two domains in
+  Go but one in the pack. No committed fixture contains an IDN. This is a documented
+  production-only divergence, surfaced by the P-E1 shadow metric (below).
 - `log1p: {anchored_at: 10}` computes `s = 10/math.Log1p(10)` exactly as the Go constant does.
 - Parity for each feature is **bit-for-bit on the golden replay** (slice P-E2). Any mismatch
   blocks deletion of the Go code.
@@ -682,7 +842,7 @@ hashed values too.
 
 | Kind | Stored as | Rejected when |
 | --- | --- | --- |
-| `text` | NFKC-folded. Email, card, IP and phone shapes are **masked** as `@`, `#card`, `#ip`, `#phone`. Truncated at `max_len` (at most 500). Custom text defaults to `store: skeleton`; `store: raw` is opt-in, for text-accepting scorers only. **Built-in `content.sent.subject_line`** stays raw (main §4.3). From P3a it gets the same masking: email (already in #7), card, IP and phone. | Control characters or invalid UTF-8 |
+| `text` | NFKC-folded. Email, card, IP and phone shapes are **masked** as `@`, `#card`, `#ip`, `#phone`. Truncated at `max_len` (at most 500). Custom text defaults to `store: skeleton`. `store: raw` and **`store: raw+skeleton`** (M2) are opt-in, for text-accepting scorers only. The email pack declares `content.sent.subject_line` as `store: raw+skeleton`, which is today's behaviour: raw plus `subject_line_skeleton`. From P3a it gets the same masking: email (already in #7), card, IP and phone. | Control characters or invalid UTF-8 |
 | `number` | **Trusted as declared.** `max` is **required**; `min` and `integer` are optional. There's no Luhn check on numbers: the field is declared and reviewed, and Luhn only falsely rejects amounts and counts. | Out of range, non-finite, or declared without `max` (a load error) |
 | `bool` | As is. | Not a bool |
 | `enum` | A declared value: at most 64 values, each matching `[a-z0-9_.-]{1,64}`. Leak-scanned at profile load. | Undeclared value |
@@ -1584,12 +1744,36 @@ The first two already have a channel: `content.verdict` and enum fields.
 
   Any fixture that changes is listed and justified in its slice.
 - **Bounded evaluation reaches e2a only after P4a–P4c** (§5.7 f).
-- **Email becomes configuration (P-E1, P-E2).**
-  - P-E1: the YAML email pack is loaded for e2a *alongside* the transitional Go email features,
-    under shadow names (`email_yaml.*`).
-  - P-E2: the golden replay asserts that each YAML feature is bit-identical to its Go twin at every
-    recorded instant. Only then does it switch e2a to the YAML names and delete the Go email code.
-    e2a's scores are bit-identical throughout.
+- **Email becomes configuration (P-N0, P-E1, P-E2).**
+  - **P-N0**, the neutral cleanup (M3), comes first.
+  - **P-E1** loads the embedded YAML email pack for e2a *alongside* the Go email features, under
+    the shadow namespace **`emailshadow.*`**. `email_yaml` would break the §5.3 grammar (M8).
+    - The namespace is bound at load time (`packs: [{pack: email@1.0.0#sha256:…, as:
+      emailshadow}]`). It is never written into `pack.yaml`, so **the validated artifact is the
+      pack SHA**, byte-identical from P-E1 to ship.
+    - P-E1 emits a production metric, `abusekit_pack_shadow_mismatch_total{tenant, feature,
+      reason}`, comparing each shadow value with its Go twin at every scoring round (M6).
+  - **The P-E2 gate** (M6):
+    - The golden replay is bit-identical for values, risks, tiers, input hashes and
+      `NextRescoreAt`.
+    - **And** the production mismatch metric has been zero for **N consecutive days** (Q31;
+      proposed N = 7), except for the documented production-only divergences below, which the
+      metric labels separately.
+  - **P-E2 parity oracle** (M7): the **post-P4a** Go email code, meaning the Go features after
+    they moved onto facts and counters, and not #7 as merged. #7's behaviour reaches the oracle
+    only through the P0–P4a goldens, which already pinned it.
+  - **Documented production-only divergences** (M6). The golden can't show these, so the shadow
+    metric labels each one:
+    1. **Budgets and `partial`.** The YAML path runs under the bounded evaluator's budgets
+       (§5.7), and a real stream can bind where the Go path had no bound.
+    2. **Counter expiry at the retention boundary.** Lifetime shares from counters expire by day
+       bucket, while the legacy scan dropped rows individually. Within the boundary day the two
+       can differ.
+    3. **Set membership fixed at ingest.** `x_recipient_domain__in_webmail` is computed at ingest.
+       A webmail-list change needs a backfill, whereas Go re-checked the list at score time.
+    4. **IDNA normalisation** (above).
+  - **P-E2 switch:** it happens once the gate passes, and only then are the Go email features
+    deleted. e2a's scores are bit-identical throughout.
 - **#7 merges first**, as the transitional Go implementation. It protects e2a before the
   migration, and it is the parity oracle for P-E2.
 - **Rollback:** before S8, every slice can be reverted on its own. After S8, only the rename is
@@ -1616,11 +1800,12 @@ as described in §5.2.
 | P4c | Class R, budgets, flags, flood | `peak` (with `sum`) under the raw-unit saturation limit per transform (§5.7); `neighbours` exact by saturation; the partial/degraded direction table; `ratio` partial propagation and `ratio_den_partial_capable`; `relative_to_history` with its baseline budget; `partial` in verdicts and the API; pass order; `TestFeatureIndependence`; flood generator and property; cost benchmark. **Then enable bounded evaluation for e2a.** | P4b | Criteria 4 and 6; golden exact under the bounded evaluator |
 | P4d | Rescore control and warm-up | Proportional coalescing; timers only from non-shadow rules; per-tenant budget; warm-up | P4c, P3c | Storm and warm-up tests |
 | P5 | Pack gating | Registry; the Go `core` and `brand` adapters and the `declared` (YAML) adapter; enablement; `brand.title_match` (needs the `title` role); brand lists moved to data; `packtest`; starter weights | P3a, P4c | Golden exact; `feature_not_enabled`; every pack passes `packtest` |
-| P-E1 | YAML email pack | `packs/email/` (`pack.yaml`, `webmail.txt`, starter weights, fixtures, floors). The new generic primitives: baseline override, `distinct.on_missing`, compat options, lifetime `share`, `brand_match`, cross-field constraints, pack extensions of built-in types, and the flat declared `links` map. The `content.sent` schema, `email_hash`, `email_domain_class` and `address_domain` move into the pack, wire-compatible. Loaded for e2a as shadow `email_yaml.*`. | P4b, P4c, P5 | The pack loads; wire replay of every fixture is byte-compatible (same accepted, duplicate and conflict results); golden exact (Go features still drive scores) |
-| P-E2 | Parity, then deletion | The golden replay compares each `email_yaml.*` value to its Go twin, bit for bit, at every instant. Then: switch the names to `email.*`, **delete** the Go email features and the transitional built-in `content.sent` schema, and turn on the neutrality CI (§5.0) | P-E1 | Parity passes for all nine features; golden exact after deletion; `TestCoreIsDomainNeutral`, `TestNonEmailProfileEndToEnd` and `TestGoRegistryLint` green |
+| P-N0 | Neutral cleanup (M3) | `reason.go` made generic; `pkg/abusekit/v2` with a map `Links` (v1 frozen); `eval/neighbors.go` and `allLinkKinds` driven by declared evidence; data-driven `eval/gen`; brand word lists moved to data; config YAML moved to `examples/tenants/reference`, `packs/email` and `packs/brand` | P5 | Golden exact; SDK v1 and v2 produce identical wire bytes |
+| P-E1 | YAML email pack, in shadow | Embedded `packs/email/` plus the manifest. Primitives: baseline override (monotone ops, `sum`/`cap_each`), `distinct.on_missing`, the closed `compat` enum with conformance tests, lifetime `share`, `brand_match` with declarable exemptions and the per-role matcher variants, standalone `age_decay`, cross-field constraints, `rescore: legacy_v0`. The `subject_display_names` fact table; pack extensions of built-in types; the flat `links` map with its canonical serialisation; the `derived` column; `store: raw+skeleton`. The `content.sent` schema, `email_hash`, `email_domain_class` and `address_domain` move into the pack. Loaded as `emailshadow.*`, with the production mismatch metric. | P-N0, P4b, P4c | The pack loads from the embedded manifest. **`TestWireByteIdentity`**: stored `links` and `data` bytes, `body_hash` and error codes identical over the whole pre-P-E1 corpus. Golden exact (Go still drives scores). Every shadow feature bit-identical to its Go twin on the golden, including `NextRescoreAt` and input hashes. The H1 counter-example fixture passes. |
+| P-E2 | Parity gate, switch, deletion | Preconditions:<br>• embedded packs;<br>• fail-closed ingest (`TestIngestFailsClosedOnConfigError`);<br>• the shadow-mismatch gate: N clean days, divergences labelled (M6).<br>Then:<br>• switch the binding `as: emailshadow` to `as: email`; the pack SHA is unchanged;<br>• delete the Go email features, `WebmailSet`, the `--webmail` flag, the `content.sent` matches, and the transitional built-in `content.sent` schema;<br>• turn on the neutrality CI and the runtime `Reads` filter.<br>**Ordered ops step:** the hosted profile pin (`email@1.0.0#sha256:…`) and the compose cleanup (the `--webmail` flag and its environment variable) ship **in the same release** as the deletion. | P-E1 and the N-day gate | Parity oracle is the post-P4a Go code (M7). Golden exact after deletion. `TestCoreIsDomainNeutral`, `TestNonEmailProfileEndToEnd`, `TestGoRegistryLint` and `Reads` enforcement green. |
 | P5b | Core DSL parity | Every expressible *core* S2 feature re-expressed in the DSL (a conformance check; the core Go features stay, being neutral) | P4c | Bit-exact against the Go feature on every fixture |
 | P6a | Link kinds, `neighbours`, subject kinds | declared link kinds in the flat `links` map; `neighbours` (as of now); dirty propagation for declared kinds; `subject_kind`, `also`, `parent`, `event_subjects` (≤ 8); `?kind=`; `applies_to`; `x_primary_subject_hash` | P3b, P4b, P5 | Contract tests; propagation and no-double-feed tests; golden exact |
-| P6b | Scenarios, reference packs and bootstrap | Five example profiles with held-out fixtures. **Non-email reference packs** `packs/card-testing/` (from 7b) and `packs/api-credential-abuse/` (from 7d), each in YAML with fixtures, floors and starter weights. Uniform priors; `--profile`; floors with `profile:` | P4d, P5, P6a, P-E2 | Criterion 2 on held-out fixtures; isolation check; both non-email reference packs pass `packtest` with no email pack loaded |
+| P6b | Scenarios, reference packs and bootstrap (packs embedded and SHA-listed in the manifest) | Five example profiles with held-out fixtures. **Non-email reference packs** `packs/card-testing/` (from 7b) and `packs/api-credential-abuse/` (from 7d), each in YAML with fixtures, floors and starter weights. Uniform priors; `--profile`; floors with `profile:` | P4d, P5, P6a, P-E2 | Criterion 2 on held-out fixtures; isolation check; both non-email reference packs pass `packtest` with no email pack loaded |
 | P7 | e2a cutover | Private profile in the ops mount; hosted `config check` | P5, P4c, S8's mount | Golden exact against the private copy |
 
 Two v0 slices interact with this plan:
@@ -1776,36 +1961,37 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
     detection. Approve?
 25. **Dirty marks beyond the fan-in cap (revision 4, new):** the first 50 per key are marked in
     the ingest transaction, and the rest by a rate-budgeted background job. Confirm?
-26. **Where reference packs live and how they are versioned (revision 6, new).**
-    - Proposed: `packs/<name>/` in this repo. Each pack has a `pack.yaml` (name, semver version,
-      `requires`), data files, starter weights, fixtures and floors, plus a `CHANGELOG.md` that
-      lists every `compat` quirk.
-    - Major versions change semantics, minor versions only add, and patches change data only.
-    - A pack's content SHA (over its whole directory) is recorded in every verdict's
-      `profile_sha`.
-    - Packs ship with abusekit releases, but the loader also accepts them from a tenant's mount.
-    Approve?
-27. **Are reference packs part of the public repo? (revision 6, new)** Proposed: yes. `email`,
-    `brand` lists, `card-testing` and `api-credential-abuse` hold only public facts (provider and
-    brand names) and synthetic fixtures. Private additions (brand extras, tenant packs) live only
-    in the tenant mount. Approve?
-28. **How a product pins a pack version (revision 6, new).**
-    - `packs: [email@1]` pins a major and takes the newest compatible minor or patch on the search
-      path.
-    - `email@1.4.2` pins exactly.
-    - `email@1.4.2#sha256:<hex>` also pins the content.
-    - `abusekit config check` records the resolved version and SHA in the tenant's history, and a
-      change of either is a history entry.
-    - A patch or minor must pass the pack's golden replay before release.
-    Approve?
-29. **Tenant-private YAML packs (revision 6, new).** May a product ship its own YAML pack under
-    its own namespace from the private mount, not only `custom.*` features? Proposed: yes, with
-    reserved-name and collision checks. Such packs may not use `compat` options. Confirm?
-30. **Frozen quirks as `compat` options (revision 6, new).** Legacy quirks move out of Go and into
-    explicit, versioned `compat` options usable only by reference packs:
-    `email.first_day_distinct_domains` gets a closed window end and includes future-dated events,
-    and `email.sends_first_day` gets a closed end. Harmonising them later means a new pack major
-    with the option removed. Approve?
+26. **Where reference packs live and how they are versioned.**
+    - Revision 6 proposed `packs/<name>/` in the repo, loadable from the mount.
+    - The review, adopted now: packs are **embedded in the binary** and addressed by content SHA
+      through a release manifest.
+    - A tenant may add packs only in **non-reserved** namespaces, and may **never shadow** a
+      reference pack (`pack_shadowing`).
+    - Semver applies as before, and the SHA goes into `profile_sha`.
+27. **Are reference packs public?** Yes, as proposed, with starter weights and floors derived
+    **only from synthetic fixtures**. Adopted.
+28. **Pinning.**
+    - Revision 6: `email@1` floating was allowed anywhere.
+    - The review, adopted now: **advise-mode profiles must pin `name@x.y.z#sha256:<hex>`**.
+      Floating (`name@1`, `name@1.4`) is allowed only for profiles with no advise rules (shadow)
+      and in dev.
+    - `config check` records the resolved SHA.
+29. **Tenant-private YAML packs.** The review's answer, adopted: tenant packs get **no `compat`**
+    and **no shadowing**, must follow the §5.3 grammar, and may extend built-in types **only with
+    `x_`-prefixed names**.
+30. **`compat` options.**
+    - Revision 6: free-form options for reference packs.
+    - The review, adopted now: a **closed engine enum**, each option with a conformance test, and
+      a new option needs a design change.
+    - v0: `window_end_closed`, `include_future`, **`before_first_include_future`** (new, H2) and
+      `rescore_legacy_v0` (H5).
+31. **The P-E2 clean-days gate (new).** How many consecutive days of zero unlabelled shadow
+    mismatches in production before the Go email code is deleted? Proposed: 7.
+32. **Go SDK v2 (new).** A breaking `pkg/abusekit/v2`, with `Links` as a map, and v1 frozen and
+    removed one release after S6 moves. Approve the plan and v1's end-of-life?
+33. **`recipient_count` bounds (new, M2).** The email pack declares `recipient_count` with
+    `min: 1, integer: true, max: 1000000`. The max must be at least e2a's largest per-message
+    recipient count. Confirm the value against e2a's send limits before P-E1.
 
 ## 13. Changes from earlier revisions
 
@@ -2038,3 +2224,70 @@ concepts. §5.0 defines exactly what stays compiled:
 
 **Decisions.** Q6 and Q13 are revised. Q26–Q30 are new: where reference packs live and how they
 are versioned, whether they are public, pack pinning, tenant-private packs, and `compat` options.
+
+### Revision 7 (addendum, after the focused review of revision 6)
+
+**High**
+- **H1:** `brand_match` gains declarable exemption parameters (`exempt: {type, where,
+  require_token, match_variant, live_unless}`).
+  - The exemption is computed at score time from the `subject_display_names` fact table.
+  - The engine pins the matcher variant per role: `title` has the community gate on and the
+    integration gate off; `display_name` the reverse.
+  - Matching runs after masking and truncation.
+  - Standalone `age_decay = T(min(raw, T⁻¹(cap))·d)`.
+  - The "Stripe API Key" / "Your Stripe invoice" counter-example gives `1·d` and is a committed
+    parity fixture.
+- **H2:** `self_send_before_external` uses `eq: false` for "external", so an absent field is not
+  external. Adds `compat before_first_include_future`, also listed in Q30.
+- **H3:** one explicit shared baseline, `B10`, for the four history-relative email features. The
+  baseline override gains `sum`/`cap_each`, and baseline ops are restricted to monotone ones.
+  This also covers L4.
+- **H4:** reference packs are embedded and addressed by SHA. A tenant in `config_error` gets a
+  retryable whole-request `503`, and nothing is dropped or rejected per item. Tested by
+  `TestIngestFailsClosedOnConfigError`.
+- **H5:** `hash_quantum: 0` on all nine features. Chosen: the pack-level `rescore: legacy_v0` mode,
+  defined to equal Go's candidate set, so `NextRescoreAt` is asserted bit-exact.
+
+**Medium**
+- **M1:** the `links` serialisation is canonical: legacy order, then declared kinds sorted, and
+  `{}` when empty. `email_hash` keeps `hex64`. An unknown key is still a whole-request 400.
+  `TestWireByteIdentity` covers stored bytes, `body_hash` and error codes.
+- **M2:** derived fields live in a separate `derived` column, outside `body_hash` and the 8 KiB
+  limit. Adds `store: raw+skeleton`. `recipient_count` declares `min: 1, integer: true,
+  max: 1000000` (Q33).
+- **M3:** the audit of non-feature code is complete: `reason.go`, SDK v2 for `EmailHash`,
+  `eval/neighbors.go`, `eval/gen`, #7's `--webmail` flag and env var (with an ops note),
+  `WebmailSet`, the `content.sent` matches, `allLinkKinds`, `"agent"`, and the config YAML. The
+  cleanup slice P-N0 is added.
+- **M4:** the neutrality test now:
+  - scans all Go, including under `packs/` and in `_test.go`;
+  - splits identifiers on camelCase and snake_case, and lowercases them;
+  - keys the allowlist by `(file, identifier)`, with an explicit `agent`/user-agent rule;
+  - enforces `Reads` at runtime through a filtered event view;
+  - allowlists only three leak-scanner identifiers in one file;
+  - moves `emailMaskExemptKey` into the pack.
+- **M5:** a pack is a reference pack only if its SHA is in the embedded manifest. Reserved names
+  can't be shadowed. `compat` is a closed enum.
+- **M6:** a production shadow-mismatch metric, an N-clean-days gate before P-E2, and documented
+  production-only divergences (budgets and `partial`, counter expiry, ingest-time set membership,
+  IDNA).
+- **M7:** the P-E2 oracle is the post-P4a Go code.
+- **M8:** the shadow namespace is `emailshadow`, bound at load, so the pack SHA is byte-identical
+  from P-E1 to ship.
+
+**Low**
+- **L1:** the exact float expression for `age_decay`.
+- **L2:** an unreachable cap for `first_day_distinct_domains`, `if_empty: 0` on
+  `webmail_recipient_share`, and the IDNA note.
+- **L3:** `display_name` is opt-in per resource kind.
+- **L4:** covered by H3.
+
+**Slices**
+- P-N0 comes first.
+- P-E1's done-when adds byte identity.
+- P-E2 requires embedded packs, fail-closed ingest, the ordered ops pin and compose step in the
+  same release, and the clean-days gate.
+
+**Decisions**
+- Q26–Q30 now carry the review's answers.
+- New: Q31 (clean days), Q32 (SDK v2) and Q33 (`recipient_count` max).
