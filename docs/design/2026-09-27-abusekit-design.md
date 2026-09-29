@@ -6,7 +6,7 @@ see account churn, tiers failed open when a scorer was unavailable, and request 
 cover reads or replay. This revision fixes those and tightens every place an implementer would have
 had to guess. Changes from r1 are marked **[r2]**.
 
-**Amendment (proposed 2026-09-29, revision 3):** [`2026-09-29-generic-feature-packs.md`](2026-09-29-generic-feature-packs.md)
+**Amendment (proposed 2026-09-29, revision 4):** [`2026-09-29-generic-feature-packs.md`](2026-09-29-generic-feature-packs.md)
 renames the built-in features once into namespaced `core`/`email`/`brand` packs enabled per tenant, adds
 product-declared vocabularies (types, field kinds, link kinds, subject kinds) with pseudonymising
 redaction, and adds bounded declarative custom features in YAML. It amends §4.2, §4.3, §4.5, §4.6, §4.8

@@ -1,7 +1,7 @@
 # Generic feature packs, product vocabularies, and declarative custom features
 
-Status: proposed, revision 3, 2026-09-29. This revision answers the re-review of revision 2, which
-returned "approve after listed changes". Owner: Josh Zhang.
+Status: proposed, revision 4, 2026-09-29. This revision answers the verification of revision 3,
+which returned "approve after listed changes". Owner: Josh Zhang.
 
 This document amends [`2026-09-27-abusekit-design.md`](2026-09-27-abusekit-design.md), §4.2,
 §4.3, §4.5, §4.6, §4.8 and §4.10. It is written against `main` at S3, treating two open PRs as
@@ -65,10 +65,18 @@ For e2a, feature values, risks, tiers and rescore times stay bit-identical.
      exception is a masked marker inside a text field.
    - Every hash, every non-allowlisted domain and every non-account subject id is keyed per tenant.
    - No two tenants share a key.
-6. **Flooding can't lower risk.**
-   - `risk(flooded, bounded evaluator) ≥ risk(flooded, unbounded reference)` holds for every
-     fixture under the §5.7 flood generator.
-   - A flood of 10,000 tiny `blocked` payments moves no onboarding feature.
+6. **Bounding can't lower risk relative to the unbounded reference.**
+   - For every fixture under the §5.7 flood generator,
+     `risk(flooded, bounded evaluator) ≥ risk(flooded, unbounded reference)`. If that can't be
+     guaranteed for some feature, the verdict carries `degraded`.
+   - This is a relative guarantee. A flood can still legitimately move a feature in the reference
+     itself. Frozen legacy dilution is the known case: extra activity lowers
+     `core.burst_ratio_24h_vs_lifetime`'s share, and extra non-webmail sends lower
+     `email.webmail_recipient_share`, in both evaluators alike.
+   - **6b.** Neither `start` nor any class F or N onboarding fact moves under either of two floods:
+     - a flood of any type other than `subject.created`, from non-backfill producer keys, however
+       its `at` is chosen within the skew allowance;
+     - 10,000 tiny `blocked` payments.
 
 ## 2. Goals and non-goals
 
@@ -225,7 +233,7 @@ type Output struct {
 | `core.resource_velocity_1h`, `core.credential_velocity_1h` (`key_velocity_1h`) | A | exact 1 h counts |
 | `core.resource_total`, `core.credential_total` (`key_total`) | F | `subject_counters` (lifetime) |
 | `core.burst_ratio_24h_vs_lifetime` | A + F | 24 h count (A) ÷ lifetime counters |
-| `email.sends_1h`, `email.webmail_sends_1h`, `email.distinct_recipients_1h` | A + R | exact 1 h current value (A); history baseline (R) |
+| `email.sends_1h`, `email.webmail_sends_1h`, `email.distinct_recipients_1h` | A + R | exact 1 h current value (A); history baseline (R). For `distinct_recipients_1h`, the current value is two class A aggregates: `count(DISTINCT recipient_hash)` plus the sum of `recipient_count` over rows without a hash. |
 | `email.sends_10m_max` | R | `peak` with a saturation limit (exact); history baseline (R) |
 | `email.sends_first_day`, `email.first_day_distinct_domains` | N | anchored; frozen into facts after day one |
 | `email.webmail_recipient_share` | F | lifetime counters: webmail recipients vs all non-self recipients |
@@ -282,9 +290,12 @@ Revision 2's 1e-12 tolerance and cut-point proximity check are deleted.
 | `feature.Names`, `Map`, `FeatureSet`, `rules.yaml`, weights, mutation/ablation/golden-sign tests, fixtures README | Mechanical rename. | Full suite plus the grep test. |
 | `abusekit score --jsonl` | Flat names fail with `feature_renamed`. | CLI contract test. |
 
-**Enforcement.** P1 lands before any S5 or S8 PR. The v0 plan marks S5 and S8 "blocked on P1".
-`TestNoVendorAdapterBeforeRename` fails if `internal/model/{gemini,jev,laya}` exists while
-`feature.KeySpace != "ns-v1"`.
+**Enforcement.** P1 lands before any S5 or S8 PR, and the v0 plan marks S5 and S8 "blocked on P1".
+`TestNoProductionBeforeRename` guards both sides:
+- **S5:** it fails if `internal/model/{gemini,jev,laya}` exists while `feature.KeySpace != "ns-v1"`.
+- **S8:** it asserts that `abusekit serve` refuses to start with `ABUSEKIT_ENV=production` unless
+  `feature.KeySpace == "ns-v1"`. The hosted deploy (S8) always sets that variable, so a pre-rename
+  binary can't be deployed.
 
 ### 5.3 Name grammar
 
@@ -384,8 +395,16 @@ features:
 
 **Predicates.** The set is closed and has no regex:
 - `eq`, `ne`, `in`, `not_in` (at most 256 values; enum values are checked at load);
-- `in_set`, `suffix_in_set` (set files of at most 100k entries, hashed and leak-scanned at profile
-  load);
+- `in_set`, `suffix_in_set` (set files of at most 100k entries, leak-scanned at profile load).
+  - **On a `domain` field**, both are evaluated **at ingest** against the cleartext value, before
+    any HMAC. The result goes into a derived bool `x_<field>__in_<set>`, which the predicate then
+    reads.
+  - Changing a set file bumps the vocabulary version and triggers a backfill. Features that use
+    the set stay cold until the backfill completes.
+  - `suffix_in_set` on any other kind is rejected at load.
+- **Literals on pseudonymised fields.** `eq`/`in` literals and set files on `hash` fields are
+  HMACed at load, the same way ingest hashes values. During a rotation they are hashed under
+  **both** keys, and a predicate matches either one.
 - `gt`, `gte`, `lt`, `lte`, `exists`;
 - `all`, `any`, `not`, with nesting depth at most 2 and at most 8 leaves.
 
@@ -403,9 +422,9 @@ predicates, `distinct`, `group_by` or `on`.
 | `peak` | `{size, sum?}`: the maximum of `agg(E ∩ (t − size, t])`, over `t` at the instants of matching events inside the outer window. `agg` is a count, or with `sum`, a sum. Sub-windows are clipped to the outer window. | R; exact under a saturation limit (§5.7) |
 | `time_between` | `{from: {type, where, anchor: first\|last}, to: {type, where}, until_now, if_absent}`. `t_A` is the first (or last) matching `from` with `at ≤ now`. `t_B` is the first matching `to` with `t_A ≤ t_B ≤ now`. The value is minutes from `t_A` to `t_B`, or `now − t_A` when `until_now` is set and there is no `t_B`. Absence semantics are below. | A; indexed first/last-match queries |
 | `sequence` | `{a, b, within ≤ 24h, on?: {a: f, b: g}}`: the number of `b` events in the window with an `a` event where `t_a ∈ (t_b − within, t_b]` and, if `on` is set, `a.f == b.g`. Both `on` fields must be `hash` fields with the same `join_domain`. | A; aggregate with a correlated existence test |
-| `group_by` | A modifier on `count`, `distinct` or `sum`: `{field, reduce: max \| {count_gte: k}, max_groups}`. It groups by `field`, applies the op per group, then reduces: `max` takes the largest group value, `count_gte` counts groups at or above `k`. **Exact**: the aggregate engine groups every matching event, so there is no first-come admission for decoys to exploit. `max_groups` (at most 1,000) bounds only the in-memory adapter. Past it, the in-memory adapter uses space-saving (Metwally) with `k = max_groups` and flags the result `partial`. Postgres is always exact. | A; `GROUP BY` |
-| `ratio` | `{num, den, if_empty}` over the **pre-transform** values of two non-ratio custom features. Depth 1: no cycles, no ratio of ratios. | D; O(1) |
-| `neighbours` | `{via: [declared link kinds], where: {deleted: permanent} \| {labelled: abusive} \| {created_within: <dur>} \| {}}`: the number of distinct other same-tenant, same-kind subjects that share a `via` key and meet the condition. **As of `now`**: links with `first_seen ≤ now`, subjects created ≤ now, deletions and labels ≤ now. `created_within` is relative to `now`. This matches `evidenceAsOf` in `eval/neighbors.go`. Fan-in is capped at 50 per key and 200 in total; hitting the cap flags the result `partial`. | F/A; one indexed query per `via` set; at most 4 per tenant |
+| `group_by` | A modifier on `count`, `distinct` or `sum`: `{field, reduce: max \| {count_gte: k}, max_groups}`. It groups by `field`, applies the op per group, then reduces: `max` takes the largest group value, `count_gte` counts groups at or above `k`. **Exact**: the aggregate engine groups every matching event, so there is no first-come admission for decoys to exploit. `max_groups` (at most 1,000) bounds only the in-memory adapter. Past it, the in-memory adapter uses space-saving (Metwally) with `k = max_groups`. Space-saving over-estimates tracked counts and loses evicted groups. `reduce: max` with a positive sign stays one-sided upward and is flagged `partial` only. `count_gte` can undercount groups whose true count is at or above `k` but that were evicted. A negative `prior_sign` or weight inverts the direction. Those combinations are flagged `partial` **and** `degraded`. Postgres is always exact. | A; `GROUP BY` |
+| `ratio` | `{num, den, if_empty}` over the **pre-transform** values of two non-ratio custom features. Depth 1: no cycles, no ratio of ratios. **Partial propagation:** a `partial` input makes the ratio `partial`. `den` may not be a feature that can go partial (`relative_to_history`, `peak`, `group_by` or `neighbours`); the load fails with `ratio_den_partial_capable`. A partial `num` inherits its own `degraded` status. | D; O(1) |
+| `neighbours` | `{via: [declared link kinds], where: {deleted: permanent} \| {labelled: abusive} \| {created_within: <dur>} \| {}}`: the number of distinct other same-tenant, same-kind subjects that share a `via` key and meet the condition. **As of `now`**: links with `first_seen ≤ now`, subjects created ≤ now, deletions and labels ≤ now. `created_within` is relative to `now`. This matches `evidenceAsOf` in `eval/neighbors.go`. **`where` is applied before any limit.** The query returns distinct matching subjects up to `K = ⌈T⁻¹(cap)⌉ + 1` (§5.7, saturation), so the count is exact up to saturation. The per-key fan-in cap no longer truncates the counted set. If the query's examined-row budget (default 50,000) runs out before it reaches `K` or finishes, the value is `partial` **and** `degraded`, because an undercount could lower risk. | F/A; one indexed query per `via` set; at most 4 per tenant |
 
 **Absence semantics** (`time_between`, `sequence`)
 - `if_absent` is a mandatory number.
@@ -423,7 +442,16 @@ predicates, `distinct`, `group_by` or `on`.
 - Declared kinds feed only `neighbours`, so they never double-feed `core.linked_deleted_n`.
 - **Dirty-mark propagation** covers built-in *and* declared evidence kinds. When a subject gains a
   link key, is permanently deleted, or is labelled, every subject sharing any evidence key with it
-  is marked dirty, up to the fan-in cap.
+  is marked dirty.
+  - The first 50 per key are marked in the ingest transaction.
+  - The rest are marked by a background job that pages through them. It runs under a per-tenant
+    rate budget, and a metric counts the marks still pending.
+  - A subject whose mark is still pending picks up the change on its next event or timer rescore.
+    Its evidence is always read as of `now` and is never cached, so a late rescore sees the change
+    in full.
+- **Legacy `core.linked_*`** keep their frozen caps (50 per key, 200 in total) and
+  `core.neighbors_truncated`, for bit-exactness. When a cap is hit, the verdict now also carries
+  `partial` and `degraded`, because the undercount lowers a positively weighted value.
 
 **`relative_to_history`** applies to `count`, `distinct` and `peak`:
 
@@ -489,11 +517,19 @@ The result lies in `[0, cap]`, and the feature's `Bound` is `cap`.
     `burst_ratio` denominator count future-dated events. Counters include them naturally.
   - Frozen legacy exception: `email.first_day_distinct_domains` has an inclusive end.
   - Harmonising these is `@2` work (§12 Q5).
-- **Counter exactness.** Custom lifetime counters exclude events with `at > now`. Those can only
-  sit inside the ±24 h skew window, so the class A engine subtracts them exactly with a query over
-  `(now, now + 24h]`. Counter `sum` fields must be integers, so the order of addition can't matter.
-- **`hash_quantum`.** This lets `SkipInputUnchanged` skip unchanged inputs. The default is 60
-  minutes (pre-transform) for `time_between` with `until_now`, and 0 otherwise.
+- **Counter exactness.** Custom lifetime counters and the built-in webmail-share counters exclude
+  events with `at > now`. The built-in counters match the legacy behaviour, where
+  `webmailRecipientShare` excludes future-dated events. Backfill-scope keys are exempt from the
+  skew check, so future-dated events aren't limited to +24 h. The class A engine therefore
+  subtracts them exactly with an indexed query over `(now, +∞)`.
+  - The legacy total counters (`resource_total`, `credential_total`, the `burst_ratio`
+    denominator) do not subtract anything, matching their frozen behaviour.
+  - Counter `sum` fields must be integers, so the order of addition can't matter.
+- **`hash_quantum`.** This lets `SkipInputUnchanged` skip unchanged inputs. Defaults:
+  - 60 minutes (pre-transform) for `time_between` with `until_now`;
+  - `0.01 × cap` (post-transform) for any feature with `age_decay`, whose value drifts with age on
+    every tick;
+  - 0 otherwise.
 - **Rescore candidates.** A feature proposes:
   - the exit of its oldest in-window match;
   - the end of its anchored window;
@@ -527,7 +563,7 @@ hashed values too.
 | --- | --- | --- | --- |
 | `content.sent.recipient_domain` | **`none`**: `etld1` would merge `target1.example.test` and `target2.example.test`, which would change `email.first_day_distinct_domains` | Cleartext if allowlisted, else HMAC of the normalised value | HMAC is injective, so distinct counts don't change. Webmail membership is checked on cleartext. |
 | `content.sent.first_link_host` | `etld1` | Cleartext if allowlisted, else HMAC | Text scorers see a token for unknown hosts (§12 Q14) |
-| `resource.*.address_domain` | `none` | Cleartext if allowlisted, else HMAC | No feature reads it |
+| `resource.*.address_domain` | `etld1` (the default; revision 3's `none` exception is removed because no feature needs the full host) | Cleartext if allowlisted, else HMAC | No feature reads it |
 | `content.sent.recipient_hash` and every `links` value (built-in and declared) | Re-HMAC. Each link kind's `join_domain` is its kind name. | — | Equality is preserved, so no value changes |
 | `links.asn` | **Exempt** from the hash format check and from re-HMAC. It's coarse routing metadata in the clear (main §4.2), and its grammar tightens to `^(AS)?[0-9]{1,10}$`. | Cleartext | None |
 
@@ -538,11 +574,16 @@ hashed values too.
 - Lookups apply the same derivation.
 
 **Ingest rules, in order**
-1. **Input leak scan.** Every key and value is checked for:
+1. **Input leak scan.** Every key and every **string** value is checked for:
    - email addresses;
    - Luhn-valid runs of 13–19 digits, with separators;
    - IPv4 and IPv6 literals;
-   - phone shapes.
+   - phone shapes: a leading `+` followed by 8–15 digits, or a digit run broken by space, `-`, `.`
+     or parentheses into the grouped national formats of 10 or more digits.
+
+   A bare digit run with no `+` and no grouping is **not** a phone shape, so a 10-digit ASN
+   passes. Declared `number` values are JSON numbers, not strings, and are exempt, as §5.6 says
+   for `number`. Undeclared numbers are dropped before they're stored.
 
    The scan runs after NFKC and after folding every Unicode `Nd` digit to ASCII. A hit in a `text`
    field is masked. A hit in a `hash` field is exempt, because the value is replaced. Anywhere else,
@@ -592,7 +633,11 @@ func Derive(master []byte, tenant string, purpose Purpose) []byte
 - A Go migration job runs under the tenant key and can resume by `seq`. It:
   - rewrites `links.hash` and the hash, domain and subject values in `events.links` and
     `events.data`;
-  - recomputes `events.body_hash`, so duplicate/conflict detection still matches;
+  - leaves `events.body_hash` untouched. From P3b on, `body_hash` is a SHA-256 over a
+    **key-independent canonical form**: the redacted event *before* pseudonymisation (declared
+    fields after masking and reduction, hash and domain values as the producer sent them). Neither
+    rotation nor the migration can break duplicate/conflict detection. The digest covers the whole
+    body, so it can't be used to test a single field;
   - sets `vocab_version`.
 
 **Vocabulary history lives in the config tree.** Each tenant has an append-only
@@ -617,22 +662,81 @@ While any input is cold, an advise rule is stored as shadow, with `warming_until
 Revision 2's shared byte and step budget, and its weighted truncation feature, are replaced by the
 following.
 
+**`start`, defined.** The subject's anchor instant is the first of these that exists:
+1. `subject.created.account_created_at`, when the producer supplied it;
+2. the `at` of the **first accepted** `subject.created` event, ordered by `received_at`. Later
+   `subject.created` events never move it;
+3. `first_received_at`: the minimum **server-assigned** `received_at` over accepted events.
+
+The third fallback replaces revision 3's `LEAST(at)`. With `LEAST(at)`, a flood dated in the past
+could move `start` earlier by up to the skew allowance, or without bound under backfill scope. In
+replay, `received_at = at`, so fixtures without `subject.created` keep their legacy `start`. P4a
+lists and justifies any fixture whose `start` changes because events precede its
+`subject.created`.
+
 **(a) Onboarding facts are maintained at ingest.** `subject_facts(tenant, kind, subject)` is
-updated in the same transaction as the event insert. Every update is monotone and
-order-independent:
+updated in the same transaction as the event insert. **The fact row is a deterministic function of
+the accepted event set:** any order of arrival produces the same row. The permutation test in
+§5.7 (a2) checks this. The update rules:
 
 | Fact | Update |
 | --- | --- |
-| `first_seen_at`, `account_created_at` | `LEAST(existing, new)`; `account_created_at` comes from `subject.created` |
+| `first_seen_at` (legacy, informational), `first_received_at` | `LEAST(existing, new)` over `at` and over server `received_at`, respectively |
+| `account_created_at`, `first_subject_created_at` | Taken from the first accepted `subject.created`, by `received_at`. Later `subject.created` events never replace them. These feed `start` (above). |
 | `first_success_at`, `first_success_key`, `first_success_funding` | On `payment.attempt{succeeded}`: replace when the event's `(at, producer, id)` is smaller |
 | `payment_counts` | `{succeeded, declined, blocked}`: increment |
-| `declines_before_first_success` | On `declined` with `at ≤ first_success_at` (or no success yet): increment. When `first_success_at` moves earlier: recompute with an **indexed count** on `(tenant, kind, subject, type, at)` where `outcome = declined` and `at ≤ first_success_at`. |
+| `declines_before_first_success` | On a `declined` event with `at ≤ first_success_at` (or no success yet): increment. **Recount** whenever `first_success_at` changes, both from absent to `t` and from an earlier move. The recount is Σ of the daily decline counters (a built-in `subject_counters` spec) for days before `day(t)`, plus one boundary-day query using a partial index on declined payment attempts: `(tenant, kind, subject, at) WHERE type = 'payment.attempt' AND data->>'outcome' = 'declined'`, bounded to `day(t)` and `at ≤ t`. Cost: O(days + declines on the boundary day). |
 | `first_paid_upgrade_at` | `LEAST` over `subscription.changed{status: active, amount_minor > 0}` |
 | `subscription_change_count` | Increment |
 | `first_external_at`, `self_sends_before_first_external` | The same pattern for `content.sent`; capped at 2 when read |
 | `name_brands`, `name_has_at`, `exempt_subject_brands` | Brand ids matched at ingest on `resource.*` names, with the integration-token gate applied |
 
+- **Locking (a1).** Every ingest transaction runs in a fixed order:
+  1. **Lock the facts row first.** `INSERT … ON CONFLICT (tenant, kind, subject) DO UPDATE SET
+     seq = subject_facts.seq + 1 RETURNING *` takes the row lock (or `SELECT … FOR UPDATE` when the
+     row already exists).
+  2. Insert the event.
+  3. Apply the updates, and recount when required.
+
+  Counter-example to the unlocked version: transaction T1 moves `first_success_at` earlier and
+  recounts, while T2 concurrently inserts a decline dated before the new `t`. Without the lock, T1's
+  recount can't see T2's uncommitted decline, and T2 compares against the old `first_success_at`.
+  Either way, one decline is lost or counted twice. With the lock, T2 blocks until T1 commits, then
+  reads the new `t` and increments correctly. T2's event row can't commit before T2 holds the lock,
+  so it's never counted twice.
+- **Permutation test (a2).** For every fixture, and for 1,000 random permutations and concurrent
+  interleavings of the fixture's events (run on the Postgres adapter with parallel transactions),
+  the final fact row must be bit-identical.
 - **No onboarding scan is ever byte-capped.** Scoring reads one facts row.
+- **Frozen class N facts are invalidated and recomputed** whenever:
+  - `start` changes; the row records the `anchored_start` its values used;
+  - a backfill-scope event with `at` inside `[start, start + A)` is accepted, which sets
+    `anchored_dirty`.
+- **Which subjects get facts and counters.**
+  - Every indexed subject (primary, `also`, `via_parent`) gets `subjects` row updates and
+    `first_received_at`.
+  - Onboarding facts (payment, subscription, brand, self-send) are updated **only for the primary
+    subject**. They describe the acting account.
+  - Counters are incremented for **every index row** whose `subject_kind` is in the counter spec's
+    `subject_kinds`. That includes `via_parent` rows, so parent-level lifetime totals see child
+    events, matching what class A queries see through `event_subjects`.
+- **Custom `before_first` features** compile to a generic fact spec
+  `{count: {type, where}, before: {type, where}}`, kept in the facts row with the same rules:
+  lock-first, recount on `∞ → t` and on earlier moves, and daily counters plus a boundary-day query.
+  The recount uses the partial expression index for the spec's `count` predicate.
+- **Erasure and re-signup.**
+  - A legal erasure (S3b) deletes the subject's facts row and counter rows, except that numeric
+    facts and counters of `abusive`-labelled subjects are kept under main §4.4's 24-month basis.
+  - A re-signup is a new subject id, with a new facts row and fresh counters. Churn evidence
+    carries across only through retained link hashes (`core.linked_*`, `neighbours`), never through
+    facts.
+- **Counter expiry vs lifetime totals.** Counter day rows expire under the **same retention rule
+  as the event rows they count** (main §4.11). "Lifetime" therefore always means "over retained
+  events", which is exactly what the legacy scans computed.
+  - A backfill computes from the events retained when it runs and records a `retained_from`
+    watermark.
+  - The counter spec is not warm until the backfill completes, and its lifetime values are defined
+    over `[retained_from, now]`.
 - A brand-list change bumps the facts spec version. A backfill job then recomputes from retained
   events, and the brand features stay cold until it finishes.
 
@@ -666,40 +770,83 @@ this. The same argument covers any flood of any type the update rules above don'
 
 | Pass | Class | What runs | Budget |
 | --- | --- | --- | --- |
-| 1 | **F** | Read `subject_facts` and `subject_counters`. Evaluate neighbour evidence (indexed, fan-in capped). | None; O(1) rows plus capped neighbour queries. |
-| 2 | **N** | Anchored `first:` features. While `now < start + A + 24h`, each runs its own class A query over `[start, start + A)`. After that, its value is **frozen** into `subject_facts.anchored`. Later events fall outside the skew allowance, so the frozen value can't go stale. | **Reserved**: runs before A, R and G, and shares with nothing. |
+| 1 | **F** | Read `subject_facts` and `subject_counters`. Evaluate neighbour evidence: `neighbours` exact by saturation (§5.5), and legacy `core.linked_*` with their frozen caps and flags. | O(1) rows, plus neighbour queries under their own examined-row budget. |
+| 2 | **N** | Anchored `first:` features. While `now < start + A + 24h`, each runs its own dedicated anchored-range query over `[start, start + A)`. In P4a that query runs the legacy Go code over the anchored rows; from P4b it can use the class A engine. After that window, the value is **frozen** into `subject_facts.anchored`, stamped with `anchored_start`. It is recomputed when `start` changes or a backfill-scope event lands in the anchor (see (a)). | **Reserved.** Runs before A, R and G, and shares with nothing. Its row budget is 50,000; if hit, the feature is `partial` + `degraded`. |
 | 3 | **A** | One exact aggregate query per feature: `count`, `sum`, `share`, `distinct`, `group_by`, `time_between`, `sequence`, the `cur` part of `relative_to_history`, and the class A parts of Go features. | **Per feature.** Returns O(1) or O(groups) rows. DB cost is O(rows in that feature's window), via the `(tenant, kind, subject, type, at)` index. |
-| 4 | **R** | `peak` and `relative_to_history` baselines. Rows stream newest-first under the feature's own budget. | **Per feature.** `peak`: LIMIT `cap·⌈W/S⌉`. Baselines: 50,000 rows by default. |
-| 5 | **G** | The remaining Go-pack computation that isn't expressible as A or R. For e2a after §5.1, this is only `email.distinct_recipients_1h`'s fallback sum, which is itself a class A aggregate. | **Per pack.** The pack's own row budget, not shared with any other pack or feature. |
+| 4 | **R** | `relative_to_history` baselines first, then `peak`. Rows stream newest-first under each feature's own budget. | **Per feature.** Baselines: 50,000 rows by default. `peak`: LIMIT `N` from the saturation sizing below, capped by a 50,000-row budget. If that budget binds before `N`, the feature is `partial` + `degraded`. |
+| 5 | **G** | Go-pack computation that isn't expressible as A or R. For e2a after §5.1 this is **empty**: every built-in feature is F, N, A or R. The class exists for future Go packs. | **Per feature.** Each G feature declares its own row budget in its `FeatureDef`. Hitting it sets the feature `partial` + `degraded`, because a Go feature's direction under truncation isn't proven. |
 | 6 | **D** | `ratio` and the `__absent` indicators. | O(1) |
 
-**Why `peak` is exact under its limit.** Stream the matching rows newest-first with LIMIT
-`N = cap·⌈W/S⌉`.
-- Split `W` into `⌈W/S⌉` slots of width `S`.
-- If the window holds at least `N` matching units, some slot holds at least `cap` units.
-- The sub-window `(t − S, t]` that ends at the last event in that slot covers the whole slot. So
-  the true peak is at least `cap`, and the transformed value saturates at `cap`, which is what the
-  limited computation reports.
-- If the window holds fewer than `N` units, the stream is complete and exact.
-- With `sum`, the units are integer addends. Addends of 0 or less are excluded by the pushed-down
-  predicate, so `N` rows carry at least `N` units.
+**Saturation sizing: why `peak` is exact under its limit, per transform.** Revision 3 sized the
+limit in *post-transform* units, which is wrong. For example, `custom.declines_10m_peak`
+(`log1p`, cap 7) needed `N = 7·144 = 1,008` rows under that sizing. Those rows could give a loaded
+peak of 9, whose `ln 10 ≈ 2.3`, while the true value was `ln 1001 ≈ 6.9`. The limit must be sized
+in **raw units**.
+
+Let `x_sat` be the smallest raw peak at which the scored value reaches its maximum.
+
+| Transform | `x_sat` |
+| --- | --- |
+| cap `C` only | `C` |
+| `log1p: true`, cap `C` | `⌈e^C − 1⌉` |
+| `log1p: {scale: s}` or `{anchored_at: n}`, cap `C` | `⌈e^(C/s) − 1⌉` |
+| with `relative_to_history` (after its baseline `B` and age factor `d` are computed) | Scored value `T(min(P/max(B,1), rc)·d)`, where `T` is the transform above, so the maximum is `T(rc·d)`, reached when `P ≥ max(B,1)·min(rc, T⁻¹(C)/d)`. Hence `x_sat = ⌈max(B,1)·min(rc, T⁻¹(C)/d)⌉`. |
+
+Every `T` is monotone non-decreasing, and so is `P ↦ min(P/B, rc)·d`. A raw peak at or above
+`x_sat` therefore scores exactly the maximum, and below it the value is exact whenever the stream
+is complete.
+
+Stream matching rows newest-first with LIMIT `N = x_sat·⌈W/S⌉`:
+- Every loaded row carries at least one raw unit. Rows with addends ≤ 0 are excluded in the
+  query. Rows are loaded but units summed, so if the limit binds, the loaded rows carry at least
+  `N` units.
+- Split `W` into `⌈W/S⌉` slots of width `S`. By pigeonhole, some slot holds at least `x_sat`
+  loaded units.
+- The sub-window `(t − S, t]` ending at that slot's last loaded event covers the whole slot. So
+  the **loaded** peak is at least `x_sat`, and the scored value equals the maximum, which is also
+  the true value, because the true peak is at least the loaded peak.
+- If the limit doesn't bind, the stream is complete and the value is exact.
+
+For a history-relative `peak`, `B` is computed first (pass order). If `B` is partial, it is a
+lower bound on the true baseline, so the `x_sat` sized from it is smaller than the true one:
+- if the limit binds, `v1` saturates at `rc`, which is at least the true `v1`;
+- if not, `P` is exact, and dividing by a smaller `B` only raises `v1`.
+
+Either way the result is one-sided upward, flagged `partial`.
+
+The second counter-example is `email.sends_10m_max` with `B = 50`: 5,000 units in one old slot and
+about 302 units in each newer slot. Here `x_sat = 50·300/d`. With `d = 1`, `N = 15,000·144 ≈ 2.2M`
+rows, far above the 50,000-row budget. So the budget binds first, and the feature is `partial` +
+`degraded` rather than silently reporting `v1 ≈ 6`. For fixtures, the budget never binds. In
+production this is an honest degradation, not a wrong value.
 
 **(c) Hitting a bound sets a flag; it's never a weight.**
-- `Output.Partial` lists features whose own budget was hit:
-  - a `relative_to_history` baseline over budget;
-  - the in-memory `group_by` adapter past `max_groups`;
-  - `neighbours` at its fan-in cap.
-- `core.history_truncated` no longer exists.
-- In the API, each signal gets `partial: ["custom.x", …]` (omitted when empty). The subject gets
-  `partial: true` when any advise rule's signal has partial features.
-- `partial` does **not** set `degraded`, because the rule was scored. Every partial computation is
-  one-sided toward *higher* risk:
-  - baselines only shrink;
-  - space-saving over-estimates;
-  - fan-in caps apply only to features required to be positively weighted.
+- `Output.Partial` lists features whose own budget was hit. `core.history_truncated` no longer
+  exists.
+- Every partial source is classified by direction:
 
-  So callers can read `partial` as "risk may be overstated by these features, never understated".
-- **Uniform rules** record `partial` like any rule. They are shadow-only, so it never affects a tier.
+| Partial source | Direction | Flags |
+| --- | --- | --- |
+| `relative_to_history` baseline budget hit | Value can only rise | `partial` |
+| History-relative `peak` whose limit binds after a partial baseline | Value can only rise | `partial` |
+| In-memory `group_by` space-saving with `reduce: max` and positive sign | Value can only rise | `partial` |
+| `peak` or anchored (class N) row budget hit before saturation | Value may undercount | `partial` + `degraded` |
+| `neighbours` examined-row budget hit before `K` | Value may undercount | `partial` + `degraded` |
+| Legacy `core.linked_*` fan-in cap hit | Value undercounts | `partial` + `degraded` |
+| Space-saving with `count_gte`, or with a negative sign or weight | Value may undercount | `partial` + `degraded` |
+| Class G budget hit | Direction unproven | `partial` + `degraded` |
+| `ratio` with a partial `num` | Inherits `num`'s flags | — |
+
+  Revision 3 claimed that fan-in caps apply only to positively weighted features and therefore err
+  upward. **That had the direction backwards:** an undercount lowers a positively weighted value.
+  It is corrected above.
+- **API.** Each signal gets `partial: ["custom.x", …]`, omitted when empty. `degraded` follows
+  main §4.4 and is also set when any advise rule has a feature that may undercount. The subject
+  gets `partial: true` when any advise rule's signal has partial features.
+  - Callers can read a bare `partial` as "risk may be overstated, never understated".
+  - `degraded` keeps its existing meaning: "don't trust a low score".
+- **Uniform rules** record the flags like any rule. They are shadow-only, so the flags never
+  affect a tier.
 
 **(d) Budgets are per feature and per pack. Changing one feature never moves another.**
 - A feature's value depends only on the facts, the counters, its own queries and its own budget.
@@ -724,12 +871,17 @@ encoding of each type):
 | Placement | Entirely before, interleaved with, and after the real events. Timestamps land inside, at the edges of, and outside every feature window, including future-dated events within skew. |
 | Volume | 1×, 10× and 100× each feature's saturation bound |
 
-The property holds by construction:
-- classes F, N and A are exact, so bounded equals reference;
-- `peak` is exact by saturation;
-- a partial `relative_to_history` value is never below the reference, and its weight is never
-  negative;
-- space-saving never under-counts.
+The property holds by construction, or the verdict is `degraded`:
+- Classes F and A are exact, so the bounded value equals the reference. Class N is exact until
+  its budget binds, which sets `degraded`.
+- `peak` is exact by raw-unit saturation, or `degraded` when its budget binds first.
+- `neighbours` is exact by saturation, or `degraded`.
+- A partial `relative_to_history` value is never below the reference, and its weight is never
+  negative.
+- Space-saving errs upward only for `max` with a positive sign. Every other combination is
+  `degraded`.
+- `ratio` can't take a partial-capable `den`.
+- Criterion 6b covers the anchor: `start` ignores `at` on everything except `subject.created`.
 
 The test also checks it empirically for every built-in and DSL feature on every fixture.
 
@@ -746,6 +898,9 @@ bounded evaluation switched on for e2a (§9).
 | `time_between` | `(−∞, now]`, via indexed first/last-match queries |
 | `sequence` | `a` rows from `(now − W − within, now]`; `b` rows from `(now − W, now]` |
 | `relative_to_history` baseline | `(now − lookback, now − exclude_recent]` |
+| `before_first` | Facts row (§5.7a), plus one boundary-day query on recount |
+| `lifetime` | `subject_counters` rows for the spec, minus an indexed `(now, +∞)` query for specs that exclude future-dated events |
+| `neighbours` | `links` index `(tenant, kind, hash)` for each `via` key, with `where` applied, up to `K` distinct subjects, under the examined-row budget |
 
 **Limits** (validated at load; also the fuzz oracle)
 
@@ -861,7 +1016,10 @@ behaviour on `main`. e2a has no staged rules, so its golden doesn't change.
   `CREATE INDEX CONCURRENTLY`.
 
 **New tables**
-- `event_subjects(tenant, subject_kind, subject, event_seq, via_parent)`: at most 8 rows per event.
+- `event_subjects(tenant, subject_kind, subject, type, at, event_seq, via_parent)`: at most 8
+  rows per event. Its index `(tenant, subject_kind, subject, type, at)` lets class A queries
+  through `also` and `via_parent` rows run as index-bounded range scans before the join to
+  `events` for pushed-down data predicates.
 - `subject_facts`.
 - `subject_counters(…, day, n, sum)`: expires with main §4.11's numeric retention.
 - `tenant_config_versions`.
@@ -941,7 +1099,7 @@ redaction boundary.
 - **Parent and `also` fan-out.** At most 8 index rows and 8 dirty marks per event, coalesced by
   `dirty_seq`.
 - **Hostile config or events.** There's no code or regex. Limits, per-feature budgets and exactness
-  apply, and partial computations are one-sided.
+  apply. Each partial source is either one-sided upward (`partial`) or flagged `degraded` (§5.7c).
 - **Brand-list change.** The facts spec version is bumped and a backfill runs; the affected
   features stay cold until it finishes.
 
@@ -1095,7 +1253,7 @@ features:
      share: {type: invite.sent, match: {field: target_class, eq: other_community}}, window: 24h, transform: {cap: 1}}
   - {name: custom.invites_blocked_within_10m, version: 1, description: invitees who blocked within 10 min,
      sequence: {a: {type: invite.sent}, b: {type: block.received}, within: 10m, on: {a: invitee_hash, b: blocker_hash}},
-     if_absent: 0, absent_sign: "+", window: 24h, transform: {log1p: true, cap: 6}}
+     if_absent: 0, absent_sign: "-", window: 24h, transform: {log1p: true, cap: 6}}   # absent = no `a` events at all: benign
   - {name: custom.linked_invite_share_24h, version: 1, description: invites with links,
      share: {type: invite.sent, match: {field: link_host, exists: true}}, window: 24h, transform: {cap: 1}}
   - {name: custom.phone_siblings_7d, version: 1, description: accounts sharing a phone created this week,
@@ -1142,7 +1300,7 @@ features:
      sequence: {a: {type: auth.attempted, where: {field: outcome, eq: failed}},
                 b: {type: auth.attempted, where: {field: outcome, eq: succeeded}},
                 within: 10m, on: {a: login_hash, b: login_hash}},
-     if_absent: 0, absent_sign: "+", window: 24h, transform: {log1p: true, cap: 6}}
+     if_absent: 0, absent_sign: "-", window: 24h, transform: {log1p: true, cap: 6}}   # absent = no `a` events at all: benign
   - {name: custom.hosting_share_1h, version: 1, subject_kinds: [api_key], description: attempts from hosting networks,
      share: {type: auth.attempted, match: {field: client_asn, eq: hosting}}, window: 1h, transform: {cap: 1}}
   - {name: custom.max_attempts_per_ip_1h, version: 1, subject_kinds: [api_key], description: busiest client network,
@@ -1267,16 +1425,16 @@ These come after #5 and #7 merge. P1 lands before any S5 or S8 PR (enforced as d
 | # | Slice | Contents | Depends on | Done when |
 | --- | --- | --- | --- | --- |
 | P0 | Golden replay | `abusekit eval --golden`; `(at, producer, id)` order; `reference-flat.jsonl` | #5, #7 | Golden committed; flipping one weight's last bit fails it |
-| P1 | One-time rename | Every §5.2 consumer and its test; `FeatureDef`; `core.Vector`; registry-order summation; fake-scorer re-baseline; `corpus-v2` + `feature_renamed` in `LoadSnapshotCorpus` and `score --jsonl`; reason v2; corpus key-space migration; cassette header; `TestNoVendorAdapterBeforeRename` | P0 | `reference-ns.jsonl` bit-exact for values, risks and tiers; grep test clean |
+| P1 | One-time rename | Every §5.2 consumer and its test; `FeatureDef`; `core.Vector`; registry-order summation; fake-scorer re-baseline; `corpus-v2` + `feature_renamed` in `LoadSnapshotCorpus` and `score --jsonl`; reason v2; corpus key-space migration; cassette header; `TestNoProductionBeforeRename` (guards S5 and S8) | P0 | `reference-ns.jsonl` bit-exact for values, risks and tiers; grep test clean |
 | P1s | Stage gate | `maxRiskByScorer` limited to advise-mode local rules | P1 | Stage tests pass; golden exact |
 | P2 | Tenant profiles | Private-mount loader; reference profile; per-tenant reload, `/healthz`, rule sets and scorer version; fair queue and concurrency cap. All built-in features available to every tenant. | P1 | Golden exact; isolation and fairness tests |
 | P3a | Vocabulary and scans | `internal/vocab`; kinds (numbers require `max`); roles; `x_` fields; declared-domain PSL, `etld1` and IP checks; card/IP/phone scans with digit folding; `subject_line` masking; egress scan; drop-undeclared with name grammar; account-subject leak scan; ASN grammar; profile-load scans | P2 | Criterion 5 (non-key parts); golden exact or deviations justified |
 | P3b | Keys and re-HMAC | `internal/secret` (HKDF, file adapter); re-HMAC of hashes and links with `join_domain`; domain allowlist/HMAC (built-in and declared); pseudonymised non-account and `also` ids; `RedactionSchemaVersion` 3; dev/staging migration job; cross-tenant key test | P3a | Criterion 5 complete; golden exact; migration test |
 | P3c | Config history | `history/`; `abusekit config check`; `tenant_config_versions` | P2 | History CI tests |
 | P3d | Rotation and cloud keys | Dual-key write, read and flip; `__prev` fields; `key_id`; cloud secret-manager adapter | P3b | Equality exact across a simulated rotation; adapter contract test |
-| P4a | Facts and counters | `subject_facts`, `subject_counters`; ingest transaction; onboarding, brand and self-send facts; anchored freeze; backfill and cold state; Go features moved onto classes F and N | P3a | Golden exact; blocked-payment flood test; out-of-order fact tests |
+| P4a | Facts and counters | `start` precedence; `subject_facts` and `subject_counters`; the lock-first ingest transaction; recount on `∞ → t` and on earlier moves (daily decline counters plus a boundary-day query on a partial index); onboarding, brand and self-send facts; generic `before_first` fact specs; webmail counters subtracting `(now, +∞)`; anchored freeze using its **own** anchored-range query (legacy Go code over `[start, start + A)`), with invalidation on `start` change or backfill; fact and counter subject assignment for `also`/`via_parent`; retention-aligned counter expiry; backfill with a `retained_from` watermark | P3a | Golden exact (or `start` deviations justified); blocked-payment and pre-dated flood tests (6b); the permutation and concurrent-interleaving test (a2); the lost-decline race test |
 | P4b | Aggregate engine (class A) | `internal/evalengine` (Postgres and in-memory); `count`, `sum`, `share`, `distinct`, `group_by`, `time_between` + `__absent`, `sequence`, `ratio`; pushdown and indexes; conformance | P4a | Reference equality on 10k histories; adapter equivalence |
-| P4c | Class R, budgets, flags, flood | `peak` (with `sum`) under the saturation limit; `relative_to_history` with its baseline budget; `partial` in verdicts and the API; pass order; `TestFeatureIndependence`; flood generator and property; cost benchmark. **Then enable bounded evaluation for e2a.** | P4b | Criteria 4 and 6; golden exact under the bounded evaluator |
+| P4c | Class R, budgets, flags, flood | `peak` (with `sum`) under the raw-unit saturation limit per transform (§5.7); `neighbours` exact by saturation; the partial/degraded direction table; `ratio` partial propagation and `ratio_den_partial_capable`; `relative_to_history` with its baseline budget; `partial` in verdicts and the API; pass order; `TestFeatureIndependence`; flood generator and property; cost benchmark. **Then enable bounded evaluation for e2a.** | P4b | Criteria 4 and 6; golden exact under the bounded evaluator |
 | P4d | Rescore control and warm-up | Proportional coalescing; timers only from non-shadow rules; per-tenant budget; warm-up | P4c, P3c | Storm and warm-up tests |
 | P5 | Pack gating | Registry; `core`, `email` and `brand` adapters; enablement; `brand.title_match` (needs the `title` role); `packtest`; starter weights | P3a, P4c | Golden exact; `feature_not_enabled`; every pack passes `packtest` |
 | P5b | DSL parity | Every expressible #7/S2 feature re-expressed in the DSL | P4c | Bit-exact against the Go feature on every fixture |
@@ -1285,7 +1443,10 @@ These come after #5 and #7 merge. P1 lands before any S5 or S8 PR (enforced as d
 | P7 | e2a cutover | Private profile in the ops mount; hosted `config check` | P5, P4c, S8's mount | Golden exact against the private copy |
 
 Two v0 slices interact with this plan:
-- S3b must be vocabulary-aware and must clear facts and counters. It is easiest after P4a.
+- **S3b** must be vocabulary-aware. Its **done-when** includes a test that erasing a non-abusive
+  subject deletes its `subject_facts` and `subject_counters` rows. A second test checks that an
+  `abusive`-labelled subject keeps only numeric facts and counters under the 24-month basis. S3b
+  is easiest after P4a.
 - S6 is independent of all of the above.
 
 ## 10. Scalability and extensibility
@@ -1371,10 +1532,13 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
 7. **Bounding:**
    - Revision 2: byte caps, a shared step budget and a weighted truncation feature.
    - R3: ingest facts, counters, per-feature budgets, and truncation as a flag.
-   - **Now:** R3, plus exact per-feature aggregates. The only bounded pieces left are the
-     one-sided `relative_to_history` baselines and the in-memory `group_by` fallback.
+   - **Now:** R3, plus exact per-feature aggregates.
+   - **Revision 4:** `peak` is sized in raw units per transform, and `neighbours` is exact by
+     saturation. Anything that can undercount (row, anchored, neighbour and G budgets;
+     space-saving outside `max`+positive) sets `partial` + `degraded`.
 
-   Confirm the 50,000-row baseline budget and `max_groups` of 1,000?
+   Confirm the 50,000-row budgets (baseline, `peak`, anchored, neighbour examined rows) and
+   `max_groups` of 1,000?
 8. **Bootstrap:** uniform priors, shadow-only, no fitting, held-out fixtures, and `__absent`
    indicators with `absent_sign`. Confirm?
 9. **CEL:** later as a `where` leaf only, or a new design pass? Unchanged.
@@ -1413,8 +1577,22 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
     - **Now:** R3.
 
     Approve?
-22. **`partial` flag:** it doesn't set `degraded`, because every partial computation is one-sided
-    toward higher risk. Should callers treat it like `degraded` anyway?
+22. **`partial` flag:**
+    - Revision 3: `partial` never set `degraded`.
+    - Verification: that was wrong for undercounting sources.
+    - **Now (revision 4):** a bare `partial` means the value can only have risen. Any source that
+      may undercount also sets `degraded` (§5.7c table).
+
+    Should callers still treat a bare `partial` like `degraded`?
+23. **`start` precedence (revision 4, new):** `account_created_at`, then the first accepted
+    `subject.created` `at`, then server `first_received_at`. This replaces `LEAST(at)`, so a
+    pre-dated flood can't age an account. It may change `start` for fixtures whose events precede
+    `subject.created`; P4a lists them. Approve?
+24. **Key-independent `body_hash` (revision 4, new):** SHA-256 over the redacted body before
+    pseudonymisation, so rotation and the re-HMAC migration never break duplicate/conflict
+    detection. Approve?
+25. **Dirty marks beyond the fan-in cap (revision 4, new):** the first 50 per key are marked in
+    the ingest transaction, and the rest by a rate-budgeted background job. Confirm?
 
 ## 13. Changes from earlier revisions
 
@@ -1490,3 +1668,75 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
 - P4 is split into P4a–P4d, and P5b is added.
 - P5 now needs P3a and P4c, and P6a needs P3b.
 - A test enforces that P1 lands first.
+
+### Revision 4 (addendum, after verification of revision 3)
+
+**Blocking fixes (P4a, P4c)**
+1. **`peak` exactness.** The limit is now sized in **raw units** per transform (§5.7 saturation
+   sizing):
+   - `x_sat` is `C`, `⌈e^C − 1⌉` or `⌈e^(C/s) − 1⌉`.
+   - With `relative_to_history`, `x_sat = ⌈max(B,1)·min(rc, T⁻¹(C)/d)⌉`, computed after the
+     baseline.
+   - `N = x_sat·⌈W/S⌉` rows. The pigeonhole argument is restated over loaded units.
+   - If the row budget binds before `N`, the feature is `partial` + `degraded`.
+   - Both verification counter-examples are worked through.
+2. **`neighbours`.**
+   - `where` is applied before any limit, and the query counts up to `K = ⌈T⁻¹(cap)⌉ + 1`, so the
+     count is exact by saturation. An examined-row budget hit sets `degraded`.
+   - Legacy `core.linked_*` caps now also set `partial` + `degraded`.
+   - The backwards direction claim in §5.7c is corrected.
+3. **`start` is defined** by precedence: `account_created_at`, then the first accepted
+   `subject.created` by `received_at`, then server `first_received_at`.
+   - Criterion 6b is restated.
+   - Frozen class N facts carry `anchored_start` and are recomputed when `start` changes or a
+     backfill-scope event lands in the anchor.
+4. **Recount locking.**
+   - The facts row lock is taken first (`INSERT … ON CONFLICT … RETURNING` / `FOR UPDATE`). The
+     lost-decline race is given as the counter-example.
+   - The recount costs O(days + boundary-day declines), using daily decline counters plus a
+     partial index.
+   - It fires on `∞ → t` and on earlier moves.
+5. **Webmail counters** subtract future-dated events over `(now, +∞)`, matching legacy and
+   covering backfill keys that are exempt from the skew check.
+6. **`also`/`via_parent`.**
+   - Onboarding facts are updated for the primary subject only.
+   - Counters are updated for every index row whose kind is in the spec.
+   - `event_subjects` gains `type` and `at`, with a matching index, so class A queries through
+     parents are index-bounded.
+7. **`ratio`.** Partial status propagates into class D. A partial-capable `den` is rejected at
+   load (`ratio_den_partial_capable`).
+
+**Text fixes**
+- Space-saving direction: only `max` with a positive sign is upward. `count_gte` and negative signs
+  are `degraded`.
+- The facts row is restated as a deterministic function of the accepted event set, backed by a
+  permutation and concurrent-interleaving test.
+- The leak scan covers strings only, so declared numbers are exempt. Phone shapes need `+` or
+  grouping, so 10-digit ASNs pass.
+- `in_set`/`suffix_in_set` on domain fields are evaluated at ingest into a derived bool.
+- Literals and set files on hash fields are HMACed at load, under both keys during rotation.
+- `body_hash` is computed over a key-independent canonical form, so the migration no longer
+  recomputes it.
+- Class G budgets are per feature, with `partial` + `degraded` on a hit. G is empty for e2a.
+- `distinct_recipients_1h` is consistently A (current) + R (baseline).
+- §1 criterion 6 is restated relative to the unbounded reference, with the frozen dilution
+  semantics (`burst_ratio`, webmail share) noted.
+- Erasure and re-signup intent for facts and counters is specified. Counter expiry is aligned with
+  event retention, and backfills carry a `retained_from` watermark.
+- Load-plan rows are added for `before_first`, `lifetime` and `neighbours`, with a generic fact
+  spec for custom `before_first`.
+- `age_decay` features default to `hash_quantum` `0.01 × cap`.
+- Dirty marks beyond the fan-in cap are handled by a rate-budgeted background job.
+- The `address_domain` `none` exception is removed.
+- The 7c/7d sequence `absent_sign` is `-`.
+
+**Slices**
+- P4a's anchored freeze uses its own anchored-range query, not the P4b engine.
+- S3b's done-when includes the facts/counters erasure tests.
+- `TestNoProductionBeforeRename` guards S8 as well as S5, by refusing production startup before
+  the rename.
+
+**Decisions**
+- Q7 and Q22 are revised.
+- Q23 (`start` precedence), Q24 (key-independent `body_hash`) and Q25 (dirty marks beyond the cap)
+  are new.
