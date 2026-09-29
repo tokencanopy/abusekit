@@ -3,3 +3,5 @@
 run/
 .env
 .env.*
+.gate-abusekit
+.gate-run.json

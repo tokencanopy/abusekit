@@ -1,0 +1,100 @@
+# eval/floors.yaml — the CI gate's floors (design §4.10 / docs/plans/
+# 2026-09-27-v0-plan.md's S4 row: "make gate ... fails below eval/
+# floors.yaml").
+#
+# `make gate` runs `abusekit eval --dataset eval/fixtures/synthetic/
+# events.jsonl --labels eval/fixtures/synthetic/labels.jsonl --rule
+# new_account_velocity --scorer local --slice full --floors eval/
+# floors.yaml` and fails (exit 1) if any entry below is violated, or
+# exit 2 if the (rule, scorer, slice) being run has no matching entry at
+# all (fix round S1) or a value here is outside [0,1] (also S1).
+#
+# Fix round T5 (review round 2): the corpus changed again (jittered
+# prepaid-share in abusive families instead of a fixed 100%, a
+# near-rule-threshold benign_prepaid variant, second-grain timing on
+# every benign family, churn's new label events) — a genuinely harder,
+# more realistic corpus, not a weight retune, so every floor below is
+# re-derived from a fresh run against the regenerated eval/fixtures/
+# synthetic/{events,labels}.jsonl (2026-09-28): precision 0.8036 (45/56),
+# recall 0.8333 (45/54), ECE 0.1108, AUROC 0.9735, high-tier recall
+# 0.7222 (39/54); family high-tier recall: burst 0.8333 (5/6),
+# churn_incarnation_ge3 1.0 (18/18), dormant_then_blast 1.0 (6/6). Most
+# of the movement (recall/high-tier-recall down, several per-family
+# numbers down) comes directly from abusive subjects no longer all
+# paying with a prepaid card — a real, intended increase in task
+# difficulty (fix round T5: "recall should now vary across seeds"), not a
+# regression to paper over.
+#
+# Each floor below is that run's own number minus a SMALL ABSOLUTE MARGIN
+# (not the Wilson lower bound this file used before the first fix round —
+# small per-family sample sizes, especially burst and dormant_then_blast
+# at n=6, make the Wilson bound alone too tight/noisy a floor to re-derive
+# every run). The margin is wider for the two n=6 families than for the
+# corpus-wide metrics (n in the hundreds) for exactly that reason, EXCEPT
+# max_ece — see below.
+#
+# To raise a floor after a genuine improvement (a real weight retune, a
+# new calibration, a better scorer): re-run the command above, confirm
+# the new numbers, and move each floor up to (new value - the same kind
+# of margin) — never past what was actually observed, and never as a way
+# to silence a regression rather than fix one. Lowering a floor requires
+# the same PR-review bar as any other config change; it should never
+# happen in the same PR that also regresses the metric it's lowering.
+#
+# The full weight-zeroing proof (zeroing each of the 18
+# config/local_weights.yaml weights, one at a time, and re-running this
+# exact command against the current corpus) is documented in the PR
+# body's weight-sweep table, including which weight(s) — if any — this
+# floor set does not catch and why.
+#
+# min_high_tier_recall is 0.60, not baseline-minus-the-usual-margin
+# (0.7222 - ~0.09 would round to ~0.63): at n=54 abusive subjects, zeroing
+# burst_ratio_24h_vs_lifetime, first_day_distinct_domains, or
+# linked_labelled_abusive_n each independently moves this metric to the
+# EXACT same value (34/54 = 0.6296 — verified, not a rounding
+# coincidence), so no threshold on this metric alone can catch one of
+# those three without also catching the other two. Since burst_ratio and
+# linked_labelled_abusive_n are the deliberately-NOT-gate-breaking weights
+# from the sweep (T3: burst_ratio is an S5-calibration candidate with no
+# weight change; linked_labelled_abusive_n is real but not solely
+# load-bearing yet), 0.60 is set below that tie point rather than above
+# it — trading away this floor's ability to catch first_day_distinct_
+# domains alone, honestly reported in the PR body's sweep table
+# (first_day_distinct_domains, self_send_before_external, and
+# linked_deleted_n are, this round, not independently caught by ANY
+# current floor — a real reduction in gate sensitivity from round 1,
+# where all three broke the gate; a bigger abusive corpus, or a
+# mutation_test.go-style isolated scenario the way neighbors_truncated/
+# name_has_at already need, would restore it).
+#
+# A NEGATIVE-signed weight (subject_age_h, upgrade_delay_min) zeroed out
+# can only ever move recall/high-tier-recall/family-recall UP, never
+# down — those floors are all one-sided minimums and structurally cannot
+# catch a negative weight going missing. Only precision and ECE can move
+# the "wrong" way when a negative weight is removed (a small penalty that
+# used to hold a few borderline scores down is gone), so max_ece is set
+# with a deliberately TIGHT margin (baseline 0.1108, floor 0.115 — a
+# 0.0042 margin, not the wider ~0.02-0.04 margins used elsewhere in this
+# file) specifically so it — not min_precision, which doesn't move for
+# either of these two weights — is what catches them. Confirmed against
+# the current corpus: zeroing subject_age_h (ECE 0.1327) or
+# upgrade_delay_min (ECE 0.1181) each still fails this floor on their
+# own; see the PR body's weight-sweep table. (T5's harder corpus narrowed
+# the honest ECE margin from T3's 0.0063 to 0.0042 — upgrade_delay_min's
+# zeroed-ECE moved closer to baseline than before — so this floor may
+# need re-tightening again the next time the corpus changes; the
+# TestGate_NegativeWeightRegressionCaughtByTightECEFloor test below
+# exists precisely to catch that drift.)
+floors:
+  - rule: new_account_velocity
+    scorer: local
+    slice: full
+    min_precision: 0.72
+    min_recall: 0.77
+    max_ece: 0.115
+    min_auroc: 0.93
+    min_high_tier_recall: 0.60
+    family_min_high_tier_recall:
+      burst: 0.60
+      churn_incarnation_ge3: 0.85
+      dormant_then_blast: 0.60

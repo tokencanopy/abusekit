@@ -285,3 +285,68 @@ func TestInsertCorpusExample_RoundTrips(t *testing.T) {
 		t.Fatalf("expected a non-zero corpus example id")
 	}
 }
+
+// TestListCorpusExamples_JoinsLabelAndFiltersSplit is S4's own addition
+// (cmd/abusekit's `corpus export`): two corpus_examples rows, one train
+// one test, each joined back to its own labels row's label/source/rule —
+// and a --split filter that only ever returns the matching one.
+func TestListCorpusExamples_JoinsLabelAndFiltersSplit(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := mustTime(t, "2031-09-27T12:00:00Z")
+
+	appendAt(t, ctx, s, "acct_corpus_train", "subject.created", now, map[string]any{"channel": "signup"})
+	trainLabelID, err := s.PutLabel(ctx, testTenant, store.Label{Subject: "acct_corpus_train", Label: "benign", Source: "operator", Actor: "test-operator"})
+	if err != nil {
+		t.Fatalf("PutLabel(train): %v", err)
+	}
+	if _, err := s.InsertCorpusExample(ctx, testTenant, store.CorpusExample{
+		Subject: "acct_corpus_train", LabelID: trainLabelID, DecisionAt: now,
+		EventSlice: []map[string]any{{"id": "e1", "type": "subject.created"}},
+		Features:   map[string]float64{"subject_age_h": 0},
+		Split:      "train",
+	}); err != nil {
+		t.Fatalf("InsertCorpusExample(train): %v", err)
+	}
+
+	appendAt(t, ctx, s, "acct_corpus_test", "subject.created", now, map[string]any{"channel": "signup"})
+	testLabelID, err := s.PutLabel(ctx, testTenant, store.Label{Subject: "acct_corpus_test", Rule: "new_account_velocity", Label: "abusive", Source: "outcome", Actor: "test-operator"})
+	if err != nil {
+		t.Fatalf("PutLabel(test): %v", err)
+	}
+	if _, err := s.InsertCorpusExample(ctx, testTenant, store.CorpusExample{
+		Subject: "acct_corpus_test", LabelID: testLabelID, DecisionAt: now,
+		EventSlice: []map[string]any{{"id": "e2", "type": "subject.created"}},
+		Features:   map[string]float64{"subject_age_h": 1},
+		Split:      "test",
+	}); err != nil {
+		t.Fatalf("InsertCorpusExample(test): %v", err)
+	}
+
+	all, err := s.ListCorpusExamples(ctx, testTenant, "all")
+	if err != nil {
+		t.Fatalf("ListCorpusExamples(all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListCorpusExamples(all) returned %d rows, want 2", len(all))
+	}
+
+	trainOnly, err := s.ListCorpusExamples(ctx, testTenant, "train")
+	if err != nil {
+		t.Fatalf("ListCorpusExamples(train): %v", err)
+	}
+	if len(trainOnly) != 1 || trainOnly[0].Subject != "acct_corpus_train" || trainOnly[0].Label != "benign" || trainOnly[0].LabelSource != "operator" {
+		t.Fatalf("ListCorpusExamples(train) = %+v, want exactly the acct_corpus_train row with its label/source joined", trainOnly)
+	}
+
+	testOnly, err := s.ListCorpusExamples(ctx, testTenant, "test")
+	if err != nil {
+		t.Fatalf("ListCorpusExamples(test): %v", err)
+	}
+	if len(testOnly) != 1 || testOnly[0].Subject != "acct_corpus_test" || testOnly[0].Label != "abusive" || testOnly[0].LabelSource != "outcome" || testOnly[0].Rule != "new_account_velocity" {
+		t.Fatalf("ListCorpusExamples(test) = %+v, want exactly the acct_corpus_test row with its label/source/rule joined", testOnly)
+	}
+	if testOnly[0].Gated {
+		t.Errorf("Gated = true, want false — nothing in this repo sets it yet (see corpus_cmd.go's doc comment)")
+	}
+}
