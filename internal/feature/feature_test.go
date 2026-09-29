@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +45,7 @@ func (f *fakeNeighbors) Evidence(context.Context, string, string) (NeighborEvide
 }
 
 func TestExtract_EmptyHistory(t *testing.T) {
-	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", nil, nil, defaultWindows(0), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -54,7 +56,7 @@ func TestExtract_EmptyHistory(t *testing.T) {
 
 func TestExtract_RequiresWindowsNow(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when windows.Now is zero")
 	}
@@ -62,7 +64,7 @@ func TestExtract_RequiresWindowsNow(t *testing.T) {
 
 func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, nil, Windows{Now: at(time.Hour)}, BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected an error when OneHour/DayHour are unset")
 	}
@@ -70,7 +72,7 @@ func TestExtract_RequiresPositiveWindowDurations(t *testing.T) {
 
 func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -82,7 +84,7 @@ func TestExtract_NilNeighborsTreatedAsNoNeighbors(t *testing.T) {
 func TestExtract_NeighborEvidenceError(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{err: errors.New("boom")}
-	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	_, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err == nil {
 		t.Fatalf("expected Extract to propagate a Neighbors.Evidence error")
 	}
@@ -91,7 +93,7 @@ func TestExtract_NeighborEvidenceError(t *testing.T) {
 func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 2, LabelledAbusiveCount: 3, FingerprintShared: true, Truncated: true}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
@@ -107,12 +109,87 @@ func TestExtract_LinkedFeaturesFromNeighbors(t *testing.T) {
 func TestExtract_LinkedDeletedNSaturates(t *testing.T) {
 	events := []event.Event{ev("e1", "subject.created", 0, nil)}
 	fake := &fakeNeighbors{evidence: NeighborEvidence{DeletedCount: 19}}
-	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{})
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, fake, defaultWindows(time.Hour), BrandSet{}, WebmailSet{})
 	if err != nil {
 		t.Fatalf("Extract: %v", err)
 	}
 	if res.Features.LinkedDeletedN != 3 {
 		t.Errorf("LinkedDeletedN = %v, want saturated at 3 (S1 fix round)", res.Features.LinkedDeletedN)
+	}
+}
+
+// --- [round 2] R8: subject.created's optional account_created_at --------
+
+func TestAccountCreatedAt_PreferredOverEarliestEvent(t *testing.T) {
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "2030-11-02T00:00:00Z"}), // 60 days before base
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	got, ok := accountCreatedAt(events)
+	if !ok {
+		t.Fatalf("expected account_created_at to be found")
+	}
+	want := time.Date(2030, time.November, 2, 0, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Errorf("accountCreatedAt = %v, want %v", got, want)
+	}
+}
+
+func TestAccountCreatedAt_AbsentFallsBack(t *testing.T) {
+	events := []event.Event{
+		ev("e1", "subject.created", 0, nil),
+		ev("e2", "content.sent", time.Minute, nil),
+	}
+	if _, ok := accountCreatedAt(events); ok {
+		t.Errorf("expected accountCreatedAt to report absent when no subject.created carries the field")
+	}
+}
+
+func TestAccountCreatedAt_InvalidStringFallsBack(t *testing.T) {
+	// Redact itself rejects a malformed account_created_at at ingest, but
+	// Extract must still degrade gracefully for a caller/test that hands
+	// it a raw, never-redacted event rather than panicking or picking a
+	// garbage time.
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "not-a-timestamp"}),
+	}
+	if _, ok := accountCreatedAt(events); ok {
+		t.Errorf("expected accountCreatedAt to report absent for an unparseable value")
+	}
+}
+
+func TestExtract_AccountCreatedAtOverridesFirstSeenAt(t *testing.T) {
+	// An account onboarded onto abusekit only 5 minutes ago, but whose
+	// producer reports it actually signed up 60 days earlier: every
+	// history-relative/age-decay feature must treat it as 60 days old,
+	// not as brand new — R8's whole point (an un-backfilled established
+	// account otherwise reads identically to a genuinely new one).
+	events := []event.Event{
+		ev("e1", "subject.created", 0, map[string]any{"account_created_at": "2030-11-02T00:00:00Z"}), // 60 days before base
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(5*time.Minute), BrandSet{}, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.SubjectAgeH != subjectAgeClampHours {
+		t.Errorf("SubjectAgeH = %v, want the %v clamp ceiling (account_created_at is 60 days before the earliest ingested event)", res.Features.SubjectAgeH, subjectAgeClampHours)
+	}
+}
+
+func TestExtract_NoAccountCreatedAtUsesEarliestEvent(t *testing.T) {
+	// Without the field, behavior is unchanged from before R8: firstSeenAt
+	// is still the earliest ingested event.
+	events := []event.Event{
+		ev("e1", "subject.created", 0, nil),
+		ev("e2", "content.sent", time.Minute, map[string]any{"recipient_domain": "example.test"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(5*time.Minute), BrandSet{}, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.SubjectAgeH != 5.0/60 {
+		t.Errorf("SubjectAgeH = %v, want 5/60 (no account_created_at: age is measured from the earliest ingested event)", res.Features.SubjectAgeH)
 	}
 }
 
@@ -388,19 +465,19 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 	brands := smallTestBrands()
 	t.Run("brand match on the raw name", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
-		if got := nameBrandMatch(events, brands); got != 1 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
 			t.Errorf("name_brand_match = %v, want 1", got)
 		}
 	})
 	t.Run("no brand match", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "Notifications Agent"})}
-		if got := nameBrandMatch(events, brands); got != 0 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 0 {
 			t.Errorf("name_brand_match = %v, want 0", got)
 		}
 	})
 	t.Run("empty BrandSet never matches", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
-		if got := nameBrandMatch(events, BrandSet{}); got != 0 {
+		if got := boolToFloat(len(namedBrandNames(events, BrandSet{})) > 0); got != 0 {
 			t.Errorf("name_brand_match with an empty BrandSet = %v, want 0", got)
 		}
 	})
@@ -418,7 +495,7 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 		// is about resource.deleted being checked at all, not about that
 		// gate, so it uses a name the gate leaves alone.
 		events := []event.Event{ev("r1", "resource.deleted", 0, map[string]any{"name": "PayPal Alert"})}
-		if got := nameBrandMatch(events, brands); got != 1 {
+		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
 			t.Errorf("name_brand_match = %v, want 1", got)
 		}
 	})
@@ -861,5 +938,511 @@ func TestLoadBrandsFile_Round3Probes(t *testing.T) {
 		if brands.Matches(name) {
 			t.Errorf("brands.Matches(%q) = true, want false (integration-token gate must still fire after the i-fold)", name)
 		}
+	}
+}
+
+// TestLoadBrandsFile_S2bExtraBrands checks the shipped config/brands.yaml
+// against the marketplace/social/shipping additions (scope's "extra
+// public brands" item) and N1's case-sensitive UPS entry.
+func TestLoadBrandsFile_S2bExtraBrands(t *testing.T) {
+	brands, err := LoadBrandsFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("LoadBrandsFile: %v", err)
+	}
+
+	mustMatch := []string{
+		"Your eBay listing sold",
+		"Poshmark payout pending",
+		"Vinted account verification",
+		"Your TikTok account was reported",
+		"Facebook security alert",
+		"Your Booking.com reservation",
+		"UPS: delivery exception",
+	}
+	for _, name := range mustMatch {
+		if !brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = false, want true", name)
+		}
+	}
+
+	mustNotMatch := []string{
+		"it has its ups and downs", // N1: lower-case "ups" must not match
+	}
+	for _, name := range mustNotMatch {
+		if brands.Matches(name) {
+			t.Errorf("brands.Matches(%q) = true, want false", name)
+		}
+	}
+
+	// N2/round 2's R3: the community-phrase gate applies to SUBJECT LINES
+	// only, never to a resource/agent name (Matches/MatchedBrandNames) —
+	// see TestBrandSet_NameMatchingNeverCommunityGated for that half.
+	if len(brands.MatchedBrandNamesForSubject("Facebook group meetup")) != 0 {
+		t.Errorf("MatchedBrandNamesForSubject(%q) matched, want none (N2: community context)", "Facebook group meetup")
+	}
+}
+
+// TestBrandsYAML_CategoryCommentsStayGeneric is round 2's H1: a category
+// comment in config/brands.yaml must describe the CATEGORY (marketplace,
+// social, shipping) only, never pair it with a specific quoted lure theme
+// observed for that category's brands — the same hygiene rule applied to
+// fixtures/PR text/commits extended to the shipped config file itself.
+// Reads the raw file text (LoadBrandsFile only sees the parsed brand
+// names, never the comments) and asserts none of the specific lure
+// phrases a prior round's category comments quoted are present anywhere
+// in it.
+func TestBrandsYAML_CategoryCommentsStayGeneric(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "config", "brands.yaml"))
+	if err != nil {
+		t.Fatalf("read brands.yaml: %v", err)
+	}
+	text := string(raw)
+
+	bannedLurePhrases := []string{
+		"your listing",
+		"your order",
+		"account security",
+		"policy violation",
+		"package delivery",
+	}
+	for _, phrase := range bannedLurePhrases {
+		if strings.Contains(strings.ToLower(text), phrase) {
+			t.Errorf("config/brands.yaml contains the quoted lure phrase %q — category comments must stay generic (H1), never pair a brand category with a specific lure theme", phrase)
+		}
+	}
+}
+
+// --- S2b: resource-kind aliases (N4) ------------------------------------
+
+func TestNormalizeResourceKind_Aliases(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{"key", "key"},
+		{"Key", "key"},
+		{"KEYS", "key"},
+		{"api_key", "key"},
+		{"api_keys", "key"},
+		{"api-key", "key"},
+		{"apikey", "key"},
+		{"API Key", "key"},
+		{"api key", "key"},
+		{"agent", "agent"}, // not a key alias: passes through unchanged
+	}
+	for _, tt := range tests {
+		if got := normalizeResourceKind(tt.raw); got != tt.want {
+			t.Errorf("normalizeResourceKind(%q) = %q, want %q", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestKeyVelocity_RecognisesAliasedKinds(t *testing.T) {
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "api_key"}),
+		ev("r2", "resource.created", 0, map[string]any{"kind": "API Key"}),
+		ev("r3", "resource.created", 0, map[string]any{"kind": "keys"}),
+		ev("r4", "resource.created", 0, map[string]any{"kind": "agent"}),
+	}
+	got := resourceCount(events, resourceKindKey, at(0), time.Hour)
+	if got != 3 {
+		t.Errorf("key_velocity_1h with aliased kinds = %v, want 3 (the agent kind must not count)", got)
+	}
+}
+
+// --- S2b: send-volume young-account scoping (B1) ------------------------
+
+// TestSends1h_HistoryRelativeNotCalendarGated is round 2's R1: a young
+// account with NO prior sending history reads its current burst at
+// (nearly) full strength; the SAME current volume from an account with a
+// real, comparable prior baseline reads far lower — replacing round 1's
+// hard 7-day cliff (which any of this ever landed the same score for,
+// purely by calendar age, regardless of prior history).
+func TestSends1h_HistoryRelativeNotCalendarGated(t *testing.T) {
+	firstSeenAt := base
+	events := []event.Event{
+		ev("c1", "content.sent", 6*24*time.Hour, map[string]any{"recipient_count": float64(50)}),
+	}
+	young := sends1h(events, firstSeenAt.Add(6*24*time.Hour), firstSeenAt, time.Hour)
+	if young <= 0 {
+		t.Errorf("sends_1h (young account, no prior history) = %v, want a strongly positive burst_factor-driven value", young)
+	}
+
+	// An established account (60 days old) with a comparable REAL prior
+	// baseline sending the SAME current volume must read far lower than a
+	// brand-new account with no history at all would for the same burst —
+	// never a hard 0 the way the old calendar gate produced, but heavily
+	// discounted by BOTH burstFactor (a real baseline to compare against)
+	// and ageDecayFactor (floored at 0.2, never fully gone).
+	establishedEvents := []event.Event{
+		// A comparable prior 10-minute peak within the last 30 days
+		// (excluding the trailing 24h "current" period).
+		ev("c0", "content.sent", 60*24*time.Hour-48*time.Hour, map[string]any{"recipient_count": float64(300)}),
+		ev("c1", "content.sent", 60*24*time.Hour, map[string]any{"recipient_count": float64(300)}),
+	}
+	oldNow := firstSeenAt.Add(60 * 24 * time.Hour)
+	old := sends1h(establishedEvents, oldNow, firstSeenAt, time.Hour)
+	if old <= 0 {
+		t.Errorf("sends_1h (established, real prior baseline) = %v, want > 0 (never a hard 0)", old)
+	}
+	if old >= young {
+		t.Errorf("sends_1h established=%v must read LOWER than young=%v despite an equal or larger raw burst", old, young)
+	}
+}
+
+func TestSends10mMax_GatedByAccountAgeAndCappedNotLifetime(t *testing.T) {
+	firstSeenAt := base
+	// A burst inside the first week counts.
+	events := []event.Event{
+		ev("c1", "content.sent", time.Hour, map[string]any{"recipient_count": float64(120)}),
+		ev("c2", "content.sent", time.Hour+5*time.Minute, map[string]any{"recipient_count": float64(80)}),
+	}
+	now := firstSeenAt.Add(2 * time.Hour)
+	got := sends10mMax(events, now, firstSeenAt)
+	if got != 200 {
+		t.Errorf("sends_10m_max (young account) = %v, want 200 (both events in the same 10m window)", got)
+	}
+
+	// The SAME historical burst, viewed 60 days later (an established
+	// sender), must no longer register at all — B1: "the flag never
+	// decays" is exactly the bug this gate closes.
+	longAfter := firstSeenAt.Add(60 * 24 * time.Hour)
+	gotLater := sends10mMax(events, longAfter, firstSeenAt)
+	if gotLater != 0 {
+		t.Errorf("sends_10m_max (60 days after a first-week burst) = %v, want 0", gotLater)
+	}
+}
+
+func TestSendsFirstDay_NotGatedByAccountAge(t *testing.T) {
+	firstSeenAt := base
+	events := []event.Event{ev("c1", "content.sent", time.Hour, map[string]any{"recipient_count": float64(40)})}
+	// SendsFirstDay is a permanent day-1 fact: it must still report the
+	// same value long after the account has matured, unlike its
+	// history-relative siblings Sends1h/Sends10mMax/WebmailSends1h/
+	// DistinctRecipients1h.
+	now := firstSeenAt.Add(60 * 24 * time.Hour)
+	got := sendsFirstDay(events, firstSeenAt, now, 24*time.Hour)
+	if got != 40 {
+		t.Errorf("sends_first_day (60 days later) = %v, want 40 (permanent, not gated)", got)
+	}
+}
+
+func TestSends10mMax_FutureDatedEventsExcluded(t *testing.T) {
+	// N5: an event dated after `now` must not be counted.
+	events := []event.Event{ev("c1", "content.sent", 2*time.Hour, map[string]any{"recipient_count": float64(999)})}
+	now := at(time.Hour)
+	if got := sends10mMax(events, now, base); got != 0 {
+		t.Errorf("sends_10m_max with a future-dated event = %v, want 0", got)
+	}
+}
+
+func TestRecipientCountOf_PerEventCap(t *testing.T) {
+	e := ev("c1", "content.sent", 0, map[string]any{"recipient_count": float64(10000)})
+	if got := recipientCountOf(e); got != sendsVolumeCap {
+		t.Errorf("recipientCountOf with an oversized recipient_count = %v, want capped at %v", got, sendsVolumeCap)
+	}
+}
+
+func TestRecipientCountOf_FallsBackToOne(t *testing.T) {
+	tests := []map[string]any{
+		nil,
+		{"recipient_count": float64(0)},
+		{"recipient_count": float64(-1)},
+		{"recipient_count": float64(2.5)},
+	}
+	for _, data := range tests {
+		e := ev("c1", "content.sent", 0, data)
+		if got := recipientCountOf(e); got != 1 {
+			t.Errorf("recipientCountOf(%v) = %v, want 1", data, got)
+		}
+	}
+}
+
+// --- S2b: webmail features (S7) -----------------------------------------
+
+func TestWebmailSends1h_ComputedDirectlyNotShareTimesVolume(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com"})
+	firstSeenAt := base
+	// Lifetime: 1 webmail send of 10, 1 non-webmail send of 90 (so the
+	// LIFETIME webmail share is 10/100 = 0.1). But the last hour is
+	// ENTIRELY webmail (40 recipients) — share*volume would have reported
+	// 0.1*40 = 4, which is wrong; the direct computation must report 40.
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(10)}),
+		ev("c2", "content.sent", time.Minute, map[string]any{"recipient_domain": "corp-example.test", "recipient_count": float64(90)}),
+		ev("c3", "content.sent", 50*time.Minute, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(40)}),
+	}
+	now := at(time.Hour)
+	got := webmailSends1h(events, now, firstSeenAt, time.Hour, webmail)
+	if got != 40 {
+		t.Errorf("webmail_sends_1h = %v, want 40 (direct computation, not share*volume)", got)
+	}
+}
+
+func TestWebmailRecipientShare_LifetimeAndNotGated(t *testing.T) {
+	webmail := NewWebmailSet([]string{"gmail.com"})
+	firstSeenAt := base
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_domain": "gmail.com", "recipient_count": float64(10)}),
+		ev("c2", "content.sent", time.Minute, map[string]any{"recipient_domain": "corp-example.test", "recipient_count": float64(90)}),
+	}
+	// Evaluated 60 days later: still 0.1, since this feature is a
+	// lifetime ratio, never gated by account age.
+	now := firstSeenAt.Add(60 * 24 * time.Hour)
+	got := webmailRecipientShare(events, now, webmail)
+	if math.Abs(got-0.1) > 1e-9 {
+		t.Errorf("webmail_recipient_share = %v, want 0.1", got)
+	}
+}
+
+// --- S2b: subject_brand_match (S1, S2) -----------------------------------
+
+func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
+	brands := smallTestBrands()
+	// S1: "tracking" inside the SUBJECT LINE itself must not suppress the
+	// match (only the account's own resource/agent name can).
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal package tracking update"})}
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
+	if got != 1 {
+		t.Errorf("subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
+	}
+}
+
+// TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand is round 2's R2: only
+// the brand adjacent to the integration token in a live agent's name is
+// exempted from subject matching — a DIFFERENT brand mentioned in a
+// subject line must still count.
+func TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand(t *testing.T) {
+	brands := mechanismBrands() // PayPal (+ alias), Apple, Amazon, Stripe, Wells Fargo, Bank of America
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account was flagged, also check Stripe"})}
+	exempt := map[string]struct{}{"PayPal": {}}
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, exempt)
+	if got != 1 {
+		t.Errorf("subject_brand_match = %v, want 1 (Stripe must still count; only PayPal is exempt)", got)
+	}
+}
+
+func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account"})}
+	alreadyNamed := map[string]struct{}{"PayPal": {}}
+	got := subjectBrandMatch(events, at(time.Hour), base, time.Hour, brands, alreadyNamed, nil)
+	if got != 0 {
+		t.Errorf("subject_brand_match = %v, want 0 (S2: already counted by name_brand_match)", got)
+	}
+}
+
+func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
+	brands := NewBrandSet([]BrandEntry{{Name: "Fictaone"}, {Name: "Fictatwo"}, {Name: "Fictathree"}, {Name: "Fictafour"}})
+	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Fictaone Fictatwo Fictathree Fictafour update"})}
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
+	if got != subjectBrandMatchCap {
+		t.Errorf("subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
+	}
+}
+
+// TestSubjectBrandMatch_ExcludesSelfSends is round 2's R4: a self-send
+// (recipient_is_own_identity: true) must not count toward
+// subject_brand_match, the same exclusion every other send-volume
+// feature already applies (isSelfSend) — the design's own [S2b] amendment
+// says these features "measure reach to OTHER recipients", and a
+// self-test rehearsal mentioning a brand in its own subject line is not
+// evidence of a lure reaching anyone.
+func TestSubjectBrandMatch_ExcludesSelfSends(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal account", "recipient_is_own_identity": true}),
+	}
+	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
+	if got != 0 {
+		t.Errorf("subject_brand_match (self-send only) = %v, want 0", got)
+	}
+}
+
+// --- Round 2, R7: subject_brand_match is age-decayed, never a permanent
+// lift for an established sender ------------------------------------------
+
+// TestSubjectBrandMatch_AgeDecayed is round 2's R7: an established
+// sender's routine product copy ("...integrates with <brand> Calendar")
+// must not read the same, forever, as a brand-new account's — the
+// IDENTICAL subject-line brand mention reads lower for an old account
+// than for a young one, the same ageDecayFactor mechanism R1 already
+// applies to the volume features.
+func TestSubjectBrandMatch_AgeDecayed(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{ev("c1", "content.sent", 60*24*time.Hour, map[string]any{"subject_line": "Our product now integrates with PayPal Calendar"})}
+	now := at(60*24*time.Hour + 30*time.Minute)
+
+	// Young: firstSeenAt close to the event itself (age ~30min).
+	young := subjectBrandMatch(events, now, at(60*24*time.Hour), time.Hour, brands, nil, nil)
+	if young != 1 {
+		t.Errorf("subject_brand_match (young account) = %v, want 1", young)
+	}
+
+	// Established: firstSeenAt 60 days before the event (age ~60d).
+	old := subjectBrandMatch(events, now, base, time.Hour, brands, nil, nil)
+	if old >= young {
+		t.Errorf("subject_brand_match (established account, same mention) = %v, must read LOWER than a young account's %v", old, young)
+	}
+	if old <= 0 {
+		t.Errorf("subject_brand_match (established account) = %v, want > 0 (never a hard 0 — ageDecayFactor floors at 0.2)", old)
+	}
+}
+
+// --- Round 2, R2: precise integration-name subject suppression ----------
+
+// TestExemptSubjectBrands_KeyNamedAPIDoesNotSuppress is round 2's R2:
+// keys never count, even when named with an integration token AND a
+// brand.
+func TestExemptSubjectBrands_KeyNamedAPIDoesNotSuppress(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"kind": "key", "name": "Stripe API Key"})}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands (key resource) = %v, want empty — keys never count", got)
+	}
+}
+
+// TestExemptSubjectBrands_DeletedAgentNamedSyncDoesNotSuppress is round
+// 2's R2: only a LIVE (not later deleted) agent counts.
+func TestExemptSubjectBrands_DeletedAgentNamedSyncDoesNotSuppress(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "Stripe Sync"}),
+		ev("r2", "resource.deleted", time.Minute, map[string]any{"kind": "agent", "name": "Stripe Sync"}),
+	}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands (deleted agent) = %v, want empty — a deleted agent never counts", got)
+	}
+}
+
+// TestExemptSubjectBrands_LiveAgentExemptsOnlyItsOwnBrand is round 2's
+// R2's core positive case: a live agent named after an integration
+// exempts ONLY the brand adjacent to the integration token in ITS OWN
+// name, not every brand the account has ever mentioned anywhere.
+func TestExemptSubjectBrands_LiveAgentExemptsOnlyItsOwnBrand(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "Stripe Webhook Relay"}),
+	}
+	got := exemptSubjectBrands(events, brands)
+	if _, ok := got["Stripe"]; !ok || len(got) != 1 {
+		t.Errorf("exemptSubjectBrands = %v, want exactly {Stripe}", got)
+	}
+}
+
+// TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing is round 2's
+// R2: a live agent whose name matches a brand but carries no integration
+// token at all must not exempt anything (that's an ordinary
+// brand-impersonating name, already caught by name_brand_match/S2 — not
+// a legitimate-integration signal).
+func TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing(t *testing.T) {
+	brands := mechanismBrands()
+	events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"kind": "agent", "name": "PayPal Alert"})}
+	got := exemptSubjectBrands(events, brands)
+	if len(got) != 0 {
+		t.Errorf("exemptSubjectBrands = %v, want empty (no integration token in the name)", got)
+	}
+}
+
+// TestExtract_SubjectBrandMatchIntegratesWithNamedBrandNames is an
+// Extract-level check that Features.NameBrandMatch and
+// Features.SubjectBrandMatch never double-count the same brand (S2).
+func TestExtract_SubjectBrandMatchDoesNotDoubleCount(t *testing.T) {
+	brands := smallTestBrands()
+	events := []event.Event{
+		ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Alert"}),
+		ev("c1", "content.sent", time.Minute, map[string]any{"subject_line": "Your PayPal account"}),
+	}
+	res, err := Extract(context.Background(), "e2a", "acct_test", events, nil, defaultWindows(time.Hour), brands, WebmailSet{})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	if res.Features.NameBrandMatch != 1 {
+		t.Errorf("NameBrandMatch = %v, want 1", res.Features.NameBrandMatch)
+	}
+	if res.Features.SubjectBrandMatch != 0 {
+		t.Errorf("SubjectBrandMatch = %v, want 0 (S2: PayPal already counted via NameBrandMatch)", res.Features.SubjectBrandMatch)
+	}
+}
+
+// --- Round 2, R1: history-relative volume signal, no hard age cliff ----
+
+// TestAgeDecayFactor_NoCliff is R1: probing 6d23h, 7d and 7d1h must show
+// smooth continuity (each step differs only by the ordinary slope of the
+// ramp), never a jump the way the old hard 7-day gate produced (1 -> 0).
+func TestAgeDecayFactor_NoCliff(t *testing.T) {
+	firstSeenAt := base
+	at6d23h := ageDecayFactor(firstSeenAt, firstSeenAt.Add(6*24*time.Hour+23*time.Hour))
+	at7d := ageDecayFactor(firstSeenAt, firstSeenAt.Add(7*24*time.Hour))
+	at7d1h := ageDecayFactor(firstSeenAt, firstSeenAt.Add(7*24*time.Hour+time.Hour))
+	at8d := ageDecayFactor(firstSeenAt, firstSeenAt.Add(8*24*time.Hour))
+
+	// No cliff: consecutive probes differ by a small, continuous amount,
+	// not by anywhere near the old gate's full 1 -> 0 jump.
+	const maxStepAcrossOneHour = 0.01
+	if diff := at7d - at7d1h; diff < 0 || diff > maxStepAcrossOneHour {
+		t.Errorf("ageDecayFactor(7d)=%v -> ageDecayFactor(7d1h)=%v moved by %v, want a small continuous step (<= %v)", at7d, at7d1h, diff, maxStepAcrossOneHour)
+	}
+	if diff := at6d23h - at7d; diff < 0 || diff > maxStepAcrossOneHour {
+		t.Errorf("ageDecayFactor(6d23h)=%v -> ageDecayFactor(7d)=%v moved by %v, want a small continuous step (<= %v)", at6d23h, at7d, diff, maxStepAcrossOneHour)
+	}
+	// Monotonically non-increasing with age over this range.
+	if !(at6d23h >= at7d && at7d >= at7d1h && at7d1h >= at8d) {
+		t.Errorf("ageDecayFactor must be non-increasing with age: 6d23h=%v 7d=%v 7d1h=%v 8d=%v", at6d23h, at7d, at7d1h, at8d)
+	}
+}
+
+// TestAgeDecayFactor_Bounds is R1's formula: clamp(1 - (age_days-3)/27,
+// 0.2, 1) — full weight through day 3, floor of 0.2 from ~day 25 on.
+func TestAgeDecayFactor_Bounds(t *testing.T) {
+	firstSeenAt := base
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt); got != 1 {
+		t.Errorf("ageDecayFactor(age=0) = %v, want 1", got)
+	}
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(3*24*time.Hour)); got != 1 {
+		t.Errorf("ageDecayFactor(age=3d) = %v, want 1", got)
+	}
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(90*24*time.Hour)); got != 0.2 {
+		t.Errorf("ageDecayFactor(age=90d) = %v, want the 0.2 floor", got)
+	}
+	// Never a hard 0: a genuinely established sender still gets SOME
+	// weight from a volume signal, just heavily discounted.
+	if got := ageDecayFactor(firstSeenAt, firstSeenAt.Add(365*24*time.Hour)); got != 0.2 {
+		t.Errorf("ageDecayFactor(age=365d) = %v, want the 0.2 floor (never 0)", got)
+	}
+}
+
+// TestBurstFactor_HistoryRelative is R1: the SAME current burst reads as
+// far less unusual for a subject with a substantial prior peak than for
+// one with none.
+func TestBurstFactor_HistoryRelative(t *testing.T) {
+	noHistory := burstFactor(300, 0)
+	establishedHistory := burstFactor(300, 40)
+	if noHistory <= establishedHistory {
+		t.Errorf("burstFactor(300, no history)=%v, burstFactor(300, established)=%v — a subject with real prior volume must read as LESS unusual", noHistory, establishedHistory)
+	}
+	if noHistory != 300 {
+		t.Errorf("burstFactor(300, 0) = %v, want 300 (no history: baseline floors at 1, ratio = current)", noHistory)
+	}
+	if got := burstFactor(300, 40); math.Abs(got-7.5) > 1e-9 {
+		t.Errorf("burstFactor(300, 40) = %v, want 7.5", got)
+	}
+}
+
+// TestSends10mMax_TrailingWindowNotWholeHistory is R1: "Replace
+// sends_10m_max's whole-history maximum with a trailing window, so a
+// burst stops contributing once it leaves the window" — an old burst
+// (more than currentBurstWindow ago) must no longer count toward the
+// CURRENT search, even though it's still within the 30-day history
+// lookback that feeds the baseline.
+func TestSends10mMax_TrailingWindowNotWholeHistory(t *testing.T) {
+	// A burst 2 days ago (well outside the 24h "current" window, but
+	// inside the 30-day history lookback) followed by total silence.
+	events := []event.Event{
+		ev("c1", "content.sent", 0, map[string]any{"recipient_count": float64(200), "recipient_domain": "corp.example.test"}),
+	}
+	now := at(48 * time.Hour) // 2 days after the old burst
+	got := sends10mMax(events, now, base)
+	if got != 0 {
+		t.Errorf("sends_10m_max = %v, want 0 (the only burst is outside the 24h current window)", got)
 	}
 }

@@ -1,0 +1,73 @@
+# config/webmail.yaml — a PUBLIC list of major consumer webmail provider
+# domains (internal/feature.LoadWebmailFile, design §4.5), used only to
+# compute webmail_recipient_share and webmail_sends_1h.
+#
+# This is deliberately a flat, public list of well-known free/consumer
+# email provider domain NAMES (gmail.com, outlook.com, ...) — the same
+# kind of public fact a spam filter's own provider list would carry, no
+# different from naming "Gmail" as a company in prose. It names no
+# customer, no account and no real send data (AGENTS.md's data-boundary
+# rule): it is exactly as public as the provider's own domain
+# registration.
+#
+# A domain here is matched case/whitespace-insensitively against
+# content.sent's `recipient_domain` field (internal/feature.WebmailSet).
+# Extend this list as new consumer providers or country-variant domains
+# become common in bulk-phishing lures; there is no "brands.yaml-style"
+# curation judgment involved here (unlike config/brands.yaml, a webmail
+# provider's status is a simple fact, not a false-positive-prone name
+# match).
+domains:
+  # Google
+  - gmail.com
+  - googlemail.com
+  # Microsoft, plus common country-variant domains
+  - outlook.com
+  - outlook.de
+  - outlook.fr
+  - hotmail.com
+  - hotmail.co.uk
+  - hotmail.de
+  - hotmail.es
+  - hotmail.fr
+  - hotmail.it
+  - live.com
+  - live.co.uk
+  - live.fr
+  - msn.com
+  # Yahoo, plus common country-variant domains
+  - yahoo.com
+  - yahoo.co.uk
+  - yahoo.com.br
+  - yahoo.de
+  - yahoo.es
+  - yahoo.fr
+  - yahoo.co.jp
+  - ymail.com
+  # Apple
+  - icloud.com
+  - me.com
+  - mac.com
+  # AOL
+  - aol.com
+  # Proton
+  - protonmail.com
+  - proton.me
+  - pm.me
+  # Other major consumer/webmail providers commonly seen in bulk-phishing
+  # lures, including common country-variant domains.
+  - gmx.com
+  - gmx.net
+  - gmx.de
+  - t-online.de
+  - mail.com
+  - zoho.com
+  - yandex.com
+  - yandex.ru
+  - mail.ru
+  - qq.com
+  - 163.com
+  - 126.com
+  - naver.com
+  - web.de
+  - libero.it

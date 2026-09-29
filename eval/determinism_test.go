@@ -16,10 +16,10 @@ import (
 // would also catch a genuine source of nondeterminism the gate itself
 // depends on (unsorted map iteration, Go's randomized map order, ...).
 func TestRun_Deterministic(t *testing.T) {
-	cfg, brands := loadShippedRuleConfig(t)
+	cfg, brands, webmail := loadShippedRuleConfig(t)
 	rule := ruleByNameT(t, cfg, "new_account_velocity")
 	scorer, _ := cfg.ScorerFor(rule)
-	dataset := loadSyntheticDataset(t, brands)
+	dataset := loadSyntheticDataset(t, brands, webmail)
 
 	fixedNow := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	opts := Options{Tiers: cfg.Tiers, Now: func() time.Time { return fixedNow }}

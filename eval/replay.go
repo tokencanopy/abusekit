@@ -134,7 +134,10 @@ type ReplayInput struct {
 // dataset will be scored against's BenignLabel (fix round B1: needed to
 // resolve `label`-typed events' positive/negative class — see
 // neighbors.go's labelledAsOf); pass config.Rule.BenignLabel, never a
-// literal.
+// literal. webmail is threaded straight through to every feature.Extract
+// call below (S2b's webmail_recipient_share/webmail_sends_1h need it);
+// the zero value (feature.WebmailSet{}) matches every domain as
+// non-webmail, same as passing no webmail config at all.
 //
 // For every label row, a Point is built for every Slice whose
 // decision_at instant is resolvable and has at least one qualifying
@@ -174,7 +177,7 @@ type ReplayInput struct {
 // (fix round P2 — see LoadSnapshotCorpus's identical note); a caller
 // wanting S4's original strict behavior treats a non-nil error as fatal
 // and ignores the Dataset, unchanged.
-func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, benignLabel string) (Dataset, []RowError, error) {
+func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, webmail feature.WebmailSet, benignLabel string) (Dataset, []RowError, error) {
 	eventsBySubject, labelEvents, skippedEventSubjects, rowErrs, err := parseEventRows(in.EventsPath, in.Events)
 	if err != nil {
 		return Dataset{}, nil, err
@@ -264,7 +267,7 @@ func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, benignLabel stri
 				continue
 			}
 			windows := feature.DefaultWindows(decisionAt)
-			fr, err := feature.Extract(ctx, evalTenant, row.Subject, filtered, asOfNeighbors{n: neighbors, asOf: decisionAt, benignLabel: benignLabel}, windows, brands)
+			fr, err := feature.Extract(ctx, evalTenant, row.Subject, filtered, asOfNeighbors{n: neighbors, asOf: decisionAt, benignLabel: benignLabel}, windows, brands, webmail)
 			if err != nil {
 				rowErrs = append(rowErrs, RowError{Source: in.LabelsPath, Line: l.line, Code: "extract_failed", Err: fmt.Errorf("labels: subject %q slice %s: extract features: %w", row.Subject, slice, err)})
 				badRow = true

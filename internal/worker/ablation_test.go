@@ -44,6 +44,13 @@ func fullFeatureVector() map[string]float64 {
 		"fingerprint_seen_on_other_subjects": 0.25,
 		"neighbors_truncated":                0.25,
 		"burst_ratio_24h_vs_lifetime":        0.2,
+		"sends_10m_max":                      1,
+		"sends_1h":                           1,
+		"sends_first_day":                    1,
+		"webmail_recipient_share":            0.1,
+		"webmail_sends_1h":                   1,
+		"distinct_recipients_1h":             1,
+		"subject_brand_match":                0.1,
 	}
 }
 

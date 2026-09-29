@@ -263,6 +263,25 @@ stringification. The schema version that produced a given row is recorded on it
 (`events.redaction_version`) so a later schema change can identify rows redacted under an older
 rule set.
 
+**[S2b]** Four amendments to `content.sent`, bumping `RedactionSchemaVersion` to 2: (a) `recipient_hash`
+must match a closed format, `^[A-Za-z0-9_:+/=-]{8,128}$` — anything containing `@` or `%`, any
+whitespace, or any other out-of-set character is rejected, not truncated (a formatted field's shape
+is exact, so truncating an over-length value first could silently turn an invalid hash into one that
+happens to match); (b) `subject_line` MASKS an email-shaped substring (replacing it with `@`) instead
+of rejecting the whole event the way every other field's embedded-email check still does — a bulk
+lure's subject line is exactly the field most likely to legitimately quote back an address, and
+losing the whole event over it destroys the very evidence the vocabulary exists to capture (**[round
+2 nit]** the stored value is NFKC-folded unconditionally now, not only on the branch where an
+email-shaped substring was actually found and masked — the two previously diverged, so the identical
+logical subject line could be stored as two different byte sequences depending on whether masking
+happened to trigger); (c) a
+`recipient_hash` paired with `recipient_count > 1` is rejected — design's own contract is that a set
+`recipient_hash` represents exactly one recipient; (d) `recipient_count`, if present, must be a
+positive integer. **[S2b]** `resource.created`/`resource.deleted`'s `kind` also normalizes a small,
+documented set of producer spelling variants for the key resource kind (e.g. `api_key`, `api_keys`,
+`api-key`, `apikey`, "api key", `keys`) to the same canonical value, so a producer's own convention
+for naming this field never silently reads as ordinary, uncounted resource activity.
+
 ### 4.4 Score API
 
 `GET /v1/subjects/{subject}` → `200` (a seen-but-unscored subject is `200` with `tier:"unknown"`;
@@ -329,7 +348,9 @@ rules:
              upgrade_delay_min, upgraded, declines_before_first_success, first_funding_prepaid,
              name_brand_match, name_has_at, first_day_distinct_domains, self_send_before_external,
              linked_deleted_n, linked_labelled_abusive_n, fingerprint_seen_on_other_subjects,
-             neighbors_truncated, burst_ratio_24h_vs_lifetime]
+             neighbors_truncated, burst_ratio_24h_vs_lifetime,
+             sends_10m_max, sends_1h, sends_first_day, webmail_recipient_share, webmail_sends_1h,
+             distinct_recipients_1h, subject_brand_match]        # [S2b]
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6
@@ -374,6 +395,93 @@ every count above it read identically — a 30-domain and a 300-domain fan-out s
 now a `log1p(n)` curve instead, scaled so `n=10` reproduces exactly the hard cap's old contribution
 (no weight change needed) while `n=150` scores meaningfully higher — volume sensitivity above the
 old cap is preserved, just compressed rather than flattened to zero.
+
+**[S2b]** Seven more `new_account_velocity` inputs, addressing common bulk-phishing shapes: send
+volume (`sends_10m_max`, `sends_1h`, `sends_first_day`), consumer-webmail concentration
+(`webmail_recipient_share`, `webmail_sends_1h`, `config/webmail.yaml`), distinct-recipient fan-out
+in a trailing window (`distinct_recipients_1h`), and a brand match against the message SUBJECT
+(`subject_brand_match`, in addition to the existing resource/agent name match). All exclude a
+self-send (`recipient_is_own_identity: true`) — these measure reach to OTHER recipients, and a
+self-send would otherwise double-count the rehearsal behaviour `self_send_before_external` already
+captures — and all exclude a future-dated event (bounded by `now`, the same as every other feature).
+- **B1 (established senders):** `sends_10m_max`, `sends_1h`, `webmail_sends_1h` and
+  `distinct_recipients_1h` are each `burstFactor(current, the subject's own prior 10-minute peak
+  over the preceding 30 days, excluding the trailing 24h) × ageDecayFactor(age)` — a
+  HISTORY-RELATIVE measure, not the calendar-age hard gate an earlier round shipped. `burstFactor`
+  floors its denominator at 1, so a subject with no meaningful prior sending reads its current
+  burst at close to full strength (unchanged from a brand-new signup's original behaviour); one
+  with a real prior baseline reads the identical current volume as far less unusual.
+  `ageDecayFactor` is `clamp(1 − (age_days − 3) / 27, 0.2, 1)`: full weight through day 3, ramping
+  smoothly down to a floor of 0.2 by around day 25 — continuous in age, with no cliff, and never a
+  hard 0. **[round 2]** The original hard 7-day gate was proven evadable (an account that simply
+  waited past it read as fully "established" regardless of whether it had ever sent anything
+  before) and blind to whether an "established" account had any real prior volume at all — a
+  lifetime-unbounded whole-history search additionally let a burst from 40 days ago still register
+  as "the current burst" if nothing more recent happened to beat it; `sends_10m_max`'s own current-
+  burst search is now bounded to the trailing 24h for the same reason. `sends_first_day` needs
+  neither burstFactor nor ageDecayFactor: it is already permanently anchored to the subject's
+  first day, the same way `first_day_distinct_domains` is, so it can never reflect an established
+  account's CURRENT behaviour in the first place. `webmail_recipient_share` is a lifetime ratio
+  (who an account emails, not how much) and is deliberately neither history-relative nor
+  age-decayed.
+- **S1 (subject-line matching):** a subject-line brand match is NOT suppressed by an
+  integration-adjacent word ("tracking", "api") inside the subject itself — a bulk-phishing subject
+  routinely and legitimately contains one on purpose, and gating on the subject's own words silently
+  defeated the rule for exactly the subjects it exists to catch. It is suppressed only when the
+  SENDING ACCOUNT's own resource/agent name carries an integration token (the existing gate,
+  relocated to a one-time, account-level decision).
+- **S2 (double-counting):** `subject_brand_match` excludes any brand already credited by
+  `name_brand_match`, capping the combined per-brand contribution of the two features at whichever
+  one counted it first.
+- **[round 2] R7 (generic brands in subjects):** `subject_brand_match` is multiplied by
+  `ageDecayFactor` (the SAME function R1's volume features use), so an established sender's routine
+  product copy mentioning a generic big-tech brand ("...integrates with `<brand>` Calendar") is
+  discounted, not a permanent lift, as the account ages — floored at 0.2, never a hard 0, the
+  identical trade-off R1 already accepted for volume. Chosen over the alternative (treating a fixed
+  list of generic brands — apple, google, microsoft, amazon, stripe — as subject-exempt unless
+  another lure signal is present): age-decay fixes the underlying problem for EVERY brand, not just
+  five named ones, needs no definition of "another lure signal" to implement, and reuses a mechanism
+  already reviewed and tested for the identical purpose elsewhere in this same PR.
+- **[round 2] R8 (rollout: producer-supplied account age):** `subject.created` accepts an optional
+  `account_created_at` (RFC 3339), validated exactly at redaction time. When present, `Extract`
+  prefers it over `firstSeenAt`'s own derived value (the minimum `At` across every ingested event)
+  for every one of R1/R7's history-relative and age-decayed features. Without it, `firstSeenAt` is
+  only ever "the moment abusekit itself first observed this subject" — an already-established
+  account onboarded onto abusekit well after its real signup reads as brand new, and its very first
+  routine send (or first send after onboarding) triggers exactly the false positive R1 and R7 exist
+  to prevent. Supplying this one field is a precondition for correct history-relative scoring on any
+  pre-existing account; the alternative — a true historical backfill of the account's past events —
+  is possible but unnecessary, since `account_created_at` alone is sufficient (a real account whose
+  one large send reaches `high` when un-backfilled correctly reads `low` once the producer supplies
+  its actual signup date, with no event backfill at all). A malformed value is rejected at
+  ingest (closed RFC 3339 format), never silently ignored or left to fail deep inside feature
+  extraction.
+- **S7 (webmail volume):** `webmail_sends_1h` is computed directly from the trailing window, never
+  as `webmail_recipient_share * sends_1h` — the share is a lifetime ratio and the sum is a trailing
+  window, so their product tracks neither quantity correctly. Every sum caps its per-event
+  `recipient_count` (`sendsVolumeCap`), not only the aggregate.
+- **N4 (resource-kind aliases):** `resource.created`'s `kind` field also normalizes common spelling
+  variants for the key resource kind ("api key", "API Key", "api_key", "api_keys", "apikey",
+  "api-key", "keys") to the canonical value — a producer's own convention for this field should
+  never silently read as ordinary, uncounted resource activity.
+- **B3/N1/N2/N3 (brand matching):** tokenizing for brand matching now splits on any Unicode
+  punctuation or symbol rune, not a hand-picked separator list, so a brand immediately followed by
+  `:`, `,`, `!`, `)`, `"` or `/` matches, and a possessive `'s` no longer glues onto the brand word
+  (B3). A brand entry may be marked case-sensitive, for a short brand token that doubles as an
+  ordinary English word or abbreviation (N1). A brand mention inside ordinary community-gathering
+  text ("... group meetup", "... fan club") does not match (N2). Soft hyphen (U+00AD) and invisible
+  separator (U+2063) are stripped alongside the existing zero-width characters (N3). **[round 2
+  nit]** `canonicalise` now strips every rune in Unicode category Cf outright (a strict superset of
+  N3's hand-enumerated list — also catches, e.g., U+2064 INVISIBLE PLUS and U+180E MONGOLIAN VOWEL
+  SEPARATOR), and the case-sensitive check (N1) NFKC-normalizes the candidate text before comparing,
+  so a fullwidth look-alike spelling ("ＵＰＳ") is recognized the same as its plain-ASCII spelling.
+- `config/webmail.yaml` is a public list of major consumer webmail provider domains (public exactly
+  like config/brands.yaml is — no different from naming "Gmail" as a company in prose), extended
+  with common country-variant domains (`hotmail.co.uk`, `outlook.fr`, `live.co.uk`, `yahoo.fr`,
+  `yahoo.de`, `yahoo.co.jp`, `mail.ru`, `gmx.de`, `t-online.de`, `libero.it`).
+- `config/brands.yaml` gains an optional companion, `brands_extra` (`cmd/abusekit --brands-extra`):
+  a private, same-shaped brand list merged in at boot (`feature.MergeBrandSets`) — for a brand an
+  operator wants matched but that shouldn't live in this public repo.
 
 **Validation at load [r2]:** unknown scorer, unknown feature, labels not accepted by the adapter's
 `Capabilities`, text inputs to an adapter whose policy forbids text, `vote(...)` members with
@@ -535,7 +643,7 @@ published JSON Schema.
   secrets, no spend; fails below `eval/floors.yaml` (floor = lower interval bound of the reference
   run) or above the ECE bound. Nightly: live adapters with tolerance bands, cassette refresh.
 - The committed corpus is synthetic (lures written in the style of the incident families, `.test`
-  domains, shifted timelines, fictional ids). The real incident corpus lives in private storage
+  domains, shifted timelines, fictional ids). A corpus reconstructed from confirmed abuse activity lives in private storage
   and feeds only the nightly job via a secret.
 
 ### 4.11 Storage
@@ -604,7 +712,17 @@ erasure rules. Migrations embedded, expand-only.
   ("Stripe Webhook Relay", "Google Calendar Sync", "Microsoft Teams Relay") are excluded from the
   shipped list rather than flagged and accepted as noisy — word-boundary matching alone can't tell
   "impersonating Stripe" from "a real Stripe integration named after Stripe"; proper context-aware
-  matching for those is future work.
+  matching for those is future work. **[S2b]** Tokenizing now splits on any Unicode punctuation or
+  symbol rune (not a hand-picked separator list), so a brand immediately followed by punctuation
+  (`:`, `,`, `!`, `)`, `"`, `/`) matches and a possessive `'s` no longer glues onto the brand word
+  (B3); a brand entry may be marked case-sensitive for a short token that doubles as an ordinary
+  English word (N1, e.g. a shipping carrier's all-caps initialism); a brand mentioned inside
+  ordinary community-gathering text ("... group meetup", "... fan club") does not match (N2); soft
+  hyphen and the invisible separator (U+00AD, U+2063) are stripped alongside the existing zero-width
+  characters (N3). A subject-line brand match (as opposed to a resource/agent-name match) is
+  suppressed only by the SENDING ACCOUNT's own name carrying an integration token, never by words
+  inside the subject line itself (S1) — and never double-counts a brand the account's own name
+  already credited (S2).
 - Invalid config → reload rejected, previous config live, `/healthz` reports it.
 - Lost update in the worker → `dirty_seq` compare-and-clear.
 - Clock skew → ±24 h on events (except `backfill` scope), ±5 min on request signatures.
@@ -675,3 +793,12 @@ erasure rules. Migrations embedded, expand-only.
      email verification, a KYC-style check, a long-lived OAuth session) that would legitimately
      lower risk independent of behavioural velocity. Every v0 signal is behavioural; an
      otherwise-suspicious-looking but genuinely verified account has no way to net that out.
+   - **[S2b round 2, R5]** A deliberately-paced "low and slow" sender is a known gap:
+     `eval/fixtures/slow_sender_15_per_hour_6h.jsonl` sends the SAME total volume and brand mention
+     as `single_brand_100_45m.jsonl` (90-100 webmail recipients, one repeated brand) but spread at
+     15/hour over 6 hours instead of one burst, and reaches only `medium`, never `high` —
+     `sends_10m_max`/`webmail_sends_1h` (this model's two most heavily-weighted volume signals) can
+     only ever see one hour's worth at any given scoring instant, so pacing sends below any single
+     window's threshold evades a windowed-burst detector by construction. Detecting this would need
+     a wider trailing window than any this v0 feature set reads, or a feature that tracks total
+     volume irrespective of concentration — deferred, not fixed in this round.

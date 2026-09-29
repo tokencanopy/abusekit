@@ -82,7 +82,7 @@ func TestLoadReplayDataset_SchemaRejection(t *testing.T) {
 {"subject":"acct_missing","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}
 {"subject":"acct_1","label":"benign","source":"operator","decision_at":{}}
 `)
-	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err == nil {
 		t.Fatalf("expected a *SchemaError, got nil")
 	}
@@ -116,7 +116,7 @@ func TestLoadReplayDataset_SchemaRejection(t *testing.T) {
 func TestLoadReplayDataset_MissingDecisionAtField(t *testing.T) {
 	events := strings.NewReader(`{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{}}`)
 	labels := strings.NewReader(`{"subject":"acct_1","label":"benign","source":"operator"}`)
-	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err == nil || len(rowErrs) == 0 {
 		t.Fatalf("expected a RowError for a labels row with no decision_at at all")
 	}

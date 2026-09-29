@@ -42,6 +42,16 @@ fmt:
 # interval bound of the reference run)". Never touches Postgres, a
 # vendor, or the network: the local scorer needs no cassette (S4).
 #
+# --brands-extra eval/fixtures/test_brands.yaml (S2b's F9 TODO): the
+# committed corpus's abusive_subject_lure family mentions a FICTIONAL
+# brand in its subject lines (never a real one, per this repo's hygiene
+# rule for fabricated lure prose) — merging that test-only file in is
+# what lets subject_brand_match recognize it here, the same way it's
+# merged for every internal/worker replay fixture that needs a brand
+# match. --webmail defaults to config/webmail.yaml (abusekit eval's own
+# default, same as `serve`), which the abusive_webmail_blast family needs
+# no extra flag for.
+#
 # `go build ./...` (the `build` target above) deliberately writes no
 # binary when it matches more than one package (Go's own default), so
 # gate builds cmd/abusekit explicitly to a throwaway path instead of
@@ -59,6 +69,7 @@ gate:
 	@./.gate-abusekit eval \
 		--dataset eval/fixtures/synthetic/events.jsonl \
 		--labels eval/fixtures/synthetic/labels.jsonl \
+		--brands-extra eval/fixtures/test_brands.yaml \
 		--rule new_account_velocity --scorer local --slice full \
 		--floors eval/floors.yaml \
 		--out .gate-run.json; \

@@ -589,7 +589,7 @@ func TestPutLabel(t *testing.T) {
 // TestSubjectView_StaleIsSequenceBasedNotClockBased is S4: Stale must
 // come from dirty_seq > scored_seq alone. A fictional test timestamp in
 // "the future" relative to the real wall clock (2031, per this repo's
-// convention of never using real incident dates) makes the OLD
+// convention of only ever using fictional dates) makes the OLD
 // last_event_at-vs-current_scored_at comparison wrong 100% of the time
 // (not just flaky under clock skew): the event's `at` is unconditionally
 // "after" Postgres's real now(), so the old code reported a freshly

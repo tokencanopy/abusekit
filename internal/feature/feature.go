@@ -93,6 +93,13 @@ var Names = []string{
 	"fingerprint_seen_on_other_subjects",
 	"neighbors_truncated",
 	"burst_ratio_24h_vs_lifetime",
+	"sends_10m_max",
+	"sends_1h",
+	"sends_first_day",
+	"webmail_recipient_share",
+	"webmail_sends_1h",
+	"distinct_recipients_1h",
+	"subject_brand_match",
 }
 
 // Features is one subject's v0 feature vector (design §4.5), as of the
@@ -205,6 +212,62 @@ type Features struct {
 	// for an account with a long, currently-quiet history. 0 when the
 	// subject has no resource/content activity at all.
 	BurstRatio24hVsLifetime float64
+	// Sends10mMax is burstFactor(the subject's CURRENT 10-minute recipient
+	// peak within the trailing currentBurstWindow, i.e. NOT a whole-history
+	// search) against the subject's own PRIOR 10-minute peak over the
+	// preceding historyLookbackWindow, times ageDecayFactor — round 2's R1
+	// fix round: history-relative, not calendar-age-gated. A subject with
+	// no meaningful prior sending reads its current burst at close to full
+	// strength (unchanged from a brand-new signup's original behaviour);
+	// an established sender with a real prior baseline reads the SAME
+	// current volume as far less unusual. Replaces round 1's hard 7-day
+	// calendar-age cliff, proven evadable (an account that simply waited
+	// past it read as fully "established" regardless of whether it had
+	// ever sent anything before) and blind to a subject's own history.
+	Sends10mMax float64
+	// Sends1h is the SAME history-relative measure as Sends10mMax
+	// (burstFactor against the subject's own prior 10-minute peak, times
+	// ageDecayFactor), applied to the trailing Windows.OneHour sum instead
+	// of the 10-minute peak.
+	Sends1h float64
+	// SendsFirstDay is the sum of content.sent recipient_count within the
+	// subject's first 24h (Windows.DayHour) of existence, anchored to
+	// firstSeenAt exactly like FirstDayDistinctDomains — permanently
+	// fixed once that window closes, and deliberately NOT history-relative
+	// or age-decayed like its siblings above/below (it can only ever
+	// reflect a subject's OWN first day, when there is by construction no
+	// prior history to compare against and no age to decay by).
+	SendsFirstDay float64
+	// WebmailRecipientShare is the LIFETIME share (0..1) of sent
+	// recipients whose recipient_domain is on the loaded webmail list — a
+	// permanent fact, not a decaying window, and not history-relative or
+	// age-decayed (it measures WHO an account emails, not how much).
+	WebmailRecipientShare float64
+	// WebmailSends1h is Sends1h restricted to webmail-domain recipients,
+	// computed directly rather than as WebmailRecipientShare*Sends1h (S7
+	// fix round — see webmailSends1h's own doc comment for why that
+	// product would be wrong), then run through the SAME history-relative
+	// burstFactor/ageDecayFactor measure as Sends10mMax/Sends1h (round 2,
+	// R1), against the identical prior-peak baseline (not a webmail-only
+	// variant of it).
+	WebmailSends1h float64
+	// DistinctRecipients1h counts distinct content.sent recipient_hash
+	// values in the trailing Windows.OneHour window (falling back to
+	// summing recipient_count for any event with no hash at all), then run
+	// through the SAME history-relative burstFactor/ageDecayFactor measure
+	// (round 2, R1).
+	DistinctRecipients1h float64
+	// SubjectBrandMatch counts DISTINCT curated brands matched across
+	// every non-self-send content.sent subject_line (round 2, R4) in the
+	// trailing Windows.OneHour window, excluding any brand already
+	// counted by NameBrandMatch (S2 fix round) and any brand exempted by
+	// exemptSubjectBrands (round 2, R2 fix round: only the brand adjacent
+	// to an integration token in a LIVE, agent-kind resource's own name —
+	// not a whole-account exemption), capped at subjectBrandMatchCap, then
+	// multiplied by ageDecayFactor (round 2, R7 fix round: an established
+	// sender's routine product copy mentioning a generic big-tech brand
+	// must not read as a permanent lift forever).
+	SubjectBrandMatch float64
 }
 
 // Map converts f into the map[string]float64 shape internal/core.Plan and
@@ -229,6 +292,13 @@ func (f Features) Map() map[string]float64 {
 		"fingerprint_seen_on_other_subjects": f.FingerprintSeenOnOtherSubjects,
 		"neighbors_truncated":                f.NeighborsTruncated,
 		"burst_ratio_24h_vs_lifetime":        f.BurstRatio24hVsLifetime,
+		"sends_10m_max":                      f.Sends10mMax,
+		"sends_1h":                           f.Sends1h,
+		"sends_first_day":                    f.SendsFirstDay,
+		"webmail_recipient_share":            f.WebmailRecipientShare,
+		"webmail_sends_1h":                   f.WebmailSends1h,
+		"distinct_recipients_1h":             f.DistinctRecipients1h,
+		"subject_brand_match":                f.SubjectBrandMatch,
 	}
 }
 
@@ -329,8 +399,10 @@ type Result struct {
 //
 // neighbors nil is treated as NoNeighbors, a convenience for a caller (or
 // test) that doesn't care about the linked_* features. brands' zero value
-// (BrandSet{}) holds name_brand_match at 0.
-func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet) (Result, error) {
+// (BrandSet{}) holds name_brand_match/subject_brand_match at 0; webmail's
+// zero value (WebmailSet{}) holds webmail_recipient_share/
+// webmail_sends_1h at 0 (S2b).
+func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet, webmail WebmailSet) (Result, error) {
 	if windows.Now.IsZero() {
 		return Result{}, fmt.Errorf("feature: windows.Now must be set")
 	}
@@ -351,11 +423,27 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 	// costs nothing extra and stays correct even for a caller (or test)
 	// that hands Extract events out of order — see minAt's doc comment.
 	firstSeenAt, _ := minAt(events, func(event.Event) bool { return true })
+	// [round 2] R8: a producer-supplied subject.created.account_created_at
+	// overrides the derived value above when present — see
+	// accountCreatedAt's own doc comment for why. Every firstSeenAt-keyed
+	// feature below (age decay, burst baselines, first-day windows, next
+	// rescore scheduling) inherits this single override automatically,
+	// since they all read the same local variable.
+	if createdAt, ok := accountCreatedAt(events); ok {
+		firstSeenAt = createdAt
+	}
 
 	ev, err := neighbors.Evidence(ctx, tenant, subject)
 	if err != nil {
 		return Result{}, fmt.Errorf("feature: resolve neighbor evidence for %s: %w", subject, err)
 	}
+
+	// S2b: computed once and shared between NameBrandMatch and
+	// SubjectBrandMatch (S2 fix round's double-counting cap) and between
+	// SubjectBrandMatch and round 2's R2 fix round's precise, per-brand
+	// subject-line integration exemption.
+	namedBrands := namedBrandNames(events, brands)
+	exemptBrands := exemptSubjectBrands(events, brands)
 
 	f := Features{
 		SubjectAgeH:                    subjectAgeHours(firstSeenAt, now),
@@ -367,7 +455,7 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		Upgraded:                       upgraded(events),
 		DeclinesBeforeFirstSuccess:     declinesBeforeFirstSuccess(events),
 		FirstFundingPrepaid:            firstFundingPrepaid(events),
-		NameBrandMatch:                 nameBrandMatch(events, brands),
+		NameBrandMatch:                 boolToFloat(len(namedBrands) > 0),
 		NameHasAt:                      nameHasAt(events),
 		FirstDayDistinctDomains:        firstDayDistinctDomains(events, firstSeenAt, windows.DayHour),
 		SelfSendBeforeExternal:         selfSendBeforeExternal(events),
@@ -376,6 +464,13 @@ func Extract(ctx context.Context, tenant, subject string, events []event.Event, 
 		FingerprintSeenOnOtherSubjects: boolToFloat(ev.FingerprintShared),
 		NeighborsTruncated:             boolToFloat(ev.Truncated),
 		BurstRatio24hVsLifetime:        burstRatio(events, now, windows.DayHour),
+		Sends10mMax:                    sends10mMax(events, now, firstSeenAt),
+		Sends1h:                        sends1h(events, now, firstSeenAt, windows.OneHour),
+		SendsFirstDay:                  sendsFirstDay(events, firstSeenAt, now, windows.DayHour),
+		WebmailRecipientShare:          webmailRecipientShare(events, now, webmail),
+		WebmailSends1h:                 webmailSends1h(events, now, firstSeenAt, windows.OneHour, webmail),
+		DistinctRecipients1h:           distinctRecipients1h(events, now, firstSeenAt, windows.OneHour),
+		SubjectBrandMatch:              subjectBrandMatch(events, now, firstSeenAt, windows.OneHour, brands, namedBrands, exemptBrands),
 	}
 
 	return Result{

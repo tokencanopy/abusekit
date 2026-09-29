@@ -38,6 +38,7 @@ func shippedConfig(t *testing.T) serveConfig {
 		vendorsPath: filepath.Join(root, "config", "vendors.yaml"),
 		weightsPath: filepath.Join(root, "config", "local_weights.yaml"),
 		brandsPath:  filepath.Join(root, "config", "brands.yaml"),
+		webmailPath: filepath.Join(root, "config", "webmail.yaml"),
 		keysPath:    filepath.Join(root, "config", "keys.yaml"),
 		dev:         true,
 	}
@@ -74,6 +75,12 @@ func TestParseServeFlags_Defaults(t *testing.T) {
 	}
 	if c.metricsListen != "127.0.0.1:9099" {
 		t.Errorf("metricsListen = %q, want the default 127.0.0.1:9099 (R8 round 2)", c.metricsListen)
+	}
+	if c.webmailPath != "config/webmail.yaml" {
+		t.Errorf("webmailPath = %q, want the default config/webmail.yaml (S2b)", c.webmailPath)
+	}
+	if c.brandsExtraPath != "" {
+		t.Errorf("brandsExtraPath = %q, want empty by default (S2b: no committed file for a private brand list to default to)", c.brandsExtraPath)
 	}
 }
 
@@ -153,6 +160,54 @@ func TestBoot_RejectsInvalidRules(t *testing.T) {
 	}
 }
 
+// TestBoot_RejectsMissingBrandsExtraFile is S2b's analogue of
+// TestBoot_RejectsMissingRulesFile: --brands-extra, once set, is
+// validated the same way every other config path is — before ever
+// touching Postgres.
+func TestBoot_RejectsMissingBrandsExtraFile(t *testing.T) {
+	c := shippedConfig(t)
+	c.brandsExtraPath = filepath.Join(t.TempDir(), "does-not-exist.yaml")
+	if _, _, _, err := boot(context.Background(), c); err == nil {
+		t.Fatalf("expected boot to fail with a missing brands-extra file")
+	}
+}
+
+// TestBoot_RejectsMissingWebmailFile is S2b's analogue for --webmail.
+func TestBoot_RejectsMissingWebmailFile(t *testing.T) {
+	c := shippedConfig(t)
+	c.webmailPath = filepath.Join(t.TempDir(), "does-not-exist.yaml")
+	if _, _, _, err := boot(context.Background(), c); err == nil {
+		t.Fatalf("expected boot to fail with a missing webmail file")
+	}
+}
+
+// TestBoot_MergesBrandsExtra is S2b: --brands-extra, when set, actually
+// merges into the brand set boot constructs — matched here against a
+// brand name that config/brands.yaml does NOT ship, so a false pass
+// (the shipped list alone happening to already match) is impossible.
+// Needs Postgres (boot only returns populated deps on a full success);
+// skips cleanly like every other DB-backed test here.
+func TestBoot_MergesBrandsExtra(t *testing.T) {
+	c := shippedConfig(t)
+	c.databaseURL = testDBURL(t)
+
+	extra := filepath.Join(t.TempDir(), "brands-extra.yaml")
+	if err := os.WriteFile(extra, []byte("brands:\n  - name: Zzyzxcorp\n"), 0o644); err != nil {
+		t.Fatalf("write brands-extra file: %v", err)
+	}
+	c.brandsExtraPath = extra
+
+	s, _, deps, err := boot(context.Background(), c)
+	if err != nil {
+		t.Fatalf("boot: %v", err)
+	}
+	defer s.Close()
+
+	if !deps.brands.Matches("Zzyzxcorp") {
+		t.Errorf("expected --brands-extra's entry to be merged into boot's brand set")
+	}
+}
+
 // TestRunServe_CheckSucceeds is S17's end-to-end path: connect, migrate,
 // validate the shipped config, and return with no error and no blocking —
 // including closing the store's pool on the way out (defer'd inside
@@ -169,6 +224,7 @@ func TestRunServe_CheckSucceeds(t *testing.T) {
 		"--vendors", c.vendorsPath,
 		"--weights", c.weightsPath,
 		"--brands", c.brandsPath,
+		"--webmail", c.webmailPath,
 		"--keys", c.keysPath,
 	}
 	if err := runServe(args); err != nil {
@@ -225,12 +281,12 @@ func TestRunServeWithContext_ServesTheAPI(t *testing.T) {
 		t.Fatalf("boot: %v", err)
 	}
 
-	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands})
+	w, err := worker.New(worker.Deps{Store: s, Config: cfg, Neighbors: deps.neighbors, Brands: deps.brands, Webmail: deps.webmail})
 	if err != nil {
 		s.Close()
 		t.Fatalf("worker.New: %v", err)
 	}
-	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands, deps.webmail)
 	if err != nil {
 		s.Close()
 		t.Fatalf("startAPIServer: %v", err)

@@ -213,7 +213,7 @@ func (s *Server) snapshotCorpusExample(ctx context.Context, tenant, subject stri
 	}
 
 	windows := feature.DefaultWindows(decisionAt)
-	fr, err := feature.Extract(ctx, tenant, subject, rawEvents, s.neighbors, windows, s.brands)
+	fr, err := feature.Extract(ctx, tenant, subject, rawEvents, s.neighbors, windows, s.brands, s.webmail)
 	if err != nil {
 		return 0, err
 	}

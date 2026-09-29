@@ -90,16 +90,18 @@ func run(args []string) error {
 }
 
 type serveConfig struct {
-	check         bool
-	dev           bool
-	databaseURL   string
-	rulesPath     string
-	vendorsPath   string
-	weightsPath   string
-	brandsPath    string
-	keysPath      string
-	metricsListen string
-	listenAddr    string
+	check           bool
+	dev             bool
+	databaseURL     string
+	rulesPath       string
+	vendorsPath     string
+	weightsPath     string
+	brandsPath      string
+	brandsExtraPath string
+	webmailPath     string
+	keysPath        string
+	metricsListen   string
+	listenAddr      string
 }
 
 // minKeySecretBytes and devSecretPrefix are the fix round's B2 guards
@@ -124,6 +126,13 @@ func parseServeFlags(args []string) (serveConfig, error) {
 	fs.StringVar(&c.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&c.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
 	fs.StringVar(&c.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
+	// S2b: brands-extra is OPTIONAL and has no default path at all (unlike
+	// --brands) — an operator's private brand list lives outside this
+	// public repo (AGENTS.md's data-boundary rule), so there is no
+	// checked-in file a default could ever point at. Empty (the default)
+	// means "no private brand list", not an error.
+	fs.StringVar(&c.brandsExtraPath, "brands-extra", os.Getenv("ABUSEKIT_BRANDS_EXTRA_CONFIG"), "optional path to a private, brands.yaml-shaped extra brand list, merged with --brands (env ABUSEKIT_BRANDS_EXTRA_CONFIG; empty disables it — S2b)")
+	fs.StringVar(&c.webmailPath, "webmail", envOr("ABUSEKIT_WEBMAIL_CONFIG", "config/webmail.yaml"), "path to webmail.yaml (S2b)")
 	// B2 fix round: NO default keys path. A silently-defaulted
 	// config/keys.yaml is exactly the fail-open behavior this guards
 	// against -- every deployment must say explicitly where its keys live.
@@ -218,6 +227,7 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 		Config:    cfg,
 		Neighbors: deps.neighbors,
 		Brands:    deps.brands,
+		Webmail:   deps.webmail,
 		Metrics:   deps.metrics,
 		Budgets:   deps.budgets,
 		Logger:    slog.Default(),
@@ -258,7 +268,7 @@ func runServeWithContext(ctx context.Context, c serveConfig) error {
 	// requests first means an evaluate call that's already claimed a
 	// subject gets to finish its round through a still-running worker
 	// rather than racing its own shutdown.
-	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands)
+	apiSrv, apiAddr, err := startAPIServer(c.listenAddr, s, w, cfg, deps.keys, deps.neighbors, deps.brands, deps.webmail)
 	if err != nil {
 		return fmt.Errorf("start api server: %w", err)
 	}
@@ -299,13 +309,13 @@ const (
 // convention), returning (nil, "", nil) — a test constructing a
 // serveConfig by hand (leaving listenAddr at its zero value) gets no
 // listener at all, never a port collision.
-func startAPIServer(addr string, s *store.Store, w *worker.Worker, cfg *config.Config, keys map[string]config.Key, neighbors feature.Neighbors, brands feature.BrandSet) (*http.Server, string, error) {
+func startAPIServer(addr string, s *store.Store, w *worker.Worker, cfg *config.Config, keys map[string]config.Key, neighbors feature.Neighbors, brands feature.BrandSet, webmail feature.WebmailSet) (*http.Server, string, error) {
 	if addr == "" {
 		return nil, "", nil
 	}
 	srv, err := serve.New(serve.Deps{
 		Store: s, Worker: w, Config: cfg, Keys: keys,
-		Neighbors: neighbors, Brands: brands, Logger: slog.Default(),
+		Neighbors: neighbors, Brands: brands, Webmail: webmail, Logger: slog.Default(),
 	})
 	if err != nil {
 		return nil, "", fmt.Errorf("construct http server: %w", err)
@@ -381,6 +391,7 @@ const (
 type bootDeps struct {
 	neighbors feature.Neighbors
 	brands    feature.BrandSet
+	webmail   feature.WebmailSet
 	metrics   *worker.Metrics
 	budgets   *worker.Budgets
 	// keys is design §4.3's per-producer/operator credential set (S3),
@@ -405,6 +416,21 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 	})
 	if err != nil {
 		return nil, nil, bootDeps{}, err
+	}
+	// S2b: brands-extra is optional (see parseServeFlags' own comment) —
+	// an empty path merges in nothing, MergeBrandSets(brands, BrandSet{})
+	// behaves identically to brands alone.
+	if c.brandsExtraPath != "" {
+		extra, err := feature.LoadBrandsFile(c.brandsExtraPath)
+		if err != nil {
+			return nil, nil, bootDeps{}, fmt.Errorf("load brands-extra config: %w", err)
+		}
+		brands = feature.MergeBrandSets(brands, extra)
+	}
+
+	webmail, err := feature.LoadWebmailFile(c.webmailPath)
+	if err != nil {
+		return nil, nil, bootDeps{}, fmt.Errorf("load webmail config: %w", err)
 	}
 
 	keysData, err := os.ReadFile(c.keysPath)
@@ -433,6 +459,7 @@ func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, boo
 	deps := bootDeps{
 		neighbors: feature.NewStoreNeighbors(s, feature.Config{}), // default link-kind policy (S1 fix round) until a tenant-specific override exists
 		brands:    brands,
+		webmail:   webmail,
 		budgets:   worker.NewPersistedBudgets(s, defaultPerAdapterDailyBudget, worker.DefaultPerSubjectDailyBudget, defaultPerTenantDailyBudget),
 		metrics:   metrics,
 		keys:      keys,

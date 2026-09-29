@@ -69,12 +69,14 @@ type Deps struct {
 	Config *config.Config
 	Keys   map[string]config.Key
 
-	// Neighbors and Brands feed the label handler's corpus-snapshot
-	// feature extraction (design §4.9) — the SAME values cmd/abusekit
-	// wires into the worker's own Deps, so a labelled subject's stored
-	// features match what the worker would have computed for it.
+	// Neighbors, Brands and Webmail feed the label handler's corpus-
+	// snapshot feature extraction (design §4.9) — the SAME values
+	// cmd/abusekit wires into the worker's own Deps, so a labelled
+	// subject's stored features match what the worker would have
+	// computed for it.
 	Neighbors feature.Neighbors
 	Brands    feature.BrandSet
+	Webmail   feature.WebmailSet
 
 	// Now returns the current time; nil uses time.Now().UTC(). Tests
 	// inject a fixed clock for deterministic signature/skew and
@@ -114,6 +116,7 @@ type Server struct {
 
 	neighbors feature.Neighbors
 	brands    feature.BrandSet
+	webmail   feature.WebmailSet
 
 	nowFn  func() time.Time
 	logger *slog.Logger
@@ -175,6 +178,7 @@ func New(deps Deps) (*Server, error) {
 		keys:           deps.Keys,
 		neighbors:      deps.Neighbors,
 		brands:         deps.Brands,
+		webmail:        deps.Webmail,
 		nowFn:          deps.Now,
 		logger:         deps.Logger,
 		replay:         newReplayCache(),

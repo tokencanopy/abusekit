@@ -23,29 +23,88 @@
 # comment for the exact rule and why it's text-wide rather than
 # positional.
 #
-# Still excluded: ebay, chase, ups, irs. Unlike the six above, these
-# aren't false-positive-prone specifically because they double as
-# integration/platform names — they're short, ordinary English words/
-# abbreviations ("chase" the verb, "ups" as in "ups and downs", "irs" as a
-# generic acronym) whose false-positive surface the integration-token rule
-# doesn't bound at all (there's no "chase sync"/"ups webhook" pattern to
-# gate on; the collision is with ordinary prose, not with integration
-# naming). Proper context-aware matching for these remains future work
-# (see docs/design's open questions).
+# S2b's N2 fix round adds a second, independent suppression: a brand
+# mentioned as part of describing an ordinary community gathering
+# ("<brand> group meetup", "<brand> fan club") does not match either —
+# common, unremarkable text for a social-media brand in particular, not a
+# lure.
+#
+# Still excluded: chase, irs. These are short, ordinary English words/
+# abbreviations ("chase" the verb, "irs" as a generic acronym) whose
+# false-positive surface neither the integration-token rule nor the
+# case-sensitive-token option below bounds well — proper context-aware
+# matching for these remains future work (see docs/design's open
+# questions).
+#
+# S2b's N1 fix round adds `case_sensitive` for a brand whose Name is a
+# short, single word that also doubles as an ordinary English word or
+# abbreviation: `ups` below (moved out of the excluded set) only matches
+# the identical-case standalone token "UPS", never the everyday word
+# "ups" (as in "its ups and downs").
+#
+# S2b's round 2 (H1): a category comment below names the CATEGORY only
+# (marketplace, social, shipping, ...) — it never pairs a category with a
+# specific quoted lure theme observed for that category's brands. See
+# internal/feature's TestBrandsYAML_CategoryCommentsStayGeneric.
+#
+# Categories below are alphabetized within each one.
 brands:
+  # Financial / payments
+  - name: Bank of America
+  - name: Binance
+  - name: Coinbase
   - name: PayPal
     aliases: ["Pay Pal"]
-  - name: Netflix
-  - name: Coinbase
-  - name: Binance
   - name: Wells Fargo
-  - name: Bank of America
-  - name: Walmart
-  - name: USPS
-  - name: FedEx
-  - name: Apple
-  - name: Stripe
-  - name: Google
+
+  # Retail / e-commerce
   - name: Amazon
+  - name: Walmart
+
+  # Shipping / postal (already-shipped carriers)
   - name: DHL
+  - name: FedEx
+  - name: USPS
+
+  # Subscription / streaming
+  - name: Netflix
+
+  # Tech / platform (generic single-word names, integration-token gated)
+  - name: Apple
+  - name: Google
   - name: Microsoft
+  - name: Stripe
+
+  # Marketplace / classifieds
+  - name: Depop
+  - name: eBay
+  - name: Etsy
+  - name: Mercari
+  - name: Poshmark
+  - name: Shopify
+  - name: Vinted
+
+  # Social / community. N2's community-context gate (a brand mentioned as
+  # part of an ordinary group/meetup/fan-club description) applies to
+  # every entry here, not only these four.
+  - name: Facebook
+  - name: Instagram
+  - name: TikTok
+    aliases: ["Tik Tok"]
+  - name: WhatsApp
+    aliases: ["What's App"]
+
+  # Travel / booking
+  - name: Airbnb
+  - name: Booking.com
+
+  # Shipping / postal (additional carriers)
+  - name: Australia Post
+  - name: Canada Post
+  - name: DPD
+  - name: Evri
+  - name: PostNL
+    aliases: ["Post NL"]
+  - name: Royal Mail
+  - name: UPS
+    case_sensitive: true

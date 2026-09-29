@@ -23,12 +23,16 @@ func repoRoot(t *testing.T) string {
 	return filepath.Join(filepath.Dir(thisFile), "..")
 }
 
-// loadShippedRuleConfig loads the real config/{rules,vendors,brands}.yaml
-// and config/local_weights.yaml this repo ships, matching
+// loadShippedRuleConfig loads the real config/{rules,vendors,brands,
+// webmail}.yaml and config/local_weights.yaml this repo ships, matching
 // cmd/abusekit's own loadRuleConfig — used by determinism_test.go and
 // floors_test.go's gate test so both exercise the SAME configuration
-// `make gate` runs, not a hand-rolled stand-in.
-func loadShippedRuleConfig(t *testing.T) (*config.Config, feature.BrandSet) {
+// `make gate` runs, not a hand-rolled stand-in. Brands additionally
+// merges in eval/fixtures/test_brands.yaml's fictional entries, exactly
+// the way Makefile's gate target's own --brands-extra flag does, so
+// genSubjectLure's fictional-brand lure scores the same here as it does
+// under `make gate` itself.
+func loadShippedRuleConfig(t *testing.T) (*config.Config, feature.BrandSet, feature.WebmailSet) {
 	t.Helper()
 	root := repoRoot(t)
 
@@ -71,7 +75,17 @@ func loadShippedRuleConfig(t *testing.T) (*config.Config, feature.BrandSet) {
 	if err != nil {
 		t.Fatalf("load brands.yaml: %v", err)
 	}
-	return cfg, brands
+	extra, err := feature.LoadBrandsFile(filepath.Join(root, "eval", "fixtures", "test_brands.yaml"))
+	if err != nil {
+		t.Fatalf("load eval/fixtures/test_brands.yaml: %v", err)
+	}
+	brands = feature.MergeBrandSets(brands, extra)
+
+	webmail, err := feature.LoadWebmailFile(filepath.Join(root, "config", "webmail.yaml"))
+	if err != nil {
+		t.Fatalf("load webmail.yaml: %v", err)
+	}
+	return cfg, brands, webmail
 }
 
 // loadShippedLocalWeights loads config/local_weights.yaml's raw Weights
@@ -101,7 +115,7 @@ func ruleByNameT(t *testing.T, cfg *config.Config, name string) config.Rule {
 // loadSyntheticDataset loads the committed synthetic corpus
 // (eval/fixtures/synthetic/{events,labels}.jsonl) — the same dataset
 // `make gate` runs.
-func loadSyntheticDataset(t *testing.T, brands feature.BrandSet) Dataset {
+func loadSyntheticDataset(t *testing.T, brands feature.BrandSet, webmail feature.WebmailSet) Dataset {
 	t.Helper()
 	root := repoRoot(t)
 	eventsPath := filepath.Join(root, "eval", "fixtures", "synthetic", "events.jsonl")
@@ -119,7 +133,7 @@ func loadSyntheticDataset(t *testing.T, brands feature.BrandSet) Dataset {
 
 	// "benign" matches config/rules.yaml's new_account_velocity.benign_label
 	// — every test using this helper scores that rule.
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: eventsPath, Events: eventsF, LabelsPath: labelsPath, Labels: labelsF}, brands, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: eventsPath, Events: eventsF, LabelsPath: labelsPath, Labels: labelsF}, brands, webmail, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset(synthetic corpus): %v (rowErrs=%v)", err, rowErrs)
 	}

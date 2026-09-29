@@ -86,7 +86,7 @@ func (o Options) withDefaults() Options {
 		o.BenignPerFamily = 22 // 7 families x 22 = 154, clearing the >=150 floor with margin
 	}
 	if o.AbusivePerFamily <= 0 {
-		o.AbusivePerFamily = 6 // burst, fast, dormant_then_blast, slow_operator x 6 = 24
+		o.AbusivePerFamily = 6 // burst, fast, dormant_then_blast, slow_operator, webmail_blast, subject_lure x 6 = 36 (F9 TODO added the last two)
 	}
 	if o.ChurnChainsPerKind <= 0 {
 		o.ChurnChainsPerKind = 2 // x3 kinds x 5-subject chains = 30 churn subjects
@@ -133,21 +133,28 @@ var abusiveFamilies = []struct {
 	{"abusive_fast", genFast},
 	{"abusive_dormant_then_blast", genDormantThenBlast},
 	{"abusive_slow_operator", genSlowOperator},
+	// F9 TODO: S2b's webmail_recipient_share/webmail_sends_1h/
+	// subject_brand_match otherwise read 0 across the ENTIRE corpus —
+	// every other family's recipient_domain is a synthetic .example.test
+	// name and no family ever sets subject_line at all.
+	{"abusive_webmail_blast", genWebmailBlast},
+	{"abusive_subject_lure", genSubjectLure},
 }
 
 var churnKinds = []string{"email", "card", "device"}
 
 // Generate builds the full synthetic corpus: Options.BenignPerFamily
-// subjects for each of the seven benign families (default 22 each, 154
-// total — clearing the task brief's ">=150 benign subjects across the
-// realistic families" floor), Options.AbusivePerFamily subjects for each
-// of burst/fast/dormant-then-blast/slow-operator (default 6 each, 24
-// total), plus Options.ChurnChainsPerKind churn chains of
-// Options.ChurnChainLength incarnations for each of the three
-// email/card/device-linked variants (default 2x5=10 per kind, 30 total)
-// — 54 abusive subjects total, clearing the ">=40 abusive subjects
-// across burst, fast, churn (email/card/device-linked variants),
-// dormant-then-blast and slow-operator families" floor.
+// subjects for each of the benign families (default 22 each — clearing
+// the task brief's ">=150 benign subjects across the realistic families"
+// floor), Options.AbusivePerFamily subjects for each of burst/fast/
+// dormant-then-blast/slow-operator/webmail-blast/subject-lure (default 6
+// each, 36 total — the last two added by the F9 TODO), plus
+// Options.ChurnChainsPerKind churn chains of Options.ChurnChainLength
+// incarnations for each of the three email/card/device-linked variants
+// (default 2x5=10 per kind, 30 total) — clearing the ">=40 abusive
+// subjects across burst, fast, churn (email/card/device-linked
+// variants), dormant-then-blast and slow-operator families" floor with
+// margin to spare.
 //
 // Every random draw comes from a single *rand.Rand seeded from
 // Options.Seed, consumed in the FIXED family/index order above — this is

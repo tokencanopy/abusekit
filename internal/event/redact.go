@@ -3,6 +3,7 @@ package event
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"unicode"
 	"unicode/utf8"
@@ -21,7 +22,14 @@ import (
 // relative to a freshly-redacted one — that's what lets an operator (or a
 // future migration) identify which rows were redacted under an older
 // rule set without guessing from `received_at` timestamps.
-const RedactionSchemaVersion = 1
+//
+// S2b bumped this from 1 to 2: content.sent's `recipient_hash` now has a
+// closed format (S4), `recipient_count` must be a positive integer (N6),
+// a recipient_hash paired with recipient_count > 1 is rejected (S6), and
+// `subject_line` masks an email-shaped substring instead of rejecting the
+// whole event (S5) — each changes what an already-stored row's `data`
+// means relative to a freshly-redacted one.
+const RedactionSchemaVersion = 2
 
 // fieldKind is a listed field's declared value type (R2 round-2 review:
 // "listed fields typed only as 'some scalar'"). Before this, a switch on
@@ -73,6 +81,31 @@ type fieldSpec struct {
 	// string field, still capped/skeletoned as configured above). Only
 	// meaningful on a kindText field.
 	enum []string
+	// format, when non-nil, is a closed shape a string value must fully
+	// match (S2b's S4 fix round: content.sent's recipient_hash must match
+	// ^[A-Za-z0-9_:+/=-]{8,128}$, rejecting anything containing '@' or
+	// '%', any whitespace, or anything outside that set). A field with
+	// format set is validated INSTEAD of enum/maxLen truncation — the
+	// format's own bounds (recipientHashRe's own {8,128}) are exact, so
+	// truncating an over-length value first (as maxLen would) could
+	// silently turn an invalid hash into one that happens to match after
+	// losing its tail; a mismatch is always a hard reject, never a lossy
+	// truncation. Only meaningful on a kindText field.
+	format *regexp.Regexp
+	// maskEmail, when true (content.sent's subject_line, S2b's S5 fix
+	// round), replaces an email-shaped substring with "@" instead of
+	// rejecting the whole event the way every other field's email check
+	// does (scanForLeaks) — see Redact's own doc comment for the exact
+	// order this runs in. Only meaningful on a kindText field, and
+	// mutually exclusive with format (no field needs both).
+	maskEmail bool
+	// positiveInteger, when true (content.sent's recipient_count, S2b's
+	// N6 fix round), additionally rejects a kindNumber value that is
+	// zero, negative, or not a whole number — a producer's own event
+	// vocabulary says this field counts recipients, and a fractional or
+	// non-positive count is never a valid count of anything. Only
+	// meaningful on a kindNumber field.
+	positiveInteger bool
 }
 
 // isEnumValue reports whether s is one of spec's allowed enum values.
@@ -107,6 +140,18 @@ var schema = map[string]map[string]fieldSpec{
 		"channel":            {maxLen: 64},
 		"email_domain_class": {maxLen: 32, enum: []string{"webmail", "corporate", "disposable", "unknown"}},
 		"identity_kind":      {maxLen: 64},
+		// [round 2] R8: an optional producer-supplied real account-
+		// creation instant, preferred by internal/feature's Extract over
+		// its own derived "earliest ingested event" firstSeenAt when
+		// present (see accountCreatedAt in internal/feature/windows.go).
+		// Without it, an established account onboarded onto abusekit
+		// well after its real signup reads as brand new, defeating every
+		// history-relative/age-decay feature exactly for the accounts
+		// they exist to protect. Validated exactly against RFC 3339
+		// (format, not just maxLen) so a malformed value fails loudly at
+		// ingest instead of silently failing time.Parse deep inside
+		// feature extraction.
+		"account_created_at": {format: accountCreatedAtRe},
 	},
 	"subject.deleted": {
 		"mode": {maxLen: 16, enum: []string{"trash", "permanent"}},
@@ -134,10 +179,16 @@ var schema = map[string]map[string]fieldSpec{
 		"address_domain": {maxLen: 253},
 	},
 	"content.sent": {
-		"subject_line":              {maxLen: 200, skeleton: true},
-		"recipient_domain":          {maxLen: 253},
-		"recipient_count":           {kind: kindNumber},
-		"recipient_hash":            {maxLen: 128},
+		// S2b's S5 fix round: an email-shaped substring is MASKED (not a
+		// whole-event reject) — see Redact's own doc comment.
+		"subject_line":     {maxLen: 200, skeleton: true, maskEmail: true},
+		"recipient_domain": {maxLen: 253},
+		// S2b's N6 fix round: recipient_count, if present, must be a
+		// positive integer.
+		"recipient_count": {kind: kindNumber, positiveInteger: true},
+		// S2b's S4 fix round: recipient_hash must match a closed,
+		// non-PII-shaped format — see recipientHashRe.
+		"recipient_hash":            {format: recipientHashRe},
 		"recipient_is_own_identity": {kind: kindBool},
 		"first_link_host":           {maxLen: 253},
 	},
@@ -172,6 +223,36 @@ func looksLikeEmail(s string) bool {
 	return emailRe.MatchString(norm.NFKC.String(s))
 }
 
+// maskEmails replaces every email-shaped substring in s (after NFKC
+// folding, the same normalization looksLikeEmail already matches against
+// — see its own doc comment for why) with a literal "@", rather than
+// rejecting the whole value (S2b's S5 fix round). Multiple email-shaped
+// substrings are each replaced independently.
+func maskEmails(s string) string {
+	return emailRe.ReplaceAllString(norm.NFKC.String(s), "@")
+}
+
+// recipientHashRe is content.sent's recipient_hash format (S2b's S4 fix
+// round): 8 to 128 characters from a closed, non-PII-shaped set — letters,
+// digits, and the punctuation a base64url/hex/opaque-token encoding
+// commonly uses (underscore, colon, plus, slash, equals, hyphen).
+// Deliberately excludes '@' and '%' and any whitespace: a keyed hash the
+// producer computed should never look like an email address or a
+// URL-escaped value, and requiring the closed set rather than only
+// blocklisting '@'/'%'/whitespace catches anything else unanticipated
+// too (design's own "a keyed hash the producer holds" contract, §4.3).
+var recipientHashRe = regexp.MustCompile(`^[A-Za-z0-9_:+/=-]{8,128}$`)
+
+// accountCreatedAtRe is subject.created's optional account_created_at
+// format ([round 2] R8): a full RFC 3339 date-time (date, "T", time,
+// optional fractional seconds, and a "Z" or numeric UTC offset) —
+// anything looser (a bare date, a Unix timestamp, free text) is rejected
+// rather than accepted and later failing time.Parse deep inside feature
+// extraction. Deliberately doesn't use time.Parse itself here: Redact's
+// other format fields are all regex-validated, and a regex keeps this
+// field's validation in the same place/style as the rest of the schema.
+var accountCreatedAtRe = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$`)
+
 // hasControlChar reports whether s contains any Unicode control character
 // (category Cc, which includes NUL and every other C0/C1 control code).
 // Redact and Validate both reject these outright: a NUL byte in specific
@@ -187,6 +268,18 @@ func hasControlChar(s string) bool {
 	return false
 }
 
+// emailMaskExemptKey returns the one top-level `data` key (if any) for
+// which scanForLeaks' email check must be skipped in favour of masking
+// (S2b's S5 fix round) — content.sent's subject_line. Every other field,
+// of every event type, keeps rejecting an embedded email-shaped substring
+// outright.
+func emailMaskExemptKey(eventType string) string {
+	if eventType == "content.sent" {
+		return "subject_line"
+	}
+	return ""
+}
+
 // Redact rewrites e.Data in place per the static schema for e.Type
 // (design §4.3):
 //
@@ -196,16 +289,25 @@ func hasControlChar(s string) bool {
 //     This runs before any type-checking, dropping or truncation, so a
 //     producer cannot dodge it by nesting a value inside an unlisted key,
 //     an array, or a field belonging to an event type Redact doesn't
-//     recognize.
+//     recognize. The ONE exception (S2b's S5 fix round) is content.sent's
+//     top-level subject_line: an email-shaped substring there is masked,
+//     not rejected — see emailMaskExemptKey and the field loop below.
 //   - For a known type: listed keys pass through, but ONLY as a scalar
 //     (string, number, or bool) — an object or array under a listed key is
 //     rejected with CodeRedactionFailed rather than silently stored,
-//     stringified, or size-capped, since the field's cap and skeleton
+//     stringified, or size-capped, since the field's cap/format/skeleton
 //     handling only make sense for a single scalar value. Unlisted keys
 //     are dropped (not hashed). A string field with `skeleton: true` also
 //     gets a computed `<key>_skeleton` sibling (any producer-supplied
 //     value under that name is dropped as unlisted, then replaced by our
-//     own computation); an over-cap string is truncated, not rejected.
+//     own computation); an over-cap string is truncated, not rejected,
+//     UNLESS the field has a `format` (S4), which is validated exactly
+//     with no truncation. A number field with `positiveInteger` (N6)
+//     additionally rejects zero, negative or fractional values.
+//   - content.sent additionally rejects a recipient_hash paired with a
+//     recipient_count > 1 (S2b's S6 fix round): design's redaction
+//     section documents that a set recipient_hash represents exactly one
+//     recipient.
 //   - For an unknown type: every key is kept as-is (no allow-listing to
 //     apply) — the recursive scan above already proved it clean.
 //
@@ -219,7 +321,8 @@ func (e *Event) Redact() error {
 		return nil
 	}
 
-	if err := scanForLeaks(e.Data, "data"); err != nil {
+	exemptKey := emailMaskExemptKey(e.Type)
+	if err := scanForLeaks(e.Data, "data", exemptKey); err != nil {
 		return err
 	}
 
@@ -252,11 +355,41 @@ func (e *Event) Redact() error {
 				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got a string", k, spec.kind))
 			}
 			s := val
-			if !spec.isEnumValue(s) {
-				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q is not one of %v", k, s, spec.enum))
-			}
-			if spec.maxLen > 0 && len(s) > spec.maxLen {
-				s = truncateUTF8(s, spec.maxLen)
+			switch {
+			case spec.format != nil:
+				// S4: a formatted field is validated exactly, never
+				// truncated — see fieldSpec.format's own doc comment for
+				// why truncating first would be unsafe here.
+				if !spec.format.MatchString(s) {
+					return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q does not match the required format", k, s))
+				}
+			case spec.maskEmail:
+				// S5: mask an embedded email rather than reject. Round 2's
+				// nit: s is NFKC-folded HERE, unconditionally — not only
+				// when looksLikeEmail actually finds something to mask
+				// (maskEmails' own internal NFKC fold, applied only to the
+				// text it replaces into, previously meant subject_line was
+				// folded when masking happened to trigger and left raw,
+				// unfolded bytes otherwise: a Unicode-compatible look-alike
+				// like fullwidth "ＵＰＳ" survived unfolded in the far more
+				// common unmasked case, and the identical logical subject
+				// line could be stored as two different byte sequences
+				// depending on whether an email-shaped substring happened
+				// to also be present). looksLikeEmail/maskEmails each fold
+				// again internally, which is idempotent and therefore
+				// harmless.
+				s = norm.NFKC.String(s)
+				if looksLikeEmail(s) {
+					s = maskEmails(s)
+				}
+				fallthrough
+			default:
+				if !spec.isEnumValue(s) {
+					return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s %q is not one of %v", k, s, spec.enum))
+				}
+				if spec.maxLen > 0 && len(s) > spec.maxLen {
+					s = truncateUTF8(s, spec.maxLen)
+				}
 			}
 			out[k] = s
 			if spec.skeleton {
@@ -265,6 +398,9 @@ func (e *Event) Redact() error {
 		case float64:
 			if spec.kind != kindNumber {
 				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be %s, got a number", k, spec.kind))
+			}
+			if spec.positiveInteger && (val <= 0 || val != math.Trunc(val)) {
+				return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be a positive integer, got %v", k, val))
 			}
 			out[k] = val
 		case bool:
@@ -275,6 +411,10 @@ func (e *Event) Redact() error {
 		default:
 			return badErr(CodeRedactionFailed, fmt.Sprintf("data.%s must be a string, number, or bool, got %T", k, v))
 		}
+	}
+
+	if err := validateContentSentCrossFields(e.Type, out); err != nil {
+		return err
 	}
 
 	size, err := jsonSize(out)
@@ -292,28 +432,53 @@ func (e *Event) Redact() error {
 	return nil
 }
 
+// validateContentSentCrossFields is S2b's S6 fix round: a content.sent
+// event that sets recipient_hash represents exactly one recipient, so
+// pairing it with a recipient_count > 1 is a contradiction, rejected
+// rather than silently stored. A no-op for every other event type, and
+// for content.sent without both fields set.
+func validateContentSentCrossFields(eventType string, out map[string]any) error {
+	if eventType != "content.sent" {
+		return nil
+	}
+	hash, hasHash := out["recipient_hash"].(string)
+	count, hasCount := out["recipient_count"].(float64)
+	if hasHash && hash != "" && hasCount && count > 1 {
+		return badErr(CodeRedactionFailed, "data.recipient_hash represents exactly one recipient and cannot be paired with data.recipient_count > 1")
+	}
+	return nil
+}
+
 // scanForLeaks walks v recursively (v is always one of the types
 // encoding/json produces into an `any`: string, float64, bool, nil,
 // []any, or map[string]any — including when a test constructs a value by
 // hand rather than through json.Unmarshal), checking every string value
 // and every map key against hasControlChar/looksLikeEmail. path is used
 // only to build a human-readable error message.
-func scanForLeaks(v any, path string) error {
+//
+// emailMaskExempt (S2b's S5 fix round), when non-empty, is the ONE
+// top-level `data` key whose value is exempt from this function's
+// looksLikeEmail check specifically — every other field, including a
+// NESTED occurrence of a key with the same name, keeps rejecting an
+// embedded email-shaped substring outright. The control-character/
+// invalid-UTF-8 checks are never exempted for any field.
+func scanForLeaks(v any, path, emailMaskExempt string) error {
 	switch val := v.(type) {
 	case string:
-		return checkLeakString(val, path)
+		exempt := emailMaskExempt != "" && path == "data."+emailMaskExempt
+		return checkLeakString(val, path, exempt)
 	case map[string]any:
 		for k, vv := range val {
-			if err := checkLeakString(k, path+"."+k+" (key)"); err != nil {
+			if err := checkLeakString(k, path+"."+k+" (key)", false); err != nil {
 				return err
 			}
-			if err := scanForLeaks(vv, path+"."+k); err != nil {
+			if err := scanForLeaks(vv, path+"."+k, emailMaskExempt); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for i, vv := range val {
-			if err := scanForLeaks(vv, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+			if err := scanForLeaks(vv, fmt.Sprintf("%s[%d]", path, i), emailMaskExempt); err != nil {
 				return err
 			}
 		}
@@ -321,7 +486,7 @@ func scanForLeaks(v any, path string) error {
 	return nil
 }
 
-func checkLeakString(s, path string) error {
+func checkLeakString(s, path string, allowEmailShape bool) error {
 	// R1 (round 2): ranging over invalid UTF-8 silently substitutes U+FFFD
 	// per bad byte — hasControlChar never sees the original bytes, so an
 	// invalid sequence would otherwise reach Postgres and fail the whole
@@ -332,7 +497,7 @@ func checkLeakString(s, path string) error {
 	if hasControlChar(s) {
 		return badErr(CodeRedactionFailed, path+" contains a control character")
 	}
-	if looksLikeEmail(s) {
+	if !allowEmailShape && looksLikeEmail(s) {
 		return badErr(CodeRedactionFailed, path+" looks like an email address")
 	}
 	return nil
