@@ -320,7 +320,7 @@ cleanup that runs before the neutrality CI) or deleted in P-E2:
 | Location | Domain knowledge | Fix | Slice |
 | --- | --- | --- | --- |
 | `internal/worker/reason.go` `renderReason` | Prints email-named features by hand. | Reason is generated generically from the rule's inputs: the top contributing features by `|w·x|`, with their values. `reason_version: 3`. | P-N0 |
-| `pkg/abusekit` `Links.EmailHash` (public Go SDK) | Email link kind in a typed struct. The flat map is a **breaking SDK change**. | Add the module path `pkg/abusekit/v2`, where `Links` is `map[string]string`. v1 is frozen and deprecated but still emits identical wire bytes. e2a's emitter (S6) moves to v2 at its own pace, and v1 is removed one release after that. The v1 identifier sits on the allowlist, keyed by `(file, identifier)`, until then. | P-N0 (v2), P-E2 (allowlist expiry date) |
+| `pkg/abusekit` `Links.EmailHash` (public Go SDK) | Email link kind in a typed struct. The flat map is a **breaking SDK change**. | **Replaced in place** (owner decision, Q32). `pkg/abusekit` on `main` changes `Links` to `map[string]string`. There is no new module path, no second version, and no retirement window. It's pre-GA with no external consumers, so this is simply a breaking change, called out in the release notes and changelog. The wire bytes for the legacy link kinds are unchanged (M1 canonical order). No allowlist entry is needed. | P-N0 |
 | `eval/neighbors.go` `defaultNeighborKinds` | Hard-codes `email_hash`. | Uses the profile's declared evidence kinds. | P-N0 |
 | `eval/gen` | Generates `content.sent` families in Go. | Becomes a data-driven generator. Families are YAML in each pack (`packs/<p>/gen/*.yaml`) or example profile; the Go generator stays neutral. | P-N0 |
 | `internal/feature/store_neighbors.go` `allLinkKinds` | Lists `email_hash`. | Derived from the tenant's declared link kinds. | P-N0 |
@@ -1800,7 +1800,7 @@ as described in §5.2.
 | P4c | Class R, budgets, flags, flood | `peak` (with `sum`) under the raw-unit saturation limit per transform (§5.7); `neighbours` exact by saturation; the partial/degraded direction table; `ratio` partial propagation and `ratio_den_partial_capable`; `relative_to_history` with its baseline budget; `partial` in verdicts and the API; pass order; `TestFeatureIndependence`; flood generator and property; cost benchmark. **Then enable bounded evaluation for e2a.** | P4b | Criteria 4 and 6; golden exact under the bounded evaluator |
 | P4d | Rescore control and warm-up | Proportional coalescing; timers only from non-shadow rules; per-tenant budget; warm-up | P4c, P3c | Storm and warm-up tests |
 | P5 | Pack gating | Registry; the Go `core` and `brand` adapters and the `declared` (YAML) adapter; enablement; `brand.title_match` (needs the `title` role); brand lists moved to data; `packtest`; starter weights | P3a, P4c | Golden exact; `feature_not_enabled`; every pack passes `packtest` |
-| P-N0 | Neutral cleanup (M3) | `reason.go` made generic; `pkg/abusekit/v2` with a map `Links` (v1 frozen); `eval/neighbors.go` and `allLinkKinds` driven by declared evidence; data-driven `eval/gen`; brand word lists moved to data; config YAML moved to `examples/tenants/reference`, `packs/email` and `packs/brand` | P5 | Golden exact; SDK v1 and v2 produce identical wire bytes |
+| P-N0 | Neutral cleanup (M3) | `reason.go` made generic; `pkg/abusekit` `Links` replaced in place by a map (a breaking change, noted in the release notes); `eval/neighbors.go` and `allLinkKinds` driven by declared evidence; data-driven `eval/gen`; brand word lists moved to data; config YAML moved to `examples/tenants/reference`, `packs/email` and `packs/brand` | P5 | Golden exact. The SDK's contract tests are updated to the map `Links`, and a wire test shows the new SDK emits bytes identical to the pre-change SDK for every legacy link kind. The changelog carries a breaking-change entry. |
 | P-E1 | YAML email pack, in shadow | Embedded `packs/email/` plus the manifest. Primitives: baseline override (monotone ops, `sum`/`cap_each`), `distinct.on_missing`, the closed `compat` enum with conformance tests, lifetime `share`, `brand_match` with declarable exemptions and the per-role matcher variants, standalone `age_decay`, cross-field constraints, `rescore: legacy_v0`. The `subject_display_names` fact table; pack extensions of built-in types; the flat `links` map with its canonical serialisation; the `derived` column; `store: raw+skeleton`. The `content.sent` schema, `email_hash`, `email_domain_class` and `address_domain` move into the pack. Loaded as `emailshadow.*`, with the production mismatch metric. | P-N0, P4b, P4c | The pack loads from the embedded manifest. **`TestWireByteIdentity`**: stored `links` and `data` bytes, `body_hash` and error codes identical over the whole pre-P-E1 corpus. Golden exact (Go still drives scores). Every shadow feature bit-identical to its Go twin on the golden, including `NextRescoreAt` and input hashes. The H1 counter-example fixture passes. |
 | P-E2 | Parity gate, switch, deletion | Preconditions:<br>• embedded packs;<br>• fail-closed ingest (`TestIngestFailsClosedOnConfigError`);<br>• the shadow-mismatch gate: N clean days, divergences labelled (M6).<br>Then:<br>• switch the binding `as: emailshadow` to `as: email`; the pack SHA is unchanged;<br>• delete the Go email features, `WebmailSet`, the `--webmail` flag, the `content.sent` matches, and the transitional built-in `content.sent` schema;<br>• turn on the neutrality CI and the runtime `Reads` filter.<br>**Ordered ops step:** the hosted profile pin (`email@1.0.0#sha256:…`) and the compose cleanup (the `--webmail` flag and its environment variable) ship **in the same release** as the deletion. | P-E1 and the N-day gate | Parity oracle is the post-P4a Go code (M7). Golden exact after deletion. `TestCoreIsDomainNeutral`, `TestNonEmailProfileEndToEnd`, `TestGoRegistryLint` and `Reads` enforcement green. |
 | P5b | Core DSL parity | Every expressible *core* S2 feature re-expressed in the DSL (a conformance check; the core Go features stay, being neutral) | P4c | Bit-exact against the Go feature on every fixture |
@@ -1987,8 +1987,9 @@ Where the re-review's (R3) answer differs from the earlier recommendation, both 
       `rescore_legacy_v0` (H5).
 31. **The P-E2 clean-days gate (new).** How many consecutive days of zero unlabelled shadow
     mismatches in production before the Go email code is deleted? Proposed: 7.
-32. **Go SDK v2 (new).** A breaking `pkg/abusekit/v2`, with `Links` as a map, and v1 frozen and
-    removed one release after S6 moves. Approve the plan and v1's end-of-life?
+32. **Go SDK links change. Decided (owner):** replace `pkg/abusekit` in place, with `Links` as a
+    map. It's a breaking change on `main`, called out in the release notes and changelog. No
+    parallel versions.
 33. **`recipient_count` bounds (new, M2).** The email pack declares `recipient_count` with
     `min: 1, integer: true, max: 1000000`. The max must be at least e2a's largest per-message
     recipient count. Confirm the value against e2a's send limits before P-E1.
@@ -2255,7 +2256,7 @@ are versioned, whether they are public, pack pinning, tenant-private packs, and 
 - **M2:** derived fields live in a separate `derived` column, outside `body_hash` and the 8 KiB
   limit. Adds `store: raw+skeleton`. `recipient_count` declares `min: 1, integer: true,
   max: 1000000` (Q33).
-- **M3:** the audit of non-feature code is complete: `reason.go`, SDK v2 for `EmailHash`,
+- **M3:** the audit of non-feature code is complete: `reason.go`, the SDK's `EmailHash`,
   `eval/neighbors.go`, `eval/gen`, #7's `--webmail` flag and env var (with an ops note),
   `WebmailSet`, the `content.sent` matches, `allLinkKinds`, `"agent"`, and the config YAML. The
   cleanup slice P-N0 is added.
@@ -2290,4 +2291,8 @@ are versioned, whether they are public, pack pinning, tenant-private packs, and 
 
 **Decisions**
 - Q26–Q30 now carry the review's answers.
-- New: Q31 (clean days), Q32 (SDK v2) and Q33 (`recipient_count` max).
+- New: Q31 (clean days), Q32 (SDK links change) and Q33 (`recipient_count` max).
+
+### Revision 7a
+
+- Owner decision on Q32: the Go SDK is replaced in place. `pkg/abusekit` `Links` becomes a map as a breaking change, noted in the release notes and changelog. There's no v2 module path and no retirement window.
