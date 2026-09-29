@@ -9,7 +9,9 @@
 // `/v1/*` HTTP surface itself (internal/serve): `serve` without --check
 // now runs both the worker AND the API, blocking on SIGINT/SIGTERM.
 // `serve --check` is unaffected: it still only validates config and
-// migrates the database, then exits 0.
+// migrates the database, then exits 0. S4 adds `eval`/`score`/`corpus`
+// (eval_cmd.go/score_cmd.go/corpus_cmd.go): the evaluation harness CLI,
+// which never touches Postgres except for `corpus export`.
 package main
 
 import (
@@ -32,31 +34,58 @@ import (
 
 	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/feature"
-	"github.com/tokencanopy/abusekit/internal/model"
-	"github.com/tokencanopy/abusekit/internal/model/local"
 	"github.com/tokencanopy/abusekit/internal/serve"
 	"github.com/tokencanopy/abusekit/internal/store"
 	"github.com/tokencanopy/abusekit/internal/worker"
 )
 
+// exitError pairs an error with the process exit code main() should use
+// for it (api-design: "exit codes 0 for pass, 1 for a floor violation, 2
+// for bad input" — eval_cmd.go/score_cmd.go/corpus_cmd.go return one of
+// these instead of a plain error whenever the distinction matters). A
+// plain error (every pre-S4 code path) still exits 1, unchanged.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
+
+// exitCode1 / exitCode2 build an *exitError for a floor violation / bad
+// input, respectively (see the api-design contract above).
+func exitCode1(err error) error { return &exitError{code: 1, err: err} }
+func exitCode2(err error) error { return &exitError{code: 2, err: err} }
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "abusekit:", err)
-		os.Exit(1)
+		code := 1
+		var ec *exitError
+		if errors.As(err, &ec) {
+			code = ec.code
+		}
+		os.Exit(code)
 	}
 }
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: abusekit <serve|migrate> [flags]")
+		return errors.New("usage: abusekit <serve|migrate|eval|score|corpus> [flags]")
 	}
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:])
 	case "migrate":
 		return runMigrate(args[1:])
+	case "eval":
+		return runEval(args[1:])
+	case "score":
+		return runScore(args[1:])
+	case "corpus":
+		return runCorpus(args[1:])
 	default:
-		return fmt.Errorf("unknown subcommand %q (want \"serve\" or \"migrate\")", args[0])
+		return fmt.Errorf("unknown subcommand %q (want \"serve\", \"migrate\", \"eval\", \"score\", or \"corpus\")", args[0])
 	}
 }
 
@@ -379,44 +408,14 @@ type bootDeps struct {
 // weights/brands file fails fast without ever touching Postgres, rather
 // than migrating a database it's about to report as unusable anyway.
 func boot(ctx context.Context, c serveConfig) (*store.Store, *config.Config, bootDeps, error) {
-	weights, err := local.LoadWeightsFile(c.weightsPath)
-	if err != nil {
-		return nil, nil, bootDeps{}, err
-	}
-	localScorer, err := local.New(weights)
-	if err != nil {
-		return nil, nil, bootDeps{}, err
-	}
-	registry := model.NewRegistry()
-	if err := registry.Register(localScorer); err != nil {
-		return nil, nil, bootDeps{}, err
-	}
-
-	vendorsData, err := os.ReadFile(c.vendorsPath)
-	if err != nil {
-		return nil, nil, bootDeps{}, fmt.Errorf("read vendors config: %w", err)
-	}
-	vendors, err := config.LoadVendors(vendorsData)
-	if err != nil {
-		return nil, nil, bootDeps{}, err
-	}
-
-	rulesData, err := os.ReadFile(c.rulesPath)
-	if err != nil {
-		return nil, nil, bootDeps{}, fmt.Errorf("read rules config: %w", err)
-	}
-	cfg, err := config.Load(rulesData, config.Dependencies{
-		Registry: registry,
-		Features: config.NewFeatureSet(feature.Names...),
-		Vendors:  vendors,
+	cfg, _, brands, err := loadRuleConfig(ruleConfigPaths{
+		rulesPath:   c.rulesPath,
+		vendorsPath: c.vendorsPath,
+		weightsPath: c.weightsPath,
+		brandsPath:  c.brandsPath,
 	})
 	if err != nil {
-		return nil, nil, bootDeps{}, fmt.Errorf("load rules config: %w", err)
-	}
-
-	brands, err := feature.LoadBrandsFile(c.brandsPath)
-	if err != nil {
-		return nil, nil, bootDeps{}, fmt.Errorf("load brands config: %w", err)
+		return nil, nil, bootDeps{}, err
 	}
 	// S2b: brands-extra is optional (see parseServeFlags' own comment) —
 	// an empty path merges in nothing, MergeBrandSets(brands, BrandSet{})

@@ -52,3 +52,64 @@ func (s *Store) InsertCorpusExample(ctx context.Context, tenant string, ex Corpu
 	}
 	return id, nil
 }
+
+// CorpusExportRow is one corpus_examples row joined with its label
+// (design §4.9's "a label writes a corpus example"; §4.10's
+// `abusekit corpus export`). EventSlice/Features are left as raw JSON —
+// the harness (eval package), not this package, knows how to turn an
+// event slice back into text-field values, and re-decoding Features into
+// a Go map here would just be thrown away again the moment it's
+// re-marshaled for corpus-v1's `input.features`.
+type CorpusExportRow struct {
+	ID          int64
+	Subject     string
+	DecisionAt  time.Time
+	EventSlice  json.RawMessage
+	Features    json.RawMessage
+	Split       string
+	Label       string
+	LabelSource string
+	Rule        string
+	Gated       bool
+}
+
+// ListCorpusExamples returns every corpus_examples row for tenant,
+// optionally restricted to one split ("" or "all" means every split),
+// joined with the labels row that produced it, ordered by id (insertion
+// order) for a deterministic, reproducible export.
+//
+// design §4.9: "A label enters the gate corpus only after a second
+// source ... agrees" — nothing yet SETS corpus_examples.gated true (no
+// writer exists for it anywhere in this repo; see cmd/abusekit/
+// corpus_cmd.go's own doc comment on the "second source agreement" gap
+// this leaves open). ListCorpusExamples still surfaces the column as-is
+// (CorpusExportRow.Gated) rather than filtering on it, so a caller can
+// see and reason about the gap instead of silently exporting nothing.
+func (s *Store) ListCorpusExamples(ctx context.Context, tenant, split string) ([]CorpusExportRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT c.id, c.subject, c.decision_at, c.event_slice, c.features, c.split, c.gated,
+		       l.label, l.source, l.rule
+		FROM corpus_examples c
+		JOIN labels l ON l.id = c.label_id AND l.tenant = c.tenant
+		WHERE c.tenant = $1 AND ($2 = '' OR $2 = 'all' OR c.split = $2)
+		ORDER BY c.id ASC
+	`, tenant, split)
+	if err != nil {
+		return nil, fmt.Errorf("store: query corpus examples: %w", err)
+	}
+	defer rows.Close()
+
+	var out []CorpusExportRow
+	for rows.Next() {
+		var r CorpusExportRow
+		if err := rows.Scan(&r.ID, &r.Subject, &r.DecisionAt, &r.EventSlice, &r.Features, &r.Split, &r.Gated,
+			&r.Label, &r.LabelSource, &r.Rule); err != nil {
+			return nil, fmt.Errorf("store: scan corpus example row: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate corpus examples: %w", err)
+	}
+	return out, nil
+}
