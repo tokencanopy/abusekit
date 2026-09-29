@@ -282,7 +282,7 @@ the way the hand-written fixtures above are:
   `impersonationNames`; benign shapes pair one WITH an integration word —
   `eval/gen/benign.go`'s `integrationAgentNames`).
 
-18 families, 286 subjects total: 232 benign across 9 families (fast
+20 families, 297 subjects total: 231 benign across 9 families (fast
 developer onboarding with self-tests, integration-heavy orgs, day-1
 receipts fan-out to 10–40 domains, support-desk later-day fan-out,
 newsletter-style later-day fan-out, slow upgraders, $0-trial accounts,
@@ -290,21 +290,42 @@ plus two fix-round S3 additions — a shared-card household of 2–3
 otherwise-unremarkable members, and a deleted-then-legitimately-
 resigns-up-later pair sharing an email — none of which the shipped
 `config/local_weights.yaml` was tuned against, unlike the hand-written
-benign fixtures above) and 54 abusive across burst/fast/
-dormant-then-blast/slow-operator (6 each, every count and gap seeded
-jitter — fix round S3) plus three churn variants — email-linked,
-card-linked, device-linked (2 chains of 5 incarnations each, 10 subjects
-per kind, now with jittered timing/declines and real sends before each
-incarnation is abandoned) — every one of which is in `internal/feature`'s
-default same-tenant link-kind set. Two more benign single-subject
-families (fix round S3: `benign_prepaid`, `benign_decline_then_success`)
-round out the counter-examples for signals that are real fraud evidence
-in the abusive families but also routine and innocent on their own.
-`eval/gen`'s own `TestGenerate_RecallVariesWithSeed` proves the jitter
-reaches scoring outcomes, not just cosmetic field values. See the PR
-that introduced this corpus (and its fix round) for the local scorer's
-measured precision/recall/F1/ECE/AUROC against it, and `eval/floors.yaml`
-for how those numbers became the CI gate's floors.
+benign fixtures above) and 66 abusive across burst/fast/
+dormant-then-blast/slow-operator/webmail-blast/subject-lure (6 each,
+every count and gap seeded jitter — fix round S3; the last two are the
+F9 TODO's S2b-merge addition, see below) plus three churn variants —
+email-linked, card-linked, device-linked (2 chains of 5 incarnations
+each, 10 subjects per kind, now with jittered timing/declines and real
+sends before each incarnation is abandoned) — every one of which is in
+`internal/feature`'s default same-tenant link-kind set. Two more benign
+single-subject families (fix round S3: `benign_prepaid`,
+`benign_decline_then_success`) round out the counter-examples for
+signals that are real fraud evidence in the abusive families but also
+routine and innocent on their own. `eval/gen`'s own
+`TestGenerate_RecallVariesWithSeed` proves the jitter reaches scoring
+outcomes, not just cosmetic field values. See the PR that introduced
+this corpus (and its fix round) for the local scorer's measured
+precision/recall/F1/ECE/AUROC against it, and `eval/floors.yaml` for how
+those numbers became the CI gate's floors.
+
+- **F9 TODO (S2b merge, 2026-09-29)**: `abusive_webmail_blast` and
+  `abusive_subject_lure` are the same fast decline/success/upgrade/
+  resource-burst shape as `abusive_fast`, followed by a content.sent
+  blast to REAL consumer webmail domains (`webmailBlastDomains` —
+  config/webmail.yaml's own list, a public fact) or a FICTIONAL-brand
+  subject-line lure (`subjectLureBrands`/`subjectLureTemplates` — never a
+  real brand, this repo's hygiene rule for fabricated lure prose)
+  respectively. Every other family's recipient_domain is a synthetic
+  `.example.test` name and no other family ever sets `subject_line` at
+  all, so without these two, S2b's `webmail_recipient_share`/
+  `webmail_sends_1h`/`subject_brand_match` read 0 across the entire
+  corpus — proven, not assumed (`eval.TestLoadReplayDataset_WebmailRecipientShareIsNonZero`
+  proves the harness threads a WebmailSet through at all; the gate's own
+  weight-zeroing sweep, PR body, shows these two families' effect on the
+  aggregate metrics). `make gate` passes `--brands-extra
+  eval/fixtures/test_brands.yaml` so the fictional lure brand is
+  recognized when scoring this corpus, the same way it's merged for
+  every internal/worker replay fixture that needs one.
 
 `make gate`/CI never read the private incident corpus (design §1/§4.10):
 that corpus lives in a separate private repository and is scored with

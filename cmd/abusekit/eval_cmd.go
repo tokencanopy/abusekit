@@ -23,18 +23,20 @@ import (
 // etc. work unchanged for the harness too.
 type evalFlags struct {
 	ruleConfigPaths
-	dataset       string
-	labels        string
-	rule          string
-	scorer        string
-	slice         string
-	split         string
-	out           string
-	cassettesDir  string
-	record        bool
-	skipInvalid   bool
-	floorsPath    string
-	promptVersion string
+	brandsExtraPath string
+	webmailPath     string
+	dataset         string
+	labels          string
+	rule            string
+	scorer          string
+	slice           string
+	split           string
+	out             string
+	cassettesDir    string
+	record          bool
+	skipInvalid     bool
+	floorsPath      string
+	promptVersion   string
 }
 
 // errHelp is returned by parseEvalFlags when -h/--help was given (fix
@@ -49,6 +51,12 @@ func parseEvalFlags(args []string) (evalFlags, error) {
 	fs.StringVar(&f.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&f.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
 	fs.StringVar(&f.brandsPath, "brands", envOr("ABUSEKIT_BRANDS_CONFIG", "config/brands.yaml"), "path to brands.yaml")
+	// Both of these mirror `serve`'s own flags exactly (same names, same
+	// env vars, same defaults — parseServeFlags in main.go) so the harness
+	// scores against the SAME brand/webmail configuration a real
+	// deployment runs on, not a silently different one.
+	fs.StringVar(&f.brandsExtraPath, "brands-extra", os.Getenv("ABUSEKIT_BRANDS_EXTRA_CONFIG"), "optional path to a private, brands.yaml-shaped extra brand list, merged with --brands (env ABUSEKIT_BRANDS_EXTRA_CONFIG; empty disables it)")
+	fs.StringVar(&f.webmailPath, "webmail", envOr("ABUSEKIT_WEBMAIL_CONFIG", "config/webmail.yaml"), "path to webmail.yaml")
 	fs.StringVar(&f.dataset, "dataset", "", "path to a label-snapshot corpus JSONL (design §4.6), or — with --labels also set — an event-replay events JSONL (required)")
 	fs.StringVar(&f.labels, "labels", "", "path to an event-replay labels JSONL; when set, --dataset is read as the matching events file (design §4.6's second corpus shape)")
 	fs.StringVar(&f.rule, "rule", "", "the rule name (from rules.yaml) to score against (required)")
@@ -99,6 +107,20 @@ func runEval(args []string) error {
 	if err != nil {
 		return exitCode2(fmt.Errorf("load rule config: %w", err))
 	}
+	// Mirrors boot's own sequence in main.go: brands-extra is optional (an
+	// empty path merges in nothing), webmail has a default the same as
+	// --brands does.
+	if f.brandsExtraPath != "" {
+		extra, err := feature.LoadBrandsFile(f.brandsExtraPath)
+		if err != nil {
+			return exitCode2(fmt.Errorf("load brands-extra config: %w", err))
+		}
+		brands = feature.MergeBrandSets(brands, extra)
+	}
+	webmail, err := feature.LoadWebmailFile(f.webmailPath)
+	if err != nil {
+		return exitCode2(fmt.Errorf("load webmail config: %w", err))
+	}
 	rule, ok := ruleByName(cfg, f.rule)
 	if !ok {
 		return exitCode2(fmt.Errorf("unknown rule %q (known: %s)", f.rule, strings.Join(ruleNames(cfg), ", ")))
@@ -109,7 +131,7 @@ func runEval(args []string) error {
 		return exitCode2(err)
 	}
 
-	dataset, datasetSHA, labelsSHA, skippedRows, err := loadEvalDataset(f.dataset, f.labels, rule.BenignLabel, brands, f.skipInvalid)
+	dataset, datasetSHA, labelsSHA, skippedRows, err := loadEvalDataset(f.dataset, f.labels, rule.BenignLabel, brands, webmail, f.skipInvalid)
 	if err != nil {
 		return exitCode2(err)
 	}
@@ -254,7 +276,7 @@ func resolveScorerNames(registry *model.Registry, flagValue string) ([]string, e
 // the partial Dataset (every row that DID parse) is returned alongside
 // the row errors instead of an error, for the caller to report as
 // `skipped_rows`.
-func loadEvalDataset(datasetPath, labelsPath, benignLabel string, brands feature.BrandSet, skipInvalid bool) (dataset eval.Dataset, datasetSHA, labelsSHA string, skipped []eval.RowError, err error) {
+func loadEvalDataset(datasetPath, labelsPath, benignLabel string, brands feature.BrandSet, webmail feature.WebmailSet, skipInvalid bool) (dataset eval.Dataset, datasetSHA, labelsSHA string, skipped []eval.RowError, err error) {
 	datasetSHA, err = eval.SHA256File(datasetPath)
 	if err != nil {
 		return eval.Dataset{}, "", "", nil, fmt.Errorf("hash --dataset %s: %w", datasetPath, err)
@@ -294,7 +316,7 @@ func loadEvalDataset(datasetPath, labelsPath, benignLabel string, brands feature
 	dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{
 		EventsPath: datasetPath, Events: eventsF,
 		LabelsPath: labelsPath, Labels: labelsF,
-	}, brands, benignLabel)
+	}, brands, webmail, benignLabel)
 	if err != nil {
 		if !skipInvalid {
 			return eval.Dataset{}, "", "", nil, schemaCLIError(rowErrs, err)

@@ -31,7 +31,7 @@ func TestLoadReplayDataset_StrictlyBeforeDecisionAt(t *testing.T) {
 	labels := strings.NewReader(`
 {"subject":"acct_1","label":"benign","source":"operator","decision_at":{"early_15m":"2031-01-01T00:02:00Z"}}
 `)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -83,7 +83,7 @@ func TestLoadReplayDataset_NeighborEvidenceRespectsChronology(t *testing.T) {
 {"subject":"subject_early","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T00:03:00Z"}}
 {"subject":"subject_late","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T00:12:00Z"}}
 `)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -112,7 +112,7 @@ func TestLoadReplayDataset_TextFieldExtraction(t *testing.T) {
 {"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:01:00Z","data":{"subject_line":"Account Verification Required","recipient_domain":"customer.example.test","recipient_is_own_identity":false,"first_link_host":"verify.example.test"}}
 `)
 	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -164,7 +164,7 @@ func TestLoadReplayDataset_RelabellingGroundTruthDoesNotChangeFeatures(t *testin
 {"subject":"acct_a","label":"` + acctALabel + `","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
 {"subject":"acct_b","label":"abusive","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
 `)
-		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 		if err != nil {
 			t.Fatalf("LoadReplayDataset(%s): %v (rowErrs=%v)", acctALabel, err, rowErrs)
 		}
@@ -197,7 +197,7 @@ func TestLoadReplayDataset_FlippingLaterSubjectsLabelChangesNothing(t *testing.T
 {"subject":"acct_a","label":"abusive","source":"operator","decision_at":{"full":"2031-02-01T00:01:30Z"}}
 {"subject":"acct_b","label":"` + acctBLabel + `","source":"operator","decision_at":{"full":"2031-02-01T01:00:00Z"}}
 `)
-		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+		ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: strings.NewReader(relabelEvents()), LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 		if err != nil {
 			t.Fatalf("LoadReplayDataset(%s): %v (rowErrs=%v)", acctBLabel, err, rowErrs)
 		}
@@ -229,7 +229,7 @@ func TestLoadReplayDataset_LabelEventChronologyPerSlice(t *testing.T) {
 	labels := strings.NewReader(`
 {"subject":"target","label":"benign","source":"operator","decision_at":{"early_15m":"2031-03-01T00:15:00Z","full":"2031-03-01T00:30:00Z"}}
 `)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -251,7 +251,7 @@ func TestLoadReplayDataset_LabelEventChronologyPerSlice(t *testing.T) {
 func TestLoadReplayDataset_SliceOrderRejected(t *testing.T) {
 	events := strings.NewReader(`{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}`)
 	labels := strings.NewReader("\n" + `{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"first_send":"2031-01-01T00:20:00Z","early_15m":"2031-01-01T00:10:00Z","full":"2031-01-01T01:00:00Z"}}`)
-	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err == nil {
 		t.Fatalf("expected a slice_order RowError, got nil")
 	}
@@ -273,7 +273,7 @@ func TestLoadReplayDataset_DecisionAfterDeletionRejected(t *testing.T) {
 {"subject":"acct_1","type":"subject.deleted","at":"2031-01-01T00:05:00Z","data":{"mode":"permanent"}}
 `)
 	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
-	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	_, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err == nil {
 		t.Fatalf("expected a decision_after_deletion RowError, got nil")
 	}
@@ -296,7 +296,7 @@ func TestLoadReplayDataset_MissingSliceBeforeAnyEvent(t *testing.T) {
 	// early_15m is set BEFORE the subject's very first event; full
 	// resolves normally (auto: last event + 1ns).
 	labels := strings.NewReader(`{"subject":"acct_1","label":"abusive","source":"operator","decision_at":{"early_15m":"2031-01-01T00:00:00Z"}}`)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
 	}
@@ -341,7 +341,7 @@ func TestLoadReplayDataset_SkippedEventTaintsWholeSubject(t *testing.T) {
 {"subject":"acct_1","type":"resource.created","at":"2031-01-01T00:02:00Z","data":{"kind":"agent","name":"A"}}
 `)
 	labels := strings.NewReader(`{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
-	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, "benign")
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err == nil {
 		t.Fatalf("expected a RowError for the invalid event type, got nil")
 	}
@@ -366,6 +366,55 @@ func TestLoadReplayDataset_SkippedEventTaintsWholeSubject(t *testing.T) {
 	v := run.Verdicts[0]
 	if !v.Unscored || v.ErrorCode != "skipped_events" {
 		t.Fatalf("Verdict = %+v, want Unscored=true ErrorCode=skipped_events", v)
+	}
+}
+
+// TestLoadReplayDataset_WebmailRecipientShareIsNonZero proves
+// LoadReplayDataset actually threads its webmail parameter into
+// feature.Extract, not just accepts one — a webmail-heavy subject (every
+// content.sent recipient_domain on the loaded WebmailSet) must score a
+// non-zero webmail_recipient_share, and the SAME subject scored against
+// an EMPTY WebmailSet must read exactly 0 for it: without the wiring,
+// both runs would silently agree at 0, which is exactly the bug this
+// guards against (a caller passing --webmail and having it never reach
+// Extract at all).
+func TestLoadReplayDataset_WebmailRecipientShareIsNonZero(t *testing.T) {
+	events := strings.NewReader(`
+{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}
+{"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:01:00Z","data":{"recipient_domain":"gmail.com","recipient_is_own_identity":false,"recipient_count":1}}
+{"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:02:00Z","data":{"recipient_domain":"yahoo.com","recipient_is_own_identity":false,"recipient_count":1}}
+`)
+	labels := strings.NewReader(`{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
+
+	webmail := feature.NewWebmailSet([]string{"gmail.com", "yahoo.com"})
+	ds, rowErrs, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events, LabelsPath: "labels.jsonl", Labels: labels}, feature.BrandSet{}, webmail, "benign")
+	if err != nil {
+		t.Fatalf("LoadReplayDataset: %v (rowErrs=%v)", err, rowErrs)
+	}
+	if len(ds.Subjects) != 1 {
+		t.Fatalf("len(Subjects) = %d, want 1", len(ds.Subjects))
+	}
+	got := ds.Subjects[0].Points[SliceFull].Features["webmail_recipient_share"]
+	if got != 1.0 {
+		t.Fatalf("webmail_recipient_share = %v, want 1.0 (every recipient_domain is on the loaded WebmailSet)", got)
+	}
+
+	// Same events, empty WebmailSet: must read back to 0, proving the
+	// non-zero result above came from the webmail PARAMETER, not from
+	// some other path (e.g. a package-level default).
+	events2 := strings.NewReader(`
+{"subject":"acct_1","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{"channel":"signup"}}
+{"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:01:00Z","data":{"recipient_domain":"gmail.com","recipient_is_own_identity":false,"recipient_count":1}}
+{"subject":"acct_1","type":"content.sent","at":"2031-01-01T00:02:00Z","data":{"recipient_domain":"yahoo.com","recipient_is_own_identity":false,"recipient_count":1}}
+`)
+	labels2 := strings.NewReader(`{"subject":"acct_1","label":"benign","source":"operator","decision_at":{"full":"2031-01-01T01:00:00Z"}}`)
+	ds2, rowErrs2, err := LoadReplayDataset(ReplayInput{EventsPath: "events.jsonl", Events: events2, LabelsPath: "labels.jsonl", Labels: labels2}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
+	if err != nil {
+		t.Fatalf("LoadReplayDataset (empty webmail): %v (rowErrs=%v)", err, rowErrs2)
+	}
+	got2 := ds2.Subjects[0].Points[SliceFull].Features["webmail_recipient_share"]
+	if got2 != 0.0 {
+		t.Fatalf("webmail_recipient_share (empty WebmailSet) = %v, want 0", got2)
 	}
 }
 

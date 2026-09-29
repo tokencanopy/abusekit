@@ -218,3 +218,134 @@ func genSlowOperator(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 
 	return b.events, labelFor(subject, "abusive", "slow_operator", "operator", b.events)
 }
+
+// webmailBlastDomains are REAL major consumer webmail provider domains
+// (config/webmail.yaml's own list — a public fact, not customer data; see
+// that file's own header comment) that genWebmailBlast's recipients
+// rotate through. Every OTHER family's recipient_domain is a synthetic
+// `.example.test` name (public-repo data-boundary rule), which is exactly
+// why S2b's webmail_recipient_share/webmail_sends_1h read 0 across the
+// entire corpus until this family exists — a real webmail-domain-heavy
+// blast needs a real webmail domain to recognize, and a fictional one
+// would prove nothing about WebmailSet's actual matching.
+var webmailBlastDomains = []string{"gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com"}
+
+// genWebmailBlast: the F9 TODO's first new family — a brand-new,
+// disposable-email account with the same fast decline/success/upgrade/
+// resource-burst shape as genFast, followed by a content.sent blast to
+// REAL consumer webmail addresses instead of the corpus's usual synthetic
+// domains, so webmail_recipient_share and webmail_sends_1h are actually
+// exercised end to end (rather than reading 0 for the whole corpus, as
+// they otherwise would). No brand mention anywhere — this family isolates
+// the webmail-volume signal from subject_brand_match, which
+// genSubjectLure below exercises instead.
+func genWebmailBlast(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	subject := fmt.Sprintf("acct_gen_webmailblast_%03d", idx)
+	start := epoch.AddDate(0, 0, 36+idx%40).Add(time.Duration(idx) * time.Minute)
+	b := newBuilder(subject, start)
+
+	b.add(0, "subject.created", event.Links{EmailHash: linkHash("webmailblast-" + subject + "-email")},
+		map[string]any{"channel": "signup", "email_domain_class": "disposable", "identity_kind": "individual"})
+
+	declines := 2 + rng.Intn(2) // 2..3
+	t := 2 * time.Second
+	declineHash := linkHash("webmailblast-" + subject + "-card-declined")
+	for i := 0; i < declines; i++ {
+		b.add(t, "payment.attempt", event.Links{CardFingerprintHash: declineHash}, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "credit", "amount_minor": float64(4200), "currency": "usd"})
+		t += 2 * time.Second
+	}
+	successHash := linkHash("webmailblast-" + subject + "-card-success")
+	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(4200), "currency": "usd"})
+	t += 2 * time.Second
+	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(4200)})
+	t += 2 * time.Second
+
+	n := 3 + rng.Intn(3) // 3..5
+	domain := subject + ".example.test"
+	for i := 0; i < n; i++ {
+		kind := "agent"
+		if i%2 == 1 {
+			kind = "key"
+		}
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": kind, "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+		t += 2 * time.Second
+	}
+
+	sendCount := 20 + rng.Intn(11) // 20..30, all within a 10-minute window
+	for i := 0; i < sendCount; i++ {
+		wd := webmailBlastDomains[i%len(webmailBlastDomains)]
+		b.add(t+time.Duration(i)*20*time.Second, "content.sent", event.Links{}, map[string]any{"recipient_domain": wd, "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return b.events, labelFor(subject, "abusive", "webmail_blast", "operator", b.events)
+}
+
+// subjectLureBrands are entirely FICTIONAL brand names (eval/fixtures/
+// test_brands.yaml's own set — never a real one, per this repo's hygiene
+// rule for anything that fabricates lure-shaped SUBJECT LINE prose, a
+// stricter bar than a bare resource name like impersonationNames above:
+// a full lure sentence reads closer to reconstructing a real phishing
+// template than a name alone does). `make gate` merges test_brands.yaml
+// in via --brands-extra specifically so these fictional brands are
+// recognized when scoring this corpus (Makefile's gate target).
+var subjectLureBrands = []string{"Fictabook", "Fictashop", "Glowbank"}
+
+// subjectLureTemplates pairs each subjectLureBrands entry with one
+// lure-shaped subject line — index-aligned with subjectLureBrands, so
+// genSubjectLure's idx%3 selects both consistently.
+var subjectLureTemplates = []string{
+	"Your Fictashop order needs verification",
+	"Fictabook: unusual sign-in detected",
+	"Glowbank account alert: action required",
+}
+
+// genSubjectLure: the F9 TODO's second new family — the same fast decline/
+// success/upgrade/resource-burst shape as genWebmailBlast, followed by a
+// content.sent blast whose subject_line carries a fictional-brand lure
+// (never a real one — see subjectLureBrands), to REGULAR synthetic
+// `.example.test` recipients (never a webmail domain — this family
+// isolates subject_brand_match from the webmail-volume signal
+// genWebmailBlast exercises instead). No resource/agent name mentions a
+// brand at all, so any name_brand_match observed on these subjects would
+// be a real bug, not this family's own construction.
+func genSubjectLure(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
+	subject := fmt.Sprintf("acct_gen_subjectlure_%03d", idx)
+	start := epoch.AddDate(0, 0, 40+idx%40).Add(time.Duration(idx) * time.Minute)
+	b := newBuilder(subject, start)
+
+	b.add(0, "subject.created", event.Links{EmailHash: linkHash("subjectlure-" + subject + "-email")},
+		map[string]any{"channel": "signup", "email_domain_class": "disposable", "identity_kind": "individual"})
+
+	declines := 2 + rng.Intn(2) // 2..3
+	t := 2 * time.Second
+	declineHash := linkHash("subjectlure-" + subject + "-card-declined")
+	for i := 0; i < declines; i++ {
+		b.add(t, "payment.attempt", event.Links{CardFingerprintHash: declineHash}, map[string]any{"outcome": "declined", "reason": "card_declined", "funding": "credit", "amount_minor": float64(4200), "currency": "usd"})
+		t += 2 * time.Second
+	}
+	successHash := linkHash("subjectlure-" + subject + "-card-success")
+	b.add(t, "payment.attempt", event.Links{CardFingerprintHash: successHash}, map[string]any{"outcome": "succeeded", "funding": abusiveFunding(rng), "amount_minor": float64(4200), "currency": "usd"})
+	t += 2 * time.Second
+	b.add(t, "subscription.changed", event.Links{}, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(4200)})
+	t += 2 * time.Second
+
+	n := 3 + rng.Intn(3) // 3..5, names deliberately brand-free
+	domain := subject + ".example.test"
+	for i := 0; i < n; i++ {
+		kind := "agent"
+		if i%2 == 1 {
+			kind = "key"
+		}
+		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": kind, "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
+		t += 2 * time.Second
+	}
+
+	lureIdx := idx % len(subjectLureBrands)
+	subjectLine := subjectLureTemplates[lureIdx]
+	sendCount := 15 + rng.Intn(11) // 15..25, all within a 10-minute window
+	for i := 0; i < sendCount; i++ {
+		b.add(t+time.Duration(i)*20*time.Second, "content.sent", event.Links{}, map[string]any{"subject_line": subjectLine, "recipient_domain": domainName(subject, i), "recipient_is_own_identity": false, "recipient_count": float64(1)})
+	}
+
+	return b.events, labelFor(subject, "abusive", "subject_lure", "operator", b.events)
+}

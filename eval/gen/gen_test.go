@@ -32,7 +32,11 @@ func repoRootForGenTest(t *testing.T) string {
 // loadShippedConfigForGenTest builds the real config/{rules,vendors,
 // local_weights,brands}.yaml this repo ships — used by
 // TestGenerate_RecallVariesWithSeed to score against the actual shipped
-// weights, not a hand-rolled stand-in.
+// weights, not a hand-rolled stand-in. Brands additionally merges in
+// eval/fixtures/test_brands.yaml's fictional entries (the same way
+// Makefile's gate target's --brands-extra does for `make gate`) so
+// genSubjectLure's fictional-brand lure is actually recognized when
+// scored here, not silently read as 0.
 func loadShippedConfigForGenTest(t *testing.T, root string) (*config.Config, feature.BrandSet) {
 	t.Helper()
 	weights, err := local.LoadWeightsFile(filepath.Join(root, "config", "local_weights.yaml"))
@@ -71,7 +75,24 @@ func loadShippedConfigForGenTest(t *testing.T, root string) (*config.Config, fea
 	if err != nil {
 		t.Fatalf("load brands.yaml: %v", err)
 	}
-	return cfg, brands
+	extra, err := feature.LoadBrandsFile(filepath.Join(root, "eval", "fixtures", "test_brands.yaml"))
+	if err != nil {
+		t.Fatalf("load eval/fixtures/test_brands.yaml: %v", err)
+	}
+	return cfg, feature.MergeBrandSets(brands, extra)
+}
+
+// loadShippedWebmailForGenTest loads the real config/webmail.yaml this
+// repo ships — the webmail analogue of loadShippedConfigForGenTest's
+// brands, needed now that genWebmailBlast's recipients are real webmail
+// domains.
+func loadShippedWebmailForGenTest(t *testing.T, root string) feature.WebmailSet {
+	t.Helper()
+	w, err := feature.LoadWebmailFile(filepath.Join(root, "config", "webmail.yaml"))
+	if err != nil {
+		t.Fatalf("load webmail.yaml: %v", err)
+	}
+	return w
 }
 
 func ruleByNameForGenTest(cfg *config.Config, name string) (config.Rule, bool) {
@@ -209,7 +230,7 @@ func TestGenerate_RoundTripsThroughLoadReplayDataset(t *testing.T) {
 		}
 	}
 
-	dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, feature.BrandSet{}, "benign")
+	dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, feature.BrandSet{}, feature.WebmailSet{}, "benign")
 	if err != nil {
 		t.Fatalf("LoadReplayDataset: %v (row errors: %v)", err, rowErrs)
 	}
@@ -233,6 +254,7 @@ func TestGenerate_RoundTripsThroughLoadReplayDataset(t *testing.T) {
 func TestGenerate_RecallVariesWithSeed(t *testing.T) {
 	root := repoRootForGenTest(t)
 	cfg, brands := loadShippedConfigForGenTest(t, root)
+	webmail := loadShippedWebmailForGenTest(t, root)
 	rule, ok := ruleByNameForGenTest(cfg, "new_account_velocity")
 	if !ok {
 		t.Fatalf("rule not found")
@@ -257,7 +279,7 @@ func TestGenerate_RecallVariesWithSeed(t *testing.T) {
 				t.Fatalf("encode label: %v", err)
 			}
 		}
-		dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, brands, rule.BenignLabel)
+		dataset, rowErrs, err := eval.LoadReplayDataset(eval.ReplayInput{EventsPath: "events.jsonl", Events: &eventsBuf, LabelsPath: "labels.jsonl", Labels: &labelsBuf}, brands, webmail, rule.BenignLabel)
 		if err != nil {
 			t.Fatalf("LoadReplayDataset(seed=%d): %v (rowErrs=%v)", seed, err, rowErrs)
 		}

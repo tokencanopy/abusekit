@@ -95,9 +95,9 @@ func TestFloors_For(t *testing.T) {
 // command, not a re-implementation of it — see Makefile's gate target
 // for the actual CLI invocation this mirrors.
 func TestGate_WeightRegressionFailsFloors(t *testing.T) {
-	cfg, brands := loadShippedRuleConfig(t)
+	cfg, brands, webmail := loadShippedRuleConfig(t)
 	rule := ruleByNameT(t, cfg, "new_account_velocity")
-	dataset := loadSyntheticDataset(t, brands)
+	dataset := loadSyntheticDataset(t, brands, webmail)
 
 	floors, err := LoadFloorsFile(repoRootJoin(t, "eval", "floors.yaml"))
 	if err != nil {
@@ -155,9 +155,9 @@ func TestGate_WeightRegressionFailsFloors(t *testing.T) {
 // precision) can move the wrong way; eval/floors.yaml's max_ece is set
 // with a deliberately tight margin specifically so it catches both.
 func TestGate_NegativeWeightRegressionCaughtByTightECEFloor(t *testing.T) {
-	cfg, brands := loadShippedRuleConfig(t)
+	cfg, brands, webmail := loadShippedRuleConfig(t)
 	rule := ruleByNameT(t, cfg, "new_account_velocity")
-	dataset := loadSyntheticDataset(t, brands)
+	dataset := loadSyntheticDataset(t, brands, webmail)
 	floors, err := LoadFloorsFile(repoRootJoin(t, "eval", "floors.yaml"))
 	if err != nil {
 		t.Fatalf("LoadFloorsFile: %v", err)

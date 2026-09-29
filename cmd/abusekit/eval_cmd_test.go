@@ -26,6 +26,7 @@ func syntheticCorpusArgs(t *testing.T, extra ...string) []string {
 		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
 		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
 		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--webmail", filepath.Join(root, "config", "webmail.yaml"),
 		"--rule", "new_account_velocity",
 		"--scorer", "local",
 		"--slice", "full",
@@ -145,6 +146,7 @@ func TestRunEval_UnknownRuleAndScorerAreBadInput(t *testing.T) {
 		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
 		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
 		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--webmail", filepath.Join(root, "config", "webmail.yaml"),
 	}
 	t.Run("unknown rule", func(t *testing.T) {
 		args := append(append([]string{}, base...), "--rule", "does_not_exist", "--scorer", "local")
@@ -284,6 +286,7 @@ func TestRunEval_SchemaErrorsReportOwnFileAndLine(t *testing.T) {
 		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
 		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
 		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--webmail", filepath.Join(root, "config", "webmail.yaml"),
 		"--rule", "new_account_velocity", "--scorer", "local",
 		"--out", filepath.Join(t.TempDir(), "run.json"),
 	}
@@ -324,6 +327,7 @@ func TestRunEval_SkipInvalidWritesSkippedRows(t *testing.T) {
 		"--vendors", filepath.Join(root, "config", "vendors.yaml"),
 		"--weights", filepath.Join(root, "config", "local_weights.yaml"),
 		"--brands", filepath.Join(root, "config", "brands.yaml"),
+		"--webmail", filepath.Join(root, "config", "webmail.yaml"),
 		"--rule", "new_account_velocity", "--scorer", "local", "--skip-invalid",
 		"--out", out,
 	}
@@ -381,6 +385,7 @@ func TestRunEval_NullOptionalFieldsLoadAndDontChangeVerdicts(t *testing.T) {
 			"--vendors", filepath.Join(root, "config", "vendors.yaml"),
 			"--weights", filepath.Join(root, "config", "local_weights.yaml"),
 			"--brands", filepath.Join(root, "config", "brands.yaml"),
+			"--webmail", filepath.Join(root, "config", "webmail.yaml"),
 			"--rule", "new_account_velocity", "--scorer", "local",
 			"--out", out,
 		}
