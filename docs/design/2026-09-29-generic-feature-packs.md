@@ -1,390 +1,357 @@
-# Generic feature packs, a neutral event vocabulary, and declarative custom features
+# Generic feature packs, product vocabularies, and declarative custom features
 
-Status: proposed, 2026-09-29 · owner: Josh Zhang · amends
-[`2026-09-27-abusekit-design.md`](2026-09-27-abusekit-design.md) (§4.2, §4.3, §4.5, §4.6, §4.10).
-Written against `main` at S3 plus the two open PRs treated as merged: #5 (S4 evaluation harness)
-and #7 (S2b send-volume, webmail, recipient and subject-brand features). Section numbers below
-refer to this document; `main §x` refers to the main design.
+Status: proposed, revision 2 (after adversarial review), 2026-09-29 · owner: Josh Zhang · amends
+[`2026-09-27-abusekit-design.md`](2026-09-27-abusekit-design.md) §4.2, §4.3, §4.5, §4.6, §4.8 and
+§4.10. Written against `main` at S3, with the two open PRs treated as merged: #5 (S4 evaluation
+harness) and #7 (S2b send-volume, webmail, recipient and subject-brand features). `main §x` refers
+to the main design. §13 lists what changed from revision 1.
 
 ## 1. Problem statement
 
-abusekit's current feature set assumes an email platform. The main design promises a scoring
-service for any product that mints accounts, takes payments and lets users create resources. The
-built code does not keep that promise:
+abusekit's current feature set assumes an email platform. The main design promises scoring for
+any product that mints accounts, takes payments and lets users create resources. The built code
+falls short of that:
 
-- **The vocabulary is email-shaped.** `content.sent` carries `subject_line`, `recipient_domain`
-  and `recipient_is_own_identity`, fields that only mean something for mail. Resource kinds are an
-  undeclared convention: `internal/feature` counts `kind == "key"` (plus S2b's spelling aliases)
-  and treats everything else as a generic resource.
-- **Half the features are email features.** Of the 25 features on `main` + #7,
-  `first_day_distinct_domains`, `self_send_before_external`, `sends_10m_max`, `sends_1h`,
-  `sends_first_day`, `webmail_recipient_share`, `webmail_sends_1h`, `distinct_recipients_1h` and
-  `subject_brand_match` read `content.sent` and only mean something for mail. `key_velocity_1h`
-  and `key_total` assume API keys. A file-sharing, payments or chat product would get these at
-  zero.
-- **Custom event types are dead weight.** Main §4.3 says unknown types are "stored, available to
-  Go-registered features only". No Go feature reads them, so the only way for a product to add a
-  signal is to write Go in this repo.
-- **Everything is global.** One `config/rules.yaml`, one `config/local_weights.yaml` and one flat
-  feature namespace serve every tenant. A second tenant can't turn features on or off, and a new
-  feature name can collide with an existing one.
+- **The vocabulary is email-shaped.** `content.sent` carries `subject_line`, `recipient_domain` and
+  `recipient_is_own_identity`. Resource kinds are an undeclared convention: `internal/feature`
+  counts `kind == "key"` (plus #7's spelling aliases) and treats every other kind as generic.
+- **Much of the feature set is email-specific.** Nine of the 25 features on `main` + #7 are email
+  features, and two more assume API keys. A file-sharing, payments, chat, developer-API or
+  AI-inference product would get these at zero.
+- **Custom event types are dead weight.** Main §4.3 says unknown types are stored "for
+  Go-registered features only". No such feature exists, so the only way to add a signal is to
+  write Go in this repo.
+- **Everything is global and flat.** There is one `rules.yaml`, one `local_weights.yaml`, one
+  feature namespace, and one subject kind: the account.
 
-**Desired outcome.** A product that is not an email platform can onboard with YAML only. It
-enables the packs that fit its domain, declares its event types and field kinds, defines its
-product-specific signals as declarative features, and runs in shadow. The first consumer (e2a)
-keeps identical scores, bit for bit.
+**Desired outcome.** A product that is not an email platform onboards with a private YAML profile.
+In that profile it:
+- declares its event types, field kinds, link kinds and subject kinds;
+- enables the packs that fit its domain;
+- defines its product-specific signals as declarative features;
+- runs them in shadow.
+
+Every new value is pseudonymised or dropped at ingest. For e2a, feature values, tiers and rescore
+times stay identical, and risk moves by no more than a stated floating-point bound.
 
 ### Success criteria (measurable)
 
-1. **Bit-identical migration.** A golden replay covers every committed fixture
-   (`eval/fixtures/*.jsonl`, `eval/fixtures/synthetic/`, and #7's fixtures). It scores after every
-   event and at every scheduled rescore instant. Each recorded feature value, `NextRescoreAt`,
-   per-rule input hash, risk (compared as `math.Float64bits`), tier and local-scorer `Version()`
-   must be identical before and after every slice in §9. The same holds for the harness's
-   `run.json` metrics once timestamps and git sha are removed.
-2. **Zero-Go onboarding.** The three fictional products in §7 load from a tenant YAML file with
-   no Go changes. With uniform priors (§5.9), each product's abusive fixture scores above every
-   one of its benign fixtures.
-3. **Enablement is enforced.** For a tenant without the `email` pack, no `email.*` feature is
-   computed, stored or rendered. A rule that references one fails the config load with
+1. **Semantically identical migration.** A golden replay covers every committed fixture: all of
+   `eval/fixtures/*.jsonl` (including #7's) and the synthetic corpus. It scores after every event
+   and at every scheduled rescore instant. Across the rename and every later slice:
+   - every feature value is identical as `math.Float64bits`, compared under the rename map;
+   - every `NextRescoreAt` and every tier is identical;
+   - every risk and score satisfies `|Δ| ≤ 1e-12` (§5.2 derives the bound).
+
+   Input hashes, cassette keys, the `run.json` rule/weights SHAs and the local `Version()` may
+   change **only in the rename slice**. The golden records the before and after values.
+2. **Five generic scenarios.** Each scenario in §7 loads as a fictional profile, with zero Go
+   changes for everything §7 marks as declarative. Held-out fixtures are authored after the
+   features and never used while writing them. On those fixtures, with uniform priors (§5.9),
+   each scenario's abusive fixtures outrank every one of its benign fixtures.
+3. **Enablement is enforced.** For a tenant without a pack, none of that pack's features is
+   computed, stored or rendered. A rule that references one fails to load with
    `feature_not_enabled`.
-4. **Declarative features are correct and bounded.** For every operation in §5.5, the compiled
-   evaluator equals a naive O(n²) reference implementation on 10,000 randomized histories,
-   including shuffled arrival order and future-dated events. Per-subject extraction p99 is ≤ 50 ms
-   on 2 vCPU for a tenant at the limits in §5.7: 64 custom features over a history of 50,000
-   events.
-5. **Privacy by construction.** A property test shows that no stored value of a declared `text`
-   field matches the email-shape matcher. Values in undeclared fields are stored only as keyed
-   hashes, and config can never introduce a regex or executable code. The loader fuzz test finds
-   no profile that passes validation and breaks a limit in §5.7.
+4. **The DSL is correct and bounded.**
+   - Every operation equals a naive reference implementation on 10,000 randomized histories,
+     including shuffled arrival, ties and future-dated events.
+   - Per-subject time is measured **end to end**: store load, JSON decode, view projection, pack
+     extraction and orchestration. For a profile at the §5.7 limits with history at its byte cap,
+     it is p99 ≤ 50 ms on the reference 2-vCPU host.
+   - The step budget is calibrated from that benchmark (§5.7), so the budget cuts off work before
+     the latency target is breached.
+5. **Privacy by construction.** Property tests show that, at rest:
+   - no stored value matches an email, card (Luhn), IP or phone shape outside a masked `text`
+     field;
+   - every stored `hash` value is an abusekit-keyed HMAC;
+   - undeclared data keeps only type, time and field names.
+
+   The loader fuzzer finds no profile that passes validation while breaking a §5.7 limit.
+6. **Flooding doesn't evade.** For every built-in and DSL feature, a property test adds cheap
+   events totalling up to 10 times the byte cap to an abusive fixture. Risk must not fall (§5.7).
 
 ## 2. Goals and non-goals
 
 **Goals**
-- Split the built-in features into three packs: `core` (product-neutral), `email`, and `brand`
-  (display-name impersonation). Each pack is registered in Go and enabled per tenant.
-- Namespace every feature (`core.subject_age_h`, `email.sends_10m_max`). Keep a frozen alias
-  table for today's flat names, so stored verdicts, corpora, cassettes, floors and weights stay
-  valid.
-- Add a neutral delivery event (`delivery.sent`) and product-declared resource kinds, channels
-  and custom event types. `content.sent` stays accepted forever.
-- Add declarative custom features in YAML. The set is closed: count, distinct, share, peak,
-  time-between, and a history-relative modifier. Every feature carries a mandatory cap and
-  transform, has deterministic semantics, and is validated and versioned at load.
-- Per-tenant redaction for declared fields, driven by field kinds.
-- Per-pack starter weights, fixtures, floors and golden-sign/mutation tests. A shadow-only
-  uniform-prior mode for a tenant that has no labels yet.
+- Rename the built-in features into namespaced names **once**, while no production verdicts or
+  vendor cassettes exist. There is no compatibility bridge (§5.2).
+- Per-tenant profiles, kept in a private config mount. Only fictional example profiles live in
+  this repo.
+- Product-declared vocabularies:
+  - custom event types, with a field kind and optional role for each field;
+  - extension fields on built-in types;
+  - an `activity` role for types;
+  - resource-kind roles;
+  - declared link kinds;
+  - subject kinds beyond `account`.
+- Redaction:
+  - pseudonymise every declared hash with an abusekit-held key;
+  - drop every undeclared value;
+  - validate domains against the public suffix list (PSL);
+  - mask text or store it as a skeleton;
+  - scan for card, IP and phone shapes.
+- A closed declarative feature DSL covering the five scenarios in §7. Every feature has a
+  mandatory cap, deterministic semantics and a deterministic step budget.
+- Packs (`core`, `email`, `brand`) enabled per tenant, each with starter weights, fixtures, floors
+  and a `packtest` harness. Uniform priors, shadow-only, until a tenant has labels.
 
 **Non-goals**
-- Arbitrary code or expressions in config: no CEL, no regex, no WASM, no Go plugins (§5.12).
-- Learning weights from labels (`abusekit fit`). Bootstrapping stays in shadow until an operator
-  hand-tunes weights or a later design adds fitting (§12 Q8).
-- Cross-tenant feature sharing or linking. Main §2 already defers this.
-- Changes to scoring math. `core.Plan`, `core.Combine` and the local logistic model are
-  unchanged. Only their feature keys and quantization metadata move to a table (§5.2).
-- A runtime API for declaring vocabularies. Declarations are reviewed config, like rules (§5.6).
+- Code or expressions in config: no CEL, regex, WASM or plugins (§5.12).
+- Weight fitting (§12 Q8) and cross-tenant linking (main §2).
+- Changes to `Plan`/`Combine` math, apart from the stage-gate fix (§5.8) and per-tenant rule sets.
+- Runtime vocabulary declaration over HTTP (§5.11).
+- A neutral built-in "delivery" event. Revision 1 proposed `delivery.sent`; revision 2 drops it
+  (§5.4, §13).
 
 ## 3. Relevant context and constraints
 
-**Code this design must fit (on `main` + #5 + #7):**
-- `internal/event`: structural `Validate`, plus a static redaction `schema` map keyed by type.
-  Its `RedactionSchemaVersion` is 2 after #7. Unknown types keep every key after a recursive
-  leak scan; unlisted keys of known types are dropped.
-- `internal/feature`: a monolithic `Extract(ctx, tenant, subject, events, neighbors, windows,
-  brands, webmail)` returns one fixed struct, `Features`, with 25 fields and a hand-written
-  `Map()`. `Names` feeds `config.FeatureSet`. `nextRescoreAt` hard-codes the windowed types
-  (`resource.created`, `content.sent`).
-- `internal/core`: `inputHash` JSON-encodes the rule's feature map keyed by name.
-  `quantizeAgeFeaturesForHash` special-cases `subject_age_h` and `upgrade_delay_min` **by name**.
-- `internal/model/local`: sums `weight × feature` in **sorted feature-name order** (S10). Its
-  `Version()` is a SHA-256 of the JSON-encoded `Weights`, whose weight map is keyed by name.
-  Renaming a feature therefore changes both the floating-point summation order and the version
-  hash. The migration must neutralise both (§5.2).
-- `eval` (#5): corpus-v1 rows carry `input.features` keyed by flat name. Cassettes are keyed on
-  `(scorer, scorer_version, model, prompt_version, input_hash)`. `floors.yaml` entries are keyed
-  on `(rule, scorer, slice)`. `eval/gen` generates the synthetic corpus.
-- Worker and config: rules and weights are global, and keys already carry a `tenant`.
+**Code this design touches (`main` + #5 + #7):**
+- `internal/event`:
+  - `Validate`, and a static `schema` for redaction (`RedactionSchemaVersion` is 2 after #7).
+  - Unknown types keep every key after a leak scan; unlisted keys of known types are dropped.
+- `internal/feature`:
+  - a monolithic `Extract` returns a fixed 25-field `Features`, with `Map()` and `Names`;
+  - `nextRescoreAt` hard-codes `resource.created` and `content.sent`;
+  - `firstSeenAt` is the minimum event `at`.
+- `internal/core`:
+  - `inputHash` JSON-encodes the rule's features keyed by name;
+  - `quantizeAgeFeaturesForHash` switches on the literals `subject_age_h` and `upgrade_delay_min`;
+  - `stageSkip` reads the literal `features["subject_age_h"]`;
+  - `maxRiskByScorer` takes the maximum over **every** local rule, shadow rules included.
+- `internal/model/local`: sums in sorted feature-name order, and `Version()` hashes the whole
+  JSON-encoded `Weights` struct.
+- `internal/worker`:
+  - `renderReason` prints flat feature names into every stored verdict reason;
+  - `computeVerdict` builds `currentRuleNames` from a global config.
+- `internal/serve`: `currentRuleNames()` reads the global config.
+- `internal/store`:
+  - `EventsForSubject` loads every event, ordered by `(at, seq)`;
+  - `corpus_examples.features` is JSON keyed by feature name;
+  - `subjects.first_seen_at` keeps `LEAST(existing, new)`.
+- `eval` (#5):
+  - `hashScoreRequest` keys cassettes over `req.Features` by name;
+  - `run.json` records `dataset_sha`, `rule_sha` and `weights_sha`;
+  - corpus-v1 rows key features by name.
 
-**Patterns to reuse:** load-time validation that rejects the whole document (main §4.5). Data
-files loaded at boot (`brands.yaml`, `webmail.yaml`). Pure core with injected dependencies. The
-compare-and-clear worker queue. Expand-only migrations.
-
-**Assumptions** (unconfirmed ones are repeated in §12):
-- A1. Neither vendor adapter (S5) nor the hosted deploy (S8) has shipped. No production verdicts
-  and no vendor cassettes exist yet. The design still keeps them stable (§5.2) in case the order
-  changes.
-- A2. At most about 100 tenants and about 64 custom features per tenant. Retention of 90 days
-  for event text (main §4.11) bounds any lookback.
-- A3. Products can compute keyed hashes for identifiers they want to count distinctly, as e2a
-  already does for `recipient_hash`. As a fallback, abusekit hashes undeclared fields with its
-  own per-tenant key (§5.6).
+**Assumptions** (unconfirmed ones repeat in §12):
+- A1. S5 (vendor adapters) and S8 (hosted deploy) have not shipped. No production verdicts, corpus
+  rows or vendor cassettes exist yet. That is what makes a one-time rename safe, and why the rename
+  slice must land before S5 and S8.
+- A2. At most about 100 tenants and at most 64 custom features per tenant. Event text retention is
+  90 days (main §4.11).
+- A3. Producers can compute a keyed hash of any identifier they want counted. abusekit re-hashes
+  it anyway (§5.6), so a producer's mistake can't turn into stored personal data.
 
 ## 4. Proposed design: overview
 
 ```
-                   tenant profile (config/tenants/<tenant>.yaml)
-                   ├─ packs: [core@1, email@1, brand@1]
-                   ├─ vocabulary: resource kinds, channels, custom types + field kinds
-                   ├─ features: declarative custom.* definitions
-                   ├─ rules: inputs reference namespaced features
-                   └─ weights: per rule (file, or `uniform`)
-                                  │ compile + validate (per tenant, atomic)
-                                  ▼
-ingest ──▶ vocab.Redact(tenant) ──▶ store (wire form + vocab_version)
-                                           │
-worker ──▶ vocab.View (content.sent → delivery view) ──▶ feature.Extract(profile)
-                                           │  for each enabled pack, in fixed order:
-                                           │    core (Go) · email (Go) · brand (Go) · custom (compiled YAML)
-                                           ▼
-                             Vector{values, canonical keys, quanta}
-                                           │
-                             core.Plan / Combine (unchanged math)
+private config mount: tenants/<tenant>/profile.yaml + history/NNNN.yaml (append-only, CI-checked)
+  packs · vocabulary (types, fields+kinds+roles, extensions, link kinds, subject kinds)
+  features (custom.*) · rules · weights
+                     │ compile + validate per tenant (atomic, isolated)
+                     ▼
+ingest ─▶ vocab.Redact(tenant): leak scan · kind rules · re-HMAC hashes · drop undeclared
+       ─▶ store: event row + vocab_version + (subject_kind, subject) index rows (≤ 4 per event)
+worker (per-tenant fair queue) ─▶ loader: time-bounded + onboarding-full + byte cap
+       ─▶ feature.Extract(profile): core · email · brand (Go) · custom (compiled DSL), under a
+          deterministic step budget
+       ─▶ core.Plan / Combine (math unchanged)
 ```
 
 | Module | Interface | Deletion test |
 | --- | --- | --- |
-| `internal/vocab` (new) | `Compile(builtin, decl) (*Vocabulary, error)`; `(*Vocabulary).Redact(*event.Event) error`; `(*Vocabulary).View(event.Event) event.View` | Without it, redaction, kind declarations and the `content.sent` → delivery mapping spread across ingest and every pack. Keep. |
-| `internal/pack` (new) | `Pack` interface (§5.1) + registry; adapters `core`, `email`, `brand` (Go) and `custom` (compiled YAML) | Four adapters, so the seam is real. Without it, `feature.Extract` stays a monolith that only grows. |
-| `internal/pack/custom` (new) | `Compile(tenant, []Def, *Vocabulary) (Pack, error)` | Holds all DSL semantics. Deleting it leaves products writing Go again. Keep. |
-| `internal/feature` | `Extract(ctx, profile, subject, events, now) (Result, error)`: runs enabled packs, merges, min-reduces rescore instants | Becomes a thin orchestrator. It stays because the worker, evaluate and eval all call exactly this one function. |
-| `internal/config` | `LoadProfiles(dir, deps) (map[tenant]*Profile, []error)` | Absorbs `rules.yaml`; per-tenant atomic reload. |
-| `internal/core` | unchanged signatures; `Plan` takes `Vector` instead of `map[string]float64` | The only change is that canonical keys and quanta come from data (§5.2). |
-
-The existing S2b brand, webmail and window helpers move into the packs that own them, with their
-code unchanged. That is what keeps the migration bit-for-bit.
+| `internal/vocab` (new) | `Compile(builtin, decl) (*Vocabulary, error)`; `(*Vocabulary).Redact(*event.Event, Keys) error` | Without it, redaction, kinds, roles and extensions spread across ingest and the packs. Keep. |
+| `internal/pack` (new) | `Pack` interface + registry; adapters `core`, `email`, `brand` (Go) and `custom` (compiled DSL) | Four adapters, so the seam is real. Without it, `feature.Extract` stays a monolith. |
+| `internal/pack/custom` (new) | `Compile(tenant, []Def, *Vocabulary, CostTable) (Pack, error)` | Holds every DSL semantic. Keep. |
+| `internal/feature` | `Extract(ctx, profile, subject, History, now) (Result, error)` | A thin orchestrator. The worker, evaluate and eval all call this one function. |
+| `internal/store` | `LoadHistory(ctx, tenant, subjectRef, LoadPlan) (History, error)` replaces `EventsForSubject` for scoring | Bounded loading lives in one place. |
+| `internal/secret` (new) | `Keys` interface (§5.6), provider-agnostic | Two adapters (a file, a cloud secret manager). Keep. |
+| `internal/config` | `LoadProfiles(mount, deps) (map[tenant]*Profile, map[tenant][]error)` | Absorbs `rules.yaml`. Per-tenant atomic reload. |
 
 ## 5. Proposed design: detail
 
 ### 5.1 Packs: registration, enablement, dependencies
 
-A **pack** is a named, versioned bundle of feature definitions and computation. It may also
-carry data files (brand lists, webmail lists), starter weights, fixtures and floors. Packs are
-compiled into the binary and registered in `internal/pack/registry.go`. A tenant **enables**
-packs; it never supplies pack code.
-
 ```go
-// Pack computes a namespaced group of features for one subject.
 type Pack interface {
-    ID() ID                      // {Name: "email", Version: 1}
-    Requires() []string          // packs whose features/views it reads, e.g. email@1 → [core]
-    Features() []FeatureDef      // static metadata, see below
-    // Extract is pure: same Input → same Output, independent of event order.
-    // It must exclude events with At > Input.Now from every window (§5.5 notes one frozen
-    // legacy exception).
+    ID() ID                     // {Name: "email", Version: 1}
+    Requires() []string         // e.g. email@1 → [core]
+    Features() []FeatureDef
+    // Extract is pure: same input → same output, whatever the arrival order. Every step it
+    // takes is charged to in.Budget (§5.7).
     Extract(ctx context.Context, in Input) (Output, error)
 }
 
 type FeatureDef struct {
-    Name        string   // "email.sends_10m_max"; grammar §5.3
-    Legacy      string   // frozen flat alias ("sends_10m_max"), "" for features born namespaced
-    HashQuantum float64  // input-hash bucket; 0 = exact (§5.2)
-    Bound       float64  // max value after transform; used by uniform priors (§5.9)
-    Reads       []string // view types read ("delivery", "resource.created", ...), for dispatch
-                         // and rescore scheduling
-    RequiresPacks []string // feature-level dependency, e.g. email.subject_brand_match → [brand]
+    Name          string   // "email.sends_10m_max"; grammar §5.3
+    HashQuantum   float64  // input-hash bucket (replaces the name switch in core)
+    Bound         float64  // max value; used by uniform priors (§5.9)
+    PriorSign     int8     // +1 / -1; uniform-prior and golden-sign default
+    TruncationDir int8     // -1 if the value can only fall when history is truncated, else 0/+1 (§5.7)
+    Reads         []string // types/roles read: dispatch, load plan, rescore scheduling
+    Lookback      Lookback // history the feature needs (§5.7 load plan)
+    RequiresPacks []string // e.g. email.subject_brand_match → [brand]
+    SubjectKinds  []string // kinds this feature is defined for; default [account]
 }
 
 type Input struct {
-    Tenant, Subject string
-    Events   []event.View   // stored events projected through the tenant vocabulary
-    Now      time.Time
-    Start    time.Time      // account start: subject.created.account_created_at if present,
-                            // else earliest event At (S2b R8)
-    Neighbors NeighborEvidence // resolved once by the orchestrator, only when core is enabled
-    Params   PackParams     // this tenant's validated per-pack settings (lists, channels, kinds)
+    Tenant    string
+    Subject   SubjectRef       // {Kind, ID}
+    History   History          // bounded, ordered (at, producer, id); truncation flags
+    Now       time.Time
+    Start     time.Time        // subject.created.account_created_at, else subjects.first_seen_at
+    Neighbors NeighborResolver // store-backed, budgeted, cached per extraction
+    Params    PackParams
+    Budget    *StepBudget
 }
 
 type Output struct {
-    Values  map[string]float64 // exactly the names in Features(); missing = bug, rejected
-    Rescore []time.Time        // candidate instants at which some value changes with no new event
+    Values    map[string]float64
+    Rescore   []time.Time
+    Truncated bool            // this pack's budget or the history's truncation was hit
 }
 ```
 
-**Enablement** lives in the tenant profile: `packs: [core@1, email@1, brand@1]`. The rules are:
-- `core` is always enabled and is implied if omitted. Every other pack is opt-in.
-- A pin names a major version. A pack changes feature semantics only by shipping a new major
-  version (`email@2`) next to the old one for at least one release. Semantic changes never
-  happen in place. Every verdict records the pinned versions in `profile_sha` (§5.10).
-- `Requires` must be satisfied by the enabled set. Otherwise the tenant fails to load with
-  `pack_requires`.
-- A feature whose `RequiresPacks` are not all enabled is **not registered** for the tenant. For
-  example, `email.subject_brand_match` needs `brand`; enable `email` without `brand` and that one
-  feature doesn't exist for the tenant.
-- The orchestrator runs packs in fixed order: `core`, `email`, `brand`, then `custom`. It merges
-  their `Values` and takes the earliest `Rescore` instant, coalesced to the existing 5-minute
-  buckets. No two packs share a namespace, so collisions are impossible by construction.
+**Enablement.** A profile lists `packs: [core@1, email@1, brand@1]`. The rules:
+- `core` is always enabled; every other pack is opt-in.
+- A pin names a major version, and a pack's semantics change only by shipping a new major version.
+- `Requires` must hold, or the profile fails with `pack_requires`.
+- A feature whose `RequiresPacks` or `SubjectKinds` don't match is not registered for that tenant
+  or kind.
+- Packs run in the fixed order `core`, `email`, `brand`, `custom`. Each has its own namespace, so
+  two packs can't produce the same feature name.
 
-**Pack contents after the split** (legacy name → namespaced name):
+**Pack contents after the one-time rename:**
 
-| Pack | Features |
+| Pack | Features (old flat name → new name) |
 | --- | --- |
-| `core@1`, account and onboarding | `subject_age_h`→`core.subject_age_h` (quantum 1) |
-| `core@1`, payment | `upgrade_delay_min`→`core.upgrade_delay_min` (quantum 60), `upgraded`→`core.upgraded`, `declines_before_first_success`→`core.declines_before_first_success`, `first_funding_prepaid`→`core.first_funding_prepaid`, `fingerprint_seen_on_other_subjects`→`core.fingerprint_seen_on_other_subjects` |
-| `core@1`, resource velocity | `resource_velocity_1h`→`core.resource_velocity_1h`, `resource_total`→`core.resource_total`, `key_velocity_1h`→`core.credential_velocity_1h`, `key_total`→`core.credential_total` (a declared kind with `role: credential`, §5.4) |
-| `core@1`, linked subjects and neighbour evidence | `linked_deleted_n`→`core.linked_deleted_n`, `neighbors_truncated`→`core.neighbors_truncated` |
+| `core@1`, account | `subject_age_h`→`core.subject_age_h` |
+| `core@1`, payment | `upgrade_delay_min`→`core.upgrade_delay_min`, `upgraded`→`core.upgraded`, `declines_before_first_success`→`core.declines_before_first_success`, `first_funding_prepaid`→`core.first_funding_prepaid`, `fingerprint_seen_on_other_subjects`→`core.fingerprint_seen_on_other_subjects` |
+| `core@1`, resource velocity | `resource_velocity_1h`→`core.resource_velocity_1h`, `resource_total`→`core.resource_total`, `key_velocity_1h`→`core.credential_velocity_1h`, `key_total`→`core.credential_total` |
+| `core@1`, linked subjects | `linked_deleted_n`→`core.linked_deleted_n`, `neighbors_truncated`→`core.neighbors_truncated` |
 | `core@1`, labels | `linked_labelled_abusive_n`→`core.linked_labelled_abusive_n` |
-| `core@1`, behaviour change | `burst_ratio_24h_vs_lifetime`→`core.burst_ratio_24h_vs_lifetime`. Its activity set is `resource.created` ∪ delivery views, which is exactly today's `resource.created` ∪ `content.sent`. The shared `burstFactor`/`ageDecayFactor` functions are also exposed to the DSL as `relative_to_history` (§5.5). |
-| `email@1`, requires `core` | `sends_10m_max`, `sends_1h`, `sends_first_day`, `webmail_recipient_share`, `webmail_sends_1h`, `distinct_recipients_1h`, `first_day_distinct_domains`, `self_send_before_external`, `subject_brand_match` (the last also requires `brand`). All become `email.<same>`. They read delivery views whose `channel` is in the pack's `channels` param (default `[email]`). |
-| `brand@1` | `name_brand_match`→`brand.name_match`, `name_has_at`→`brand.name_has_at`; new `brand.title_match` (§5.1.1). Data: `brands.yaml` plus the tenant's optional private `extra` list (S2b `brands_extra`). |
+| `core@1`, behaviour change | `burst_ratio_24h_vs_lifetime`→`core.burst_ratio_24h_vs_lifetime` (counts `resource.created` + `content.sent` + declared `activity` types, §5.4); new `core.history_truncated` (§5.7) |
+| `email@1`, requires `core` | `sends_10m_max`, `sends_1h`, `sends_first_day`, `webmail_recipient_share`, `webmail_sends_1h`, `distinct_recipients_1h`, `first_day_distinct_domains`, `self_send_before_external`, `subject_brand_match` (also requires `brand`), each becoming `email.<same>`. The pack owns the built-in `content.sent` type. |
+| `brand@1` | `name_brand_match`→`brand.name_match`, `name_has_at`→`brand.name_has_at`; new `brand.title_match` over any declared field with `role: title` (§5.4) |
 
-The `core.credential_*` rename is the only name that moves beyond adding a prefix. "Key" is an
-e2a word; "credential" is the product-neutral role (§5.4). The legacy alias keeps e2a's hash and
-weight keys unchanged.
+In the early slices every built-in feature is available to every tenant (P2, §9). Pack **gating**
+comes later, in P5.
 
-New core features are **additive**. They are registered but not in e2a's rule, so e2a's golden
-replay can't move:
-- `core.email_domain_class_disposable`: main §8 Q7 deferred this. It reads the existing
-  `subject.created.email_domain_class` and is neutral (sign-up identity quality, not mail sending).
-- `core.verdict_max_24h`: the maximum `content.verdict.score` in the trailing 24 h.
-- `core.history_truncated`: see §5.7.
+New `core` features are additive and are not in e2a's rule:
+- `core.email_domain_class_disposable` (deferred in main §8 Q7);
+- `core.verdict_max_24h`;
+- `core.history_truncated`.
 
-#### 5.1.1 The brand pack
+### 5.2 The one-time rename (replaces revision 1's canonical-key bridge)
 
-The matcher is S2b's `BrandSet`, moved unchanged: NFKC and confusables skeleton, word and token
-boundaries, Unicode punctuation tokenizing, case-sensitive entries, the integration and
-community gates, and Cf stripping. It applies to any product with user-chosen display names:
-workspace names, storefront names, profile names, community names.
+**Decision.** Rename in one slice (P1) and re-baseline the golden replay once. No alias table
+survives past that slice. The bridge existed only to keep stored verdict hashes and vendor
+cassettes stable. Under A1 there are none, and a bridge would keep two names for everything alive
+forever.
 
-- `brand.name_match` and `brand.name_has_at` read `resource.created` and `resource.deleted`
-  `name` (and `name_skeleton`) across **all** declared kinds, as they do today.
-- `brand.title_match` is the neutral sibling of `email.subject_brand_match`. It counts distinct
-  brands in non-self delivery titles over a trailing 1 h, capped at 3, and has none of the
-  email-specific exemptions. Non-email tenants use it. e2a keeps `email.subject_brand_match`,
-  whose S2b integration-name exemption and double-count rule are specific to mail.
-- The brand list is pack data: `config/packs/brand/brands.yaml` (public), plus a per-tenant
-  private `brand.extra` path merged at boot with `MergeBrandSets`.
+**Every consumer the rename touches, with its test:**
 
-### 5.2 Namespacing and the canonical key (how migration stays bit-for-bit)
+| Consumer | Change | Test |
+| --- | --- | --- |
+| `core.stageSkip`, which reads the literal `features["subject_age_h"]` | Reads `core.subject_age_h` instead. The `Rule.Stage` **keys** (`max_subject_age_h`, `min_subject_age_h`) are stage names, not feature names, and keep their names. | Table test: a staged rule skips at the age bounds with a namespaced vector. A grep test fails if any `core` source still contains a flat feature literal. |
+| `core.quantizeAgeFeaturesForHash`, which switches on names | Deleted. Quantization comes from `FeatureDef.HashQuantum` (1 h for `core.subject_age_h`, 60 min for `core.upgrade_delay_min`), passed to `Plan` in `core.Vector`. | The existing "hash stable under sub-hour drift" tests, re-run with namespaced names. |
+| `core.inputHash` | Changes once (the names inside it change). | Golden records both hashes. A test asserts every rule's hash changes in P1 and is stable in every later slice. |
+| Eval cassette key (`hashScoreRequest` over `req.Features`) | Changes once. P1 re-records every committed cassette (fake and local only, per A1) and stamps `feature_key_space: ns-v1` in the cassette header. | Loading a cassette with a mismatched `feature_key_space` fails with a clear error rather than silently missing. |
+| `run.json`: `dataset_sha`, `rule_sha`, `weights_sha` | `rule_sha` and `weights_sha` change once. `dataset_sha` changes only for corpus-v1 snapshot files, which P1 rewrites to v2. The manifest gains `feature_key_space`. | Golden compares metrics, not SHAs. A test checks `feature_key_space: ns-v1` is in the manifest. |
+| `worker.renderReason` and stored verdict reasons | Prints namespaced names. Verdict rows gain `reason_version: 2`. Old stored reasons are history and are not rewritten. | A reason snapshot test, plus a test that the verdict row carries `reason_version`. |
+| `corpus_examples.features` | New column `feature_key_space text NOT NULL DEFAULT 'flat-v0'`. P1's migration rewrites the JSON keys of existing rows (none in production, per A1; this touches local dev databases only) and sets `ns-v1`. Once migrated, the corpus loader refuses `flat-v0`. | Migration test on a seeded DB: keys rewritten and marker set. A second test checks a `flat-v0` row is refused. |
+| `local.Version()`, which hashes the whole `Weights` struct | Changes once. The weights file's `version:` is bumped to `v2`. | `Version()` differs from the pre-rename golden value and is stable afterwards. |
+| `feature.Names`, `Features.Map`, `config.FeatureSet`, `config/rules.yaml`, `config/local_weights.yaml`, `mutation_test.go`, `ablation_test.go`, golden-sign tables, `eval/fixtures/README.md` | Mechanical rename. | The full existing suite passes with renamed literals, and the grep test. |
+| `abusekit score --jsonl` input rows (an external contract) | A row keyed by an old flat name is rejected with `feature_renamed`, and the error names the new name. It fails loudly and never translates silently. | CLI contract test. |
 
-Every feature has two identities:
-- **Name**: the namespaced name, used everywhere a human or config refers to the feature: rules,
-  weights files, corpus v2, reasons, docs.
-- **Canonical key**: `Legacy` if the feature has one, else `Name`. It is used in exactly three
-  places:
-  1. `core.inputHash`: the rule's feature map is re-keyed by canonical key before JSON encoding.
-     Quantization comes from each feature's `HashQuantum`, which replaces the name switch in
-     `quantizeAgeFeaturesForHash`. `core.subject_age_h` has quantum 1 and
-     `core.upgrade_delay_min` has quantum 60, the same values applied under the same keys.
-  2. The local scorer's summation order: `sortedFeatures` is sorted by canonical key.
-  3. The local scorer's `Version()`: it hashes the weights map re-keyed by canonical key.
+**The floating-point bound.** The local scorer sums weight × feature in sorted feature-name order.
+Renaming the features changes the sort order, and with it the order of the additions. For `n`
+terms, recursive summation error is at most `(n−1)·u·Σ|wᵢxᵢ|` with `u = 2⁻⁵³`. For e2a's rule:
+- `n = 25` and `Σ|wᵢxᵢ| < 100` on any bounded vector, so `|Δlinear| < 2.7e-13`;
+- the sigmoid's slope is at most ¼, so `|Δrisk| < 6.7e-14`.
 
-For a migrated feature, the canonical key is the flat name today's code uses. Summation order,
-version hash, input hashes and therefore cassette keys are byte-identical, so no subject is
-rescored at cutover and no vendor call is repeated. A feature born namespaced (every new pack
-feature and every `custom.*`) has canonical key = name, so nothing legacy leaks into new work.
-
-**The alias table is frozen.** It is a Go literal of exactly the 25 flat names on `main` + #7,
-and CI enforces it: the table can never gain an entry, and no new `Name` may equal any alias.
-
-**Where flat names are still accepted (read-side only):**
-
-| Artifact | Behaviour |
-| --- | --- |
-| Rules (`inputs`) | Resolved through the alias table, but only if the owning pack is enabled for the tenant. Otherwise the load fails with `feature_not_enabled`. A load warning says the name is deprecated. |
-| Weights files | Same resolution. A file must not mix a flat name and its namespaced twin (`duplicate_feature`). |
-| Corpus v1 rows | `eval.LoadSnapshotCorpus` maps `input.features` keys through the table. An unknown flat key fails the load. Export always writes corpus-v2 (§5.9). |
-| Text inputs | Aliases `subject_line_skeleton`→`delivery.title_skeleton` and `first_link_host`→`delivery.link_host`. Their canonical keys stay the legacy names, for the same hashing reason. |
-| Floors | Entries with no `profile:` default to `tenant:e2a` (§5.9). |
-| Stored verdicts | Untouched. They store `input_hash`, risk and reason, and never feature names. |
+The golden asserts `|Δrisk| ≤ 1e-12`, which leaves margin. So that tiers are provably unchanged, it
+also asserts that no recorded score lies within `1e-12` of a tier cut point or a rule threshold. If
+one ever does, the fixture is flagged rather than passing silently.
 
 ### 5.3 Name grammar and reserved namespaces
 
-- Feature names: `^[a-z][a-z0-9]*\.[a-z][a-z0-9_]{0,55}$`, at most 64 bytes.
-- Reserved feature namespaces: `core`, `email`, `brand`, `custom`, plus any future pack name.
-  Tenants may define only `custom.*`. The `custom.` namespace is per tenant, so two tenants may
-  each have a `custom.invites_1h` that means different things (§12 Q11).
-- Event type names keep the wire grammar `^[a-z_.]+$`, at most 64 bytes, and must contain a dot.
-  Reserved type prefixes (built-ins, tenants may not declare types under them): `subject.`,
-  `payment.`, `subscription.`, `resource.`, `content.`, `delivery.`, `abusekit.`.
+- **Features** match `^[a-z][a-z0-9]*\.[a-z][a-z0-9_]{0,55}$`. The namespaces `core`, `email`,
+  `brand` and `custom` are reserved, as is any future pack name. Tenants define only `custom.*`,
+  which is scoped to the tenant.
+- **Event types** keep `^[a-z_.]+$`, are at most 64 bytes, and must contain a dot. The prefixes
+  `subject.`, `payment.`, `subscription.`, `resource.`, `content.` and `abusekit.` are reserved.
+- **Extension fields** on built-in types must be named `x_<name>`, so they can never collide with
+  a future built-in field.
 
-### 5.4 Neutral event vocabulary
+### 5.4 Product-declared vocabulary
 
-#### Built-in types after this change
-
-The wire contract (`POST /v1/events`, main §4.3) is unchanged in shape. Every change below is
-additive: a new built-in type, new optional fields, and tenant-declared types.
-
-| Type | Change |
-| --- | --- |
-| `subject.created`, `subject.deleted`, `subject.class`, `payment.attempt`, `subscription.changed`, `content.verdict` | none (keeps #7's optional `account_created_at`) |
-| `resource.created` / `resource.deleted` | `kind` is interpreted through the tenant's declared **resource kinds** (below). On the wire it stays free text. |
-| `content.sent` | **Legacy email delivery, accepted forever, with #7's redaction unchanged.** Projected to a delivery view (below). |
-| `delivery.sent` (new) | Neutral delivery: N recipients at destination D, with optional title text. |
-
-`delivery.sent.data`:
-
-| Field | Kind | Rule |
-| --- | --- | --- |
-| `channel` | enum, declared per tenant | Optional. A tenant with exactly one declared channel may omit it; otherwise it is required. An undeclared value → `redaction_failed`. |
-| `destination` | the kind the channel declares: `domain` \| `hash` \| `enum` | Optional. Where the delivery lands: a recipient domain, a keyed community id, a region code. |
-| `destination_class` | enum, declared per channel | Optional, for example `own_community` \| `other_community`. |
-| `recipient_count` | positive integer | Optional, default 1 for every feature that sums it. |
-| `recipient_hash` | hash (`^[A-Za-z0-9_:+/=-]{8,128}$`) | Optional. Exactly one recipient, so paired with `recipient_count > 1` → `redaction_failed` (#7's rule). |
-| `to_self` | bool | Optional. The recipient is the subject's own identity. |
-| `title` | text ≤ 200 | Optional. NFKC, email-shaped substrings masked, skeleton stored as `title_skeleton`. |
-| `link_host` | domain | Optional. First link host in the delivered content. |
-
-#### The delivery view (read-side projection)
-
-Features never read `content.sent` or `delivery.sent` directly. They read `event.View`, which
-`vocab.View` produces from the stored row. For `content.sent`:
-
-| Delivery view field | Taken from `content.sent` |
-| --- | --- |
-| `channel` | constant `email` |
-| `destination` (kind `domain`) | `recipient_domain` |
-| `recipient_count` | `recipient_count` |
-| `recipient_hash` | `recipient_hash` |
-| `to_self` | `recipient_is_own_identity` |
-| `title` / `title_skeleton` | `subject_line` / `subject_line_skeleton` |
-| `link_host` | `first_link_host` |
-
-A `delivery.sent` row maps to the same view field for field. The email pack's features are the
-S2b functions with one mechanical edit: `e.Type != "content.sent"` becomes
-`v.Kind != event.ViewDelivery || !channels[v.Channel]`, and the field reads are renamed.
-Everything else is untouched, including missing-field defaults, `recipientCountOf`'s default of
-1, `normalizeToken` domain folding and `isSelfSend`. So an e2a stream of `content.sent` and the
-same stream rewritten as `delivery.sent{channel: email}` yield identical features. §8's
-translation test proves this on every fixture.
-
-**Why read-side and not a rewrite at ingest.** Rewriting would change the stored type and the
-`BodyHash` that separates `duplicate` from `conflict`. It would also need a data migration for
-stored rows and would still leave old rows to interpret. The read-side view needs no migration
-and makes both forms equivalent by construction.
-
-#### Product-declared resource kinds and channels
+There is no new built-in delivery type. The wire contract (`POST /v1/events`) keeps its shape;
+every change below is additive and optional.
 
 ```yaml
 vocabulary:
-  version: 3                    # monotonically increasing; see §5.6 for compatibility rules
+  version: 4                          # must increase with any change; history in §5.6
+  subject_kinds:                      # default [account]
+    account:  {}
+    api_key:  {parent: account}       # a key's events also mark its parent account dirty
+    card:     {}
   resource_kinds:
-    agent:     {role: identity}
-    key:       {role: credential, aliases: [keys, api_key, api_keys, api-key, apikey, "api key"]}
-  channels:
-    email:     {destination: domain}
+    key: {role: credential, aliases: [keys, api_key, api_keys, api-key, apikey, "api key"]}
+    agent: {role: other}
+  link_kinds:                         # in addition to the six built-in kinds
+    phone_hash:   {evidence: true}    # counts as neighbour evidence
+    oauth_sub_hash: {evidence: true}
+  types:
+    invite.sent:
+      role: activity                  # included by core velocity/burst features
+      fields:
+        invitee_hash:   {kind: hash, join_domain: member}
+        target_class:   {kind: enum, values: [own_community, other_community]}
+        preview:        {kind: text, role: title, max_len: 200}   # stored as skeleton by default
+        link_host:      {kind: domain}
+  extend:                             # extension fields on built-in types
+    resource.created:
+      x_visibility: {kind: enum, values: [public, private]}
 ```
 
-- `role` is a closed enum: `credential`, `identity`, `workspace`, `content`, `other`.
-  `core.credential_*` counts kinds with `role: credential`; `core.resource_*` counts every kind.
-  Matching folds case and trims whitespace, then applies `aliases`. This is the S2b behaviour
-  moved into data: e2a's declaration above reproduces `resourceKindAliases` exactly, and the
-  golden replay proves it.
-- An **undeclared kind** is stored, counts in `core.resource_*` (role `other`), and increments
-  `abusekit_undeclared_kind_total{tenant}`. That matches today's behaviour for kinds that aren't
-  keys. With `vocabulary.strict: true`, an undeclared kind is instead rejected with the existing
-  `redaction_failed` code, so no new per-item code is needed.
-- A tenant with no `resource_kinds` block gets the **implicit legacy declaration** above. That is
-  how today's global config keeps working (§8).
+**Roles.** Only these ship:
+- resource kinds: `credential` and `other` (the review's minimal set; an undeclared kind is
+  `other`);
+- types: `activity`;
+- fields: `title`, which `brand.title_match` reads, and `self`, a bool marking a self-directed
+  event that such features exclude.
 
-#### Versioning
+`brand.title_match` counts distinct brands across the `title` fields of non-self activity events in
+a trailing 1 h, capped at 3. A `title` field stored skeleton-only is matched through
+`BrandSet.MatchesSkeleton`, which compares already-folded tokens to the brands' skeletons and
+skips the second fold. (#7 found that double folding is not idempotent for leetspeak.)
 
-The wire format stays `/v1`. Every addition is optional, and producers already handle unknown
-per-item codes because the code list is closed and unchanged. The one semantic change is to
-how **undeclared** types are stored (§5.6). It is flagged, and it is licensed because the
-service is pre-GA: main §4.3 documents unknown types as "stored", and nothing reads them yet.
-`RedactionSchemaVersion` for built-ins stays at 2 (#7). Each stored row gains
-`vocab_version text` (`"<tenant>@<n>"`, NULL for built-in-only schemas) next to
-`redaction_version`, in an expand-only migration.
+**Subject kinds.** Events gain two optional fields:
+- `subject_kind` (default `account`);
+- `also: [{kind, id}]`, with at most 3 entries.
+
+`also` lets one event (a charge attempt, say) be indexed under the merchant account, the card and
+the customer at once:
+- the event is stored once, and idempotency is still keyed on `(tenant, producer, id)`;
+- one index row is written per subject;
+- each named subject, and the declared `parent` of the primary subject, is marked dirty.
+
+Subjects are keyed `(tenant, kind, id)`, and the API follows:
+- `GET /v1/subjects/{subject}` and `POST .../evaluate` take an optional `?kind=` (default
+  `account`);
+- the list endpoint (S3b) gains a `kind` filter;
+- rules declare `applies_to: [kinds]` (default `[account]`);
+- a feature is computed only for the kinds in its `SubjectKinds`. For example, the `core`
+  onboarding features exist only for `account`.
+
+**Link kinds.** The `links` object gains `custom: {"<declared kind>": "<hash>"}`, with at most 8
+entries. Each value is re-HMACed like every hash (§5.6). Built-in and declared evidence kinds feed
+both `Neighbors` and the new `neighbours` op (§5.5).
+
+**Legacy behaviour by declaration.** A profile with no `resource_kinds` gets the implicit
+declaration `key: credential`, with #7's aliases. The golden replay proves this reproduces
+`resourceKindAliases`.
 
 ### 5.5 Declarative custom features
 
@@ -392,820 +359,979 @@ service is pre-GA: main §4.3 documents unknown types as "stored", and nothing r
 
 ```yaml
 features:
-  - name: custom.public_links_1h          # custom.* only
-    version: 1                            # bump on ANY change to the definition (enforced, §5.7)
-    description: public share links created in the last hour   # required, shown in reasons
-    count:                                # exactly one op key: count | distinct | share | peak | time_between
-      type: share.link_created            # a declared type, or a built-in type/view
+  - name: custom.public_links_1h        # custom.* only
+    version: 1                          # bump on any change (checked against history, §5.6)
+    description: public share links created in the last hour
+    subject_kinds: [account]            # default [account]
+    count:                              # exactly one op key
+      type: share.link_created
       where: {field: visibility, eq: public}
-      sum: {field: size_class_weight, default: 1, cap_each: 10}   # optional; count = sum of this
-    window: 1h
-    transform: {log1p: true, cap: 50}     # cap mandatory; log1p optional; applied log1p → cap
+      sum: {field: size_class_weight, default: 1, cap_each: 10}   # optional
+    window: 1h                          # or first: <dur> | lifetime | before_first: {type, where}
+    transform: {log1p: true, cap: 50}   # cap mandatory
+    prior_sign: "+"                     # optional, for uniform priors
 ```
 
-**Windows.** Either `window: <dur>` (trailing, `(now − dur, now]`) or `first: <dur>` (anchored,
-`[start, start + dur)`). `<dur>` is a whole number of minutes, hours or days: `1m`–`30d`.
-`lifetime` means `(−∞, now]`. `start` is the account start defined in §5.1 `Input.Start`.
+**Windows.**
 
-**Predicates (`where`).** A closed set of operators. There is no regex, no arithmetic and no
-user functions.
-
-| Leaf | Meaning | Allowed field kinds |
-| --- | --- | --- |
-| `{field: f, eq: v}` / `{field: f, ne: v}` | equality after the kind's normalisation | enum, bool, number, domain, hash |
-| `{field: f, in: [..]}` / `not_in` | membership, ≤ 256 values; for enums every value is checked against the declared enum at load, so a typo is a load error | enum, number, domain, hash |
-| `{field: f, in_set: <name>}` | membership in a tenant- or pack-provided set file (for example, `email`'s webmail list), hashed at load; ≤ 100,000 entries | domain, hash, enum |
-| `{field: f, suffix_in_set: <name>}` | domain-label-boundary suffix match (`a.b.example.test` ⊂ `example.test`), linear time | domain |
-| `{field: f, gte: n}` / `lte` / `gt` / `lt` | numeric compare | number |
-| `{field: f, exists: bool}` | presence | any |
-| `{all: [..]}` / `{any: [..]}` / `{not: leaf}` | combinators, depth ≤ 2, ≤ 8 leaves in total | |
-
-An absent field or a type mismatch makes a leaf false; `{exists: false}` is the only leaf that
-is true on absence. `text` fields can't appear in `where` or as a `distinct` field. Text is only
-available to text-accepting scorers through a rule's `text:` list. That keeps free text out of
-every aggregation.
-
-**Operations.**
-
-| Op | Value at `now` |
+| Window | Range |
 | --- | --- |
-| `count` | The number of matching events in the window, or, with `sum`, the sum of the field over them. `default` covers absence, and `cap_each` clamps each event's addend before summing, as S2b does with `recipient_count`. |
-| `distinct` | `{type, where, field}`: the number of distinct normalised values of `field` among matching events in the window. `field` must be an `enum`, `number`, `domain` or `hash` field. Tracking stops at `track_max`, the smallest count whose transformed value reaches `transform.cap` (`cap` itself without `log1p`, `ceil(expm1(cap / scale))` with it). The loader rejects a definition whose `track_max` exceeds 10,000, so memory is O(track_max). |
-| `share` | `{type, where (denominator), match (numerator predicate), sum?}`: numerator ÷ denominator over the window; `if_empty` (default 0) when the denominator is 0. |
-| `peak` | `{type, where, sum?, size: <dur>}`: the maximum count or sum in any window `(t − size, t]` with `t` an event instant inside the outer window. `size` ≤ window and window ÷ size ≤ 1440. A two-pointer scan over the time-sorted matches. |
-| `time_between` | `{from: {type, where}, to: {type, where}, until_now: bool, if_absent: n}`: minutes from `t_A` (the earliest matching `from`) to `t_B` (the earliest matching `to` with `t_B ≥ t_A`). No `from` event → `if_absent`. A `from` but no `to` → minutes since `t_A` when `until_now`, else `if_absent`. `if_absent` is mandatory. Negative results can't occur, and the value is floored at 0 as a guard. |
+| `window: <dur>` | `(now − dur, now]`, where `dur` is 1 minute to 30 days, in whole minutes, hours or days |
+| `first: <dur>` | `[start, start + dur)` |
+| `lifetime` | `(now − 90d, now]`: the retention horizon. The docs call this "retained lifetime" so nobody reads it as all-time. |
+| `before_first: {type, where}` | `(now − 90d, t_B]`, where `t_B` is the first matching event at or before `now`. If there is no such event, it falls back to `(now − 90d, now]`. The end is inclusive, matching #7's "at or before". |
 
-**The history-relative modifier.** It may be added to `count`, `distinct` and `peak`, and it
-generalises S2b's `burstFactor × ageDecayFactor`:
+Events with `at > now` are excluded from every window. See "Future events" under Semantics.
 
-```yaml
-    relative_to_history:
-      lookback: 30d            # ≤ 30d
-      exclude_recent: 24h      # the current burst never serves as its own baseline
-      age_decay: {full_until: 3d, zero_at: 30d, floor: 0.2}   # optional; these are the defaults
-```
+**Predicates.** A closed set, with no regex:
+- equality and membership: `eq`, `ne`, `in` / `not_in` (at most 256 values; enum values are checked
+  against the declaration);
+- set files: `in_set` / `suffix_in_set` (named files of at most 100,000 entries, hashed at load);
+- numeric comparison: `gt`, `gte`, `lt`, `lte`;
+- presence: `exists`;
+- combinators: `all`, `any`, `not`, with nesting depth at most 2 and at most 8 leaves.
 
-`baseline` is the maximum of the same op, with the same width and predicate, over sliding
-windows whose end lies in `(now − lookback, now − exclude_recent]`. The value is then
-`min(current / max(baseline, 1), transform.cap)`. If `age_decay` is set, the result is
-multiplied by `clamp(1 − (age_days − full_until)/(zero_at − full_until), floor, 1)`. With the
-defaults, `full_until = 3d` and `zero_at = 30d` make the denominator 27, which is exactly S2b's
-`ageDecayFactor`. `floor > 0` is mandatory, so a decayed signal is never a hard zero.
+A leaf is false when its field is absent or has the wrong type. `text` fields are banned from
+predicates, `distinct`, `group_by` and `on`.
 
-**Transform.** `cap` is mandatory for every feature: a finite value > 0, and at most the op's
-natural bound (1 for `share`). `log1p` is optional and takes one of three forms, applied before
-the cap: `log1p: true` gives `ln(1 + v)`; `log1p: {scale: s}` gives `s · ln(1 + v)`; and
-`log1p: {anchored_at: n}` sets `s = n / ln(1 + n)`, so `v = n` maps to `n`. The last form
-reproduces `first_day_distinct_domains`'s S2b shape. The transformed value always lies in `[0, cap]`, and
-that is the feature's `Bound`.
+**Operations.** `cap(v)` below is the transform.
 
-#### Evaluation semantics
-
-- **Pure and order-independent.** A feature is a function of the set of stored events and
-  `now`, never of arrival order. Where "first" is ambiguous, ties at the same instant break by
-  `(at, event id)`. Late events bump `dirty_seq` as they do today.
-- **Half-open windows.** Trailing windows are `(now − W, now]`; anchored windows are
-  `[start, start + W)`; `peak` sub-windows are `(t − S, t]`.
-- **Future events are excluded everywhere,** `lifetime` included: an event with `at > now`
-  contributes to no custom feature until `now` reaches it. It does contribute a rescore
-  candidate at its own `at` (the S2b B4 behaviour, generalised).
-  *Frozen legacy exception:* the migrated Go features `core.resource_total` and
-  `core.credential_total` count future-dated events in their lifetime totals (the S2 behaviour),
-  and `email.first_day_distinct_domains` uses an inclusive `[start, start + 24h]`. Both are kept
-  for bit-for-bit parity and documented in each feature's docstring. Harmonising them is a
-  `core@2`/`email@2` change (§12 Q5).
-- **Rescore candidates.** For each windowed feature, the compiler emits: the exit instant of the
-  oldest in-window match (`at + W`); anchored window ends still in the future; for `peak`, the
-  exit of the current maximum's sub-window; for `relative_to_history`, the instants where an
-  event crosses `now − exclude_recent` or `now − lookback`; and every future-dated match. The
-  orchestrator takes the minimum and coalesces it to the 5-minute bucket. This generalises
-  `isWindowedEventType`: the set of windowed types is the union of every feature's `Reads`.
-- **Determinism of floats.** Sums accumulate in time order `(at, id)` with a single `float64`
-  accumulator, so the same event set always gives the same bits.
-
-#### Compilation and cost model
-
-`pack/custom.Compile` validates each definition and produces a **per-tenant plan**: an index
-from view type to the list of (feature, predicate program) pairs that read it. Extraction makes
-one pass over the subject's events, dispatches each event to the features for its type, and
-evaluates the flat predicate programs. `peak` and `relative_to_history` keep per-feature
-matched-instant slices, and a final pass per feature runs the two-pointer scans.
-
-Static cost units, checked at load:
-
-| Op | Units |
-| --- | --- |
-| `count`, `share`, `time_between` | 1 |
-| `distinct`, `peak` | 2 |
-| `relative_to_history` | ×2 on top of the op's own cost |
-| Each predicate leaf beyond the first | +0.25 |
-
-Per-tenant budget: **256 units**. With the 50,000-event scan bound (§5.7), the worst case is
-about 50,000 events × 8 dispatched features per type × 8 leaves ≈ 3.2M predicate steps, plus
-O(n) scans. That is tens of milliseconds, which is what criterion 4 measures. At runtime a
-per-subject extraction deadline (default 250 ms) applies to the custom pack. If it expires, the
-pack fails as described in §6.
-
-### 5.6 Redaction for declared types and fields
-
-Ingest never consults rules (main §4.3). It consults the tenant **vocabulary**, which is
-config, reviewed like code, and compiled into `vocab.Vocabulary`. The built-in `schema` map
-becomes the built-in half of every vocabulary, unchanged.
-
-```yaml
-vocabulary:
-  version: 1
-  types:
-    share.link_created:
-      fields:
-        visibility: {kind: enum, values: [public, org, private]}
-        file_kind:  {kind: enum, values: [document, archive, executable, image, other]}
-        size_bytes: {kind: number, min: 0, integer: true}
-        folder_title: {kind: text, max_len: 120, skeleton: true}
-    share.downloaded:
-      fields:
-        link_hash:        {kind: hash}
-        downloader_ip24:  {kind: hash}
-        downloader_is_owner: {kind: bool}
-```
-
-**Field kinds and the rule for each:**
-
-| Kind | Accepts | On violation |
+| Op | Definition at `now` | Bound / cost class |
 | --- | --- | --- |
-| `text` | string; NFKC; control characters and invalid UTF-8 rejected; **email-shaped substrings masked to `@`** (#7's `subject_line` rule, generalised); truncated at `max_len` (≤ 500, default 200); optional `skeleton` companion | reject for control characters or bad UTF-8; mask for an email shape |
-| `number` | finite float64; optional `min`, `max`, `integer` | reject |
-| `bool` | bool | reject |
-| `enum` | string in `values` (≤ 64 values, each ≤ 64 bytes, `[a-z0-9_.-]+`) | reject |
-| `hash` | `^[A-Za-z0-9_:+/=-]{8,128}$` (no `@`, `%` or whitespace) | reject (never truncated) |
-| `domain` | lower-cased, IDNA to ASCII, hostname grammar (labels 1–63, total ≤ 253); a user part is impossible by grammar | reject |
-| `timestamp` | RFC 3339 (#7's `account_created_at` pattern) | reject |
+| `count` | The number of matching events in the window, or the sum of `sum.field` over them. An absent field counts as `default`, and each value is clamped to `cap_each`. | O(n) |
+| `distinct` | `{field}`: the number of distinct values of `field` among matches. Tracking stops at `track_max`, the smallest count whose transformed value reaches `cap`; `track_max` must be ≤ 10,000. | O(n); memory O(track_max) |
+| `share` | `{where, match, sum?}`: the numerator over the `match` events divided by the denominator over the `where` events. When the denominator is 0, the value is `if_empty` (default 0). | O(n) |
+| `peak` | `{size}`: the maximum of `agg(E ∩ (t − size, t])`, taken over `t` = the instants of matching events inside the outer window. Sub-windows are **clipped** to the outer window, so events outside it never count even if they fall inside `(t − size, t]`. Requires `size` ≤ window and window ÷ size ≤ 1440. | O(n), two-pointer |
+| `time_between` | `{from: {type, where, anchor: first\|last}, to: {type, where}, until_now, if_absent}`. `t_A` is the first (or last) matching `from`; `t_B` is the first matching `to` with `t_B ≥ t_A`. The value is minutes from `t_A` to `t_B`. With `until_now` and no `t_B`, it is `now − t_A`. `if_absent` is mandatory. Floored at 0. | O(n) |
+| `sequence` | `{a: {type, where}, b: {type, where}, within: <dur>, on: {a: field, b: field}?}`: the number of `b` events in the window that have at least one `a` event with `t_a ∈ (t_b − within, t_b]` and, if `on` is set, `a.on == b.on`. Both `on` fields must be `hash` fields with the **same `join_domain`** (§5.6), or equality across them is meaningless; the loader checks this. The evaluator keeps, per `on` value, the latest `a` instant ≤ `t_b` in an LRU capped at 10,000 keys. Eviction sets the feature's truncated flag. Requires `within` ≤ 24 h. | O(n); memory O(keys) |
+| `group_by` | A modifier on `count`, `distinct` or `sum`: `{field, reduce: max\|{count_gte: k}, max_groups ≤ 1000}`. Matches are grouped by `field` and the op is applied per group. `max` returns the largest group value; `count_gte: k` returns how many groups have a value ≥ k. Groups are created in `(at, producer, id)` order. Once `max_groups` is reached, new groups are ignored and the truncated flag is set. | O(n); memory O(groups) |
+| `ratio` | `{num: custom.a, den: custom.b, if_empty}`: `num ÷ den` over two **non-ratio** custom features, forming a depth-1 DAG. The loader rejects cycles and ratio-of-ratio. | O(1): the inputs are computed anyway |
+| `neighbours` | `{via: [link kinds], where: {deleted: permanent} \| {labelled: abusive} \| {created_within: <dur>} \| {}}`: the number of distinct other same-tenant, same-kind subjects that share any `via` key and satisfy the condition. Fan-in is capped at 50 per key and 200 in total, as in main §4.2, and hitting a cap sets `core.neighbors_truncated`. | One store query per distinct `via` set, cached per extraction. At most 4 `neighbours` features per tenant. |
 
-**Rules that make it privacy by construction:**
-1. The existing recursive leak scan runs first, over every key and value of every event.
-   Email-shaped content outside a `text` field is still rejected. Declared `text` fields are the
-   only exemption, and they are masked instead of rejected.
-2. **Undeclared fields of a declared type are hashed, not stored.** A string becomes
-   `hk1:` + hex(HMAC-SHA256(tenant redaction key, type ‖ field ‖ value))[:32]. Numbers and bools
-   pass through. Objects and arrays are dropped. A hashed field can be used only in
-   `distinct`, `eq`/`in` on a hash (the producer would have to compute the same HMAC, which it
-   can't, so in practice only `distinct` and `exists`). It can never be read back.
-3. **Undeclared types** get the same treatment, with every top-level key treated as undeclared.
-   This replaces "kept as-is" (§5.4 versioning note). Undeclared types remain unusable by
-   features until they are declared.
-4. **The redaction key** is a per-tenant secret held by abusekit (Secret Manager,
-   `abusekit-<tenant>-redaction-key`). It is separate from the producer-held link-hash key.
-   Rotating it breaks equality across the rotation boundary for hashed fields, which is
-   acceptable because they only feed windowed `distinct`. The key id is recorded in
-   `vocab_version`.
-5. Caps: ≤ 32 declared types per tenant, ≤ 32 fields per type, `data` ≤ 8 KiB after redaction
-   (unchanged).
+**`relative_to_history`.** A modifier on `count`, `distinct` and `peak`. It is the exact pipeline
+of #7's `burstFactor × ageDecayFactor`:
 
-**Vocabulary compatibility.** Stored rows are immutable, and features must be able to read old
-rows. So a vocabulary may only **widen**: add a type, add a field, add enum values, raise
-`max_len` or `max`, or switch `strict` off. Changing a field's kind, removing or narrowing enum
-values, or lowering a cap requires a new field name. The loader enforces this against the latest
-accepted vocabulary for the tenant, recorded in a new `tenant_vocabularies(tenant, version,
-sha, body, accepted_at)` table. The version must increase with any change, and an incompatible
-change fails the load with `vocab_incompatible`. The harness reports how many rows were stored
-under each `vocab_version`.
+```
+cur      = op over the feature's window at now
+E_b      = { matching events e : now − lookback < e.at ≤ now − exclude_recent }
+base     = baseline_op over E_b      (default: the same op; for count/distinct over window W it is
+           the max of that op over sliding windows (t − W, t], t ∈ instants of E_b, clipped to E_b;
+           for peak it is peak over E_b with the same size)
+v1       = min( cur / max(base, 1), ratio_cap )          ratio_cap defaults to transform.cap
+age_days = (now − start) / 24h
+d        = clamp( 1 − (age_days − full_until)/(zero_at − full_until), floor, 1 )   if age_decay
+v2       = v1 · d                                         (v1 if no age_decay)
+value    = transform(v2)                                  log1p (optional), then cap
+```
 
-### 5.7 Limits (validated at load; also the fuzz oracle)
+Parameters:
+- `lookback` ≤ 30 d, `exclude_recent` < `lookback`, and `floor` > 0.
+- `age_decay` defaults to `full_until: 3d, zero_at: 30d, floor: 0.2`, which are #7's constants.
+- `baseline:` may override the baseline op, e.g. `baseline: {peak: {size: 10m}}`. That lets a 1 h
+  sum be compared against a prior 10-minute peak, which is how #7's `sends_1h` works.
+
+**Which #7 and S2 features the DSL can express:**
+- **Expressible:**
+  - `sends_10m_max`, `sends_1h`, `webmail_sends_1h`: `relative_to_history` with a `baseline`
+    override, `sum: recipient_count`, `cap_each: 300`, `ratio_cap: 300`;
+  - `sends_first_day`;
+  - `webmail_recipient_share`: `share` + `in_set: webmail`;
+  - `declines_before_first_success`, and `self_send_before_external` with `cap: 2`: via
+    `before_first`;
+  - `resource_*`, `credential_*`;
+  - `upgrade_delay_min`: `time_between` + `cap`.
+- **Not expressible:**
+  - `distinct_recipients_1h`, a mixed aggregate: distinct hashes, falling back to summing
+    `recipient_count` for events that have no hash;
+  - `subject_brand_match` and `brand.*`, which need the brand matcher and its integration and
+    community gates;
+  - `first_day_distinct_domains`, which has an inclusive end where DSL `first:` windows are
+    half-open;
+  - `burst_ratio_24h_vs_lifetime`, which counts future-dated events in its lifetime denominator;
+  - `linked_*` and `fingerprint_*`, which carry specific deleted-and-labelled evidence semantics;
+    the `neighbours` op covers the generic cases;
+  - `subject_age_h`, which reads `start` rather than events.
+
+The non-expressible features stay Go features in their packs. P4b adds a test that re-expresses
+every "expressible" feature in the DSL and checks it matches the Go value bit for bit on every
+fixture.
+
+**Transform.** `cap` is mandatory: a finite value > 0, and at most 1 for `share`. `log1p` is
+optional and is applied before the cap:
+- `log1p: true` gives `ln(1+v)`;
+- `log1p: {scale: s}` gives `s·ln(1+v)`;
+- `log1p: {anchored_at: n}` sets `s = n/ln(1+n)`.
+
+The output always lies in `[0, cap]`, and that range is the feature's `Bound`.
+
+#### Semantics
+
+- **Pure and order-independent.** A feature is a function of the loaded event set and `now`.
+  Ordering, ties and "first" all use `(at, producer, id)`. P0 switches the store's scoring loader
+  from `(at, seq)` to this order, and the golden captures it before the rename. Any fixture whose
+  ties now resolve differently is listed as a baseline change: a tie resolved by arrival order was
+  a latent non-determinism.
+- **Half-open windows.** `(now − W, now]`, `[start, start + W)`, and clipped `peak` sub-windows.
+  `before_first` is the one intentionally inclusive end.
+- **Future events.** Events with `at > now` are excluded from every custom window, and schedule a
+  rescore at their `at`. Some Go features keep frozen legacy behaviour for semantic identity,
+  documented on each `FeatureDef`:
+  - `core.resource_total`, `core.credential_total` and `core.burst_ratio_24h_vs_lifetime` count
+    future-dated events;
+  - `email.first_day_distinct_domains` has an inclusive end.
+
+  Harmonising them is `core@2`/`email@2` work (§12 Q5).
+- **Deterministic floats.** Sums accumulate in `(at, producer, id)` order in one `float64`.
+- **Rescore candidates.** Each DSL feature emits:
+  - the exit time of its oldest in-window match;
+  - the end of any anchored window;
+  - for `peak`, the exit of the current maximum's sub-window;
+  - for `relative_to_history`, the crossings of `now − exclude_recent` and `now − lookback`;
+  - for `before_first`, the first `to` event;
+  - future-dated matches.
+
+  Rescore-storm control (§5.8) then filters and coalesces them.
+
+### 5.6 Redaction, pseudonymisation and vocabulary history
+
+Ingest never consults rules. It consults the tenant's **vocabulary**. What abusekit stores is
+**pseudonymised**, not anonymous: anyone holding both the key and a candidate value can recompute
+a keyed hash. Retention and erasure (main §4.4, §4.11) therefore apply to it.
+
+**Field kinds:**
+
+| Kind | Stored as | Rejected when |
+| --- | --- | --- |
+| `text` | NFKC. Email, card, IP and phone shapes are **masked** (`@`, `#card`, `#ip`, `#phone`), and the value is truncated at `max_len` (≤ 500). **`store: skeleton` is the default for custom text**: only the confusables skeleton is kept. `store: raw` is opt-in, for text-accepting scorers only. The built-in `content.sent.subject_line` stays raw (main §4.3). | Control characters, invalid UTF-8 |
+| `number` | A finite float64, checked against the optional `min`, `max` and `integer`. Integers of 13–19 digits also get the Luhn check. | Out of range, non-finite, or Luhn-valid |
+| `bool` | As-is | Not a bool |
+| `enum` | One of the declared values (at most 64, each matching `[a-z0-9_.-]{1,64}`) | Undeclared value |
+| `hash` | **Re-HMACed at ingest:** `hk<keyid>:` + hex(HMAC-SHA256(k_tenant, input))[:32]. `input` is `lp(type) ‖ lp(field) ‖ lp(value)`, or `lp("join:" ‖ join_domain) ‖ lp(value)` when the field declares a `join_domain`; `lp` is a u32 length prefix. A `join_domain` makes the same identifier equal across fields and types (for `sequence.on` and cross-type `distinct`); without one, hashes are separated per field. The producer's value is never stored. | Doesn't match `^[A-Za-z0-9_:+/=-]{8,128}$` |
+| `domain` | Lower-cased and IDNA-encoded to ASCII. It must end in a public suffix from the embedded, versioned PSL snapshot, or in an RFC 6761 special-use name (`.test`, `.example`, `.invalid`, `.localhost`) so synthetic fixtures stay valid. With the optional `reduce: etld1`, only the registrable domain is stored. | IP literal, all-numeric label, unknown suffix, `@` |
+| `timestamp` | RFC 3339 (#7's pattern) | Anything else |
+
+**Rules, in order:**
+1. **Leak scan.** It runs over every key and value of every event, and now detects:
+   - email addresses;
+   - Luhn-valid runs of 13–19 digits (separators allowed);
+   - IPv4 and IPv6 literals;
+   - phone shapes: `+` followed by 8–15 digits, or grouped national formats of 10 or more digits.
+
+   What happens on a match depends on the field:
+   - a declared `text` field is masked;
+   - a declared `hash` field is exempt, because its value is replaced by the HMAC;
+   - anywhere else, the event is rejected with `redaction_failed`.
+2. **Declared fields** are handled by kind, as in the table above.
+3. **Undeclared fields** of any type, built-in or declared, are **dropped whatever their kind**,
+   numbers included. The row keeps `x_undeclared: [sorted field names]`; a name that fails the
+   leak scan is rejected. **Undeclared types** keep only `type`, `at` and that list of names.
+   Revision 1 hashed undeclared strings instead; that is removed.
+4. **Built-in hash values are re-HMACed too:** `content.sent.recipient_hash` and every `links`
+   value, both the six built-in link kinds and declared ones. Every `links` kind has its own
+   `join_domain`, which is the kind's name. Equality is preserved, so `distinct` counts,
+   neighbour joins and every golden feature value are unchanged; only the stored bytes change. A
+   producer that mistakenly sends a raw phone number as a "hash" never has it stored.
+5. **Built-in domain fields** (`recipient_domain`, `address_domain`, `first_link_host`) get the
+   `domain` rules, and `RedactionSchemaVersion` becomes 3. Every committed fixture uses `.test`
+   and passes.
+
+**Keys and rotation.** The key interface is provider-agnostic:
+
+```go
+type Keys interface {
+    // Current returns the key used to write new values, and its id.
+    Current(ctx context.Context, tenant string, purpose Purpose) (id string, key []byte, err error)
+    // ReadSet returns every key readers must accept right now (current, plus the previous key
+    // during a rotation).
+    ReadSet(ctx context.Context, tenant string, purpose Purpose) ([]KeyRef, error)
+}
+```
+
+There are two adapters: a file adapter for dev and tests, and a cloud secret-manager adapter.
+Neither the names nor the config mention a provider. Rotation is **dual-key**:
+- For `max_lookback` (at most 30 days), ingest writes each hash field twice: `<field>` under the
+  new key and `<field>__prev` under the old one. Links get one row per key id.
+- Until the rotation's `read_flip_at`, features read the `__prev` values and neighbour joins match
+  either key id.
+- After `read_flip_at`, readers use only the new values and `__prev` writes stop.
+- The key id is part of `vocab_version` (`"<tenant>@<n>/k<id>"`), so every row can be traced to
+  the key that hashed it.
+
+**Vocabulary history lives in the config tree.** The mount holds `tenants/<t>/history/NNNN.yaml`,
+an append-only list of accepted vocabulary and custom-feature versions, each with an
+`effective_at`. CI in the private config repo runs `abusekit config check` over the full history
+and enforces three rules:
+- **Widening only.** Adding a type, field, enum value, `max_len` or `max` is fine. Changing a
+  field's kind, removing an enum value or narrowing a limit needs a new field name.
+- **No redefinition.** A custom feature's `(name, version)` is never redefined.
+- **Monotonic time.** `effective_at` never goes backwards.
+
+At runtime, the `tenant_config_versions` table records what was actually loaded and refuses a
+profile that contradicts it. It is a guard, never the source of truth.
+
+**Warm-up.** A feature is **cold** from its `effective_at` until
+`effective_at + max(window, lookback + exclude_recent)`. That applies to a new custom feature, a
+new version of one, and any feature over a newly declared field or type. An `advise` rule with a
+cold input is scored and stored as shadow for that period: it reports `mode: shadow` with
+`warming_until`. The value is still computed; it just can't drive a tier on partial history.
+
+### 5.7 Bounded loading, step budget, and truncation as a signal
+
+This replaces revision 1's bound of the 50,000 newest events and its 250 ms wall-clock deadline.
+
+**Load plan (per profile and subject kind, computed at compile time):**
+1. **Onboarding types, in full.** `subject.*`, `payment.*` and `subscription.*` are loaded
+   oldest-first, up to `onboarding_bytes` (1 MiB decoded by default). Onboarding facts such as
+   "first success" come from the *earliest* events, so recent activity can never push them out.
+2. **Anchored range.** `[start, start + A)` is loaded oldest-first, where `A` is the maximum
+   `first:` duration (24 h for e2a).
+3. **Trailing range.** `(now − L, now + 24h]` is loaded **newest-first** until the total decoded
+   size reaches `history_bytes` (8 MiB by default).
+   - `L = max over features of max(window, lookback + exclude_recent + baseline width)`.
+   - `L` is 90 d if any feature uses `lifetime` or `before_first`.
+   - The `+24h` covers future-dated events inside the skew allowance, which schedule rescores.
+4. **`start`** comes from `subject.created.account_created_at` if present, else from
+   `subjects.first_seen_at`, never from loaded events. Truncation therefore can't move it.
+
+Events are deduplicated across the three ranges by `(producer, id)`, and the combined history is
+ordered `(at, producer, id)`.
+
+**Step budget, instead of wall-clock time.** A step is one event dispatched to one feature, plus
+one step per predicate leaf. The per-subject budget is
+`steps_max = history_bytes / avg_event_bytes × per_type_fanout_max × leaves_max`. With the defaults
+that is 8 MiB / 256 B × 16 × 8 ≈ 4.2M. Every pack charges its steps through `Input.Budget`, the Go
+packs included.
+
+The P4a benchmark calibrates the ns-per-step figure end to end (store load, decode, projection,
+extraction, orchestration). The committed `cost_table.yaml` records it, and CI fails if a profile
+at the limits exceeds p99 50 ms. Because the budget counts work, when it runs out doesn't depend
+on how fast the host is.
+
+**Exhaustion and truncation.** Exhausting the byte cap, the step budget, `max_groups` or the
+`sequence` keys never makes a rule unscored:
+- features are computed over what was processed, in a deterministic order (newest-first for
+  trailing features, earliest-first for onboarding and anchored ones);
+- `core.history_truncated = 1` is set, and `core` requires it to carry a **positive** weight.
+
+A pack **error** (a bug) still marks the rules that read that pack as unscored and degraded.
+Truncation never does.
+
+**Why flooding with cheap events can't evade:**
+- (a) Onboarding facts and `start` are loaded separately and are never displaced.
+- (b) Newest-first loading keeps every trailing window, up to the byte cap. The flood is itself the
+  most recent activity, so it is counted, and it raises every volume or velocity feature it
+  matches.
+- (c) Truncation drops only the *oldest* trailing events, which feed three things:
+  - baselines: a smaller baseline gives a larger `v1`, because `cur / max(base, 1)` is monotone;
+  - lifetime denominators: a smaller denominator gives a larger ratio (as with `burst_ratio`);
+  - lifetime totals: a smaller total gives a smaller value. This is the only direction that can
+    lower risk.
+- (d) An invariant closes the third case. `packtest` checks it for every weights file that
+  includes `core.history_truncated`:
+  `w(core.history_truncated) ≥ Σ over features f with TruncationDir(f) = −1 of |w_f| · Bound_f`.
+  Truncation therefore never lowers the linear sum. Two Go features have no natural bound
+  (`core.resource_total`, `core.credential_total`). They get `Bound` from a cap of 1,000, which no
+  fixture reaches, so semantic identity holds.
+- (e) Forcing truncation sets the abusive subject's own `history_truncated` signal.
+
+Criterion 6's property test covers every built-in and DSL feature.
+
+**Limits** (validated at load; also the fuzz oracle):
 
 | Limit | Value |
 | --- | --- |
 | Custom features per tenant | 64 |
-| Cost units per tenant | 256 |
-| Predicate depth / leaves per feature | 2 / 8 |
-| `in` list size / set file entries | 256 / 100,000 |
-| Window, lookback | ≤ 30 d; `lifetime` allowed only for `count`, `distinct`, `share`, `time_between` |
+| Features per event type (fan-out) | 16 |
+| Predicate depth / leaves | 2 / 8 |
+| `in` list size / set-file entries | 256 / 100,000 |
+| Window / lookback | ≤ 30 d (`lifetime` and `before_first` are 90 d: retention) |
 | `peak` window ÷ size | ≤ 1440 |
-| `distinct` cap | ≤ 10,000 |
-| Events scanned per subject | 50,000 newest by `(at, id)`, plus the earliest event and `subject.created` for `start` |
-| Extraction deadline (custom pack) | 250 ms default, per-tenant override ≤ 1 s |
+| `distinct` track_max / `group_by` groups / `sequence` keys | 10,000 / 1,000 / 10,000 |
+| `neighbours` features | 4 |
+| `also` subjects per event / declared link kinds | 3 / 8 |
+| `history_bytes` / `onboarding_bytes` | 8 MiB / 1 MiB decoded |
+| Steps per subject | Calibrated; default ≈ 4.2M |
+| Static cost units per tenant | 256. A unit is the benchmarked cost of one O(n) op at the byte cap. |
 
-Above the scan bound, the orchestrator sets `core.history_truncated = 1`. No committed fixture
-comes near the bound, so the golden replay is unaffected. Custom-feature versioning: the loader
-keeps a SHA-256 of each normalised definition per `(tenant, name, version)` in
-`tenant_feature_defs`. Redefining an existing `(name, version)` with a different body fails with
-`feature_version_reused`.
+### 5.8 Profiles, rules, scheduling
 
-### 5.8 Rules and validation at load
+**Profiles live in a private mount** (`--profiles /etc/abusekit/tenants/`, mounted by the hosted
+deploy from the operator's private config repo). This repo ships only:
+- `examples/tenants/*.yaml`: the five fictional §7 profiles;
+- `examples/tenants/reference/`: today's `config/rules.yaml` + `local_weights.yaml`, renamed. The
+  golden replay runs this profile, and e2a's private profile starts as a copy of it.
 
-A tenant profile is `config/tenants/<tenant>.yaml`:
-
-```yaml
-tenant: e2a
-packs: [core@1, email@1, brand@1]
-pack_params:
-  brand: {extra: /run/secrets/brands_extra.yaml}   # optional, private
-  email: {channels: [email], webmail_set: default}
-vocabulary: {...}          # §5.4, §5.6
-features: [...]            # §5.5
-tiers: {medium: 0.4, high: 0.8}
-min_scored_advise: 1
-rules:
-  - name: new_account_velocity
-    mode: advise
-    scorer: local
-    weights: tenants/e2a/weights.yaml      # or `uniform` (shadow only, §5.9)
-    inputs: [core.subject_age_h, ...]
-```
-
-Validation adds these checks to main §4.5's list. The whole tenant profile is rejected with a
-collected error list, and the codes are machine-readable in `/healthz`:
-- `pack_unknown`, `pack_requires`, `pack_version_unknown`
-- `feature_unknown`: a name exists in no pack and not in the tenant's `custom.*` set
-- `feature_not_enabled`: the name, or its alias, exists but its pack or `RequiresPacks` isn't
-  enabled
-- `feature_namespace`: a tenant tries to define a feature outside `custom.*`
-- `duplicate_feature`, `feature_version_reused`
-- `dsl_invalid` (with a JSON-pointer path): an unknown op, a missing cap, a text field in a
-  predicate, an enum value not declared, a window out of range, too many leaves, a cost overrun
+**Validation.** It adds these codes to main §4.5's list. Any failure rejects the whole profile,
+with every error collected:
+- `pack_unknown`, `pack_requires`
+- `feature_unknown`, `feature_not_enabled`, `feature_namespace`, `duplicate_feature`,
+  `feature_version_reused`
+- `dsl_invalid` (with a JSON-pointer path)
 - `vocab_invalid`, `vocab_incompatible`
-- `weights_unknown_feature`: every weight must name an input of the rule it serves
-- `uniform_not_shadow`: a rule that uses `weights: uniform` must be in `mode: shadow`
+- `weights_unknown_feature`, `uniform_not_shadow`, `truncation_weight_insufficient`
+- `subject_kind_unknown`
 
-**Reload is atomic per tenant.** A rejected profile keeps that tenant's previous profile live
-and has no effect on other tenants; `/healthz` reports `config_error{tenant}`. This replaces
-today's whole-config rejection, which would let one tenant's typo freeze every tenant's rule
-changes. Before any tenant file exists, `config/rules.yaml` + `config/local_weights.yaml` load
-as the **default profile**. That profile has implicit `packs: [core@1, email@1, brand@1]`, the
-implicit legacy vocabulary, and flat-name resolution, and it applies to every tenant that has
-keys but no file. This is the zero-change path for e2a until slice G7 (§9).
+**Per-tenant everything:**
+- **Reload.** Atomic per tenant. A rejected profile keeps that tenant's previous profile live and
+  never affects another tenant. `/healthz` reports `config_error{tenant}`.
+- **Rule sets.** `worker.computeVerdict` and `serve.currentRuleNames()` both read the subject's
+  tenant profile, not a global config. P2's test: tenant A's retired rule never appears in tenant
+  B's view.
+- **Scorer version.** Each tenant's local scorer is bound to its own weights file. Its
+  content-derived version (`local@<sha256[:12]>`) appears in the verdict `model` field and in the
+  signals of `GET /v1/subjects/{id}`.
 
-### 5.9 Weights, scorers, eval and bootstrap per pack
+**Stage gates consider only advise-mode local rules.** `maxRiskByScorer` excludes shadow rules, so
+a shadow experiment can never open or close a vendor call's gate. This changes behaviour on
+`main`, but e2a has no staged rules, so the golden replay is unaffected.
 
-- **Weights are per rule**, keyed by namespaced name (flat names are accepted through the alias
-  table). The scorer name stays `local`. At profile compile time the loader binds a local scorer
-  instance per weights file. `Version()` is content-derived over canonical keys (§5.2), so
-  different weights produce different versions automatically. Registry lookups become
-  `(tenant, scorer)`, and vendor scorers stay global.
-- **The local scorer's math is unchanged:** `sigmoid(bias + Σ w·x)`, summed in canonical-key
-  order.
-- **Starter weights per pack.** Each pack ships `config/packs/<pack>/starter.yaml`: one rule,
-  `<pack>_starter`, with its own bias and weights over that pack's features only. Every weight
-  carries `sign: +|-` (the golden-sign contract). Starter rules compose: a tenant can enable
-  `core_starter` and `brand_starter` as separate shadow rules, and `Combine`'s
-  `max(risk)` handles them without inventing a joint model. The `core` starter is derived from
-  today's e2a weights restricted to core features. The `email` and `brand` starters are derived
-  the same way. All are placeholders until labelled data exists for a second product.
-- **Uniform priors, shadow only.** `weights: uniform` binds a local scorer with, for `k` inputs,
-  `x̂ᵢ = xᵢ / Boundᵢ ∈ [0, 1]` and `wᵢ = ±4/k` on `x̂ᵢ`. The sign defaults to `+`, and a feature
-  can declare `prior_sign: -` (for example, an account-age or time-to-first-action feature). The
-  bias is `−2 + (4/k) × (number of negative-sign inputs)`, so risk always ranges from
-  sigmoid(−2) ≈ 0.12 to sigmoid(2) ≈ 0.88. The result is a ranking device
-  for operator review, never a tier driver. The loader rejects it in `advise`
-  (`uniform_not_shadow`), and promotion (main §4.5) requires a real weights file plus a gate run.
-- **Eval is scoped to a profile.** `abusekit eval --profile pack:email` or
-  `--profile tenant:e2a` selects the rule, weights, fixtures and floors. Layout:
-  `eval/packs/<pack>/{fixtures/, floors.yaml}` and `eval/tenants/<tenant>/{fixtures/,
-  floors.yaml, golden/}`. `floors.yaml` entries gain `profile:`; a missing value means
-  `tenant:e2a`, so #5's file keeps working unchanged. The manifest gains `profile`,
-  `profile_sha` and `pack_versions`.
-- **Cassettes** are unchanged. Their key already includes `input_hash`, and canonical keys keep
-  it stable (§5.2).
-- **Corpus v2** (`eval/schema/corpus-v2.schema.json`) is v1 plus a required `profile` and
-  `vocab_version`, with `input.features` keyed by namespaced name. `LoadSnapshotCorpus` reads
-  both versions.
-- **Golden-sign and mutation tests per pack** become a reusable harness,
-  `internal/pack/packtest.Run(t, pack)`, and every pack must pass it in CI, like the adapter
-  contract test. It checks:
-  1. Every starter weight's sign matches `sign:`.
-  2. Zeroing each weight moves at least one of the pack's fixture bands or an isolated scenario
-     (today's `mutation_test.go` logic, parameterised).
-  3. Determinism: same bits under shuffled event order and repeated runs.
-  4. No leakage from the future: adding an event at `now + ε` changes no value except rescore
-     candidates.
-  5. Every emitted name is in `Features()` and in the pack's namespace, with `Bound` respected.
+**Scheduling:**
+- **Per-tenant fair queue.** The worker claims dirty subjects round-robin across tenants, with
+  per-tenant weights (equal by default) and a per-tenant concurrency cap (4 of the batch by
+  default). One tenant's backlog can't starve another. Main §4.8's priority order applies within a
+  tenant.
+- **Rescore-storm control.** Timer rescores (as opposed to event-driven dirty marks) have three
+  limits:
+  - they are scheduled only from features that feed at least one non-shadow rule;
+  - DSL features coalesce into buckets of `max(5 min, W / 12)`, while built-in Go features keep
+    the fixed 5-minute bucket for semantic identity;
+  - a per-tenant timer-rescore budget (default 20 × active subjects per hour) is enforced by the
+    queue. When it is exhausted, timer rescores defer to the next hour and a metric counts them.
 
-  e2a's tenant profile keeps its own golden-sign and mutation suite over its composed rule, with
-  namespaced keys.
-- **How a second product bootstraps:**
-  1. Enable packs, declare the vocabulary, and write custom features. Run shadow rules
-     `core_starter` (plus `brand_starter` if relevant) and a `custom_uniform` rule over the
-     custom features.
-  2. Collect labels through `POST /v1/labels` (main §4.9). Corpus rows accrue per profile.
-  3. Once a labelled set passes the harness, hand-tune a real weights file, set floors, and
-     promote through the normal shadow → advise path. Fitting is §12 Q8.
+  Event-driven scoring is never budgeted.
 
-### 5.10 Provenance and storage changes (expand-only)
+### 5.9 Weights, eval and bootstrap per pack
 
-- `events.vocab_version text NULL`.
-- `verdicts.profile_sha text NULL`: SHA-256 of the pack versions, the normalised custom-feature
-  definitions and the vocabulary version. It is recorded, not part of the input hash, so
-  editing an unrelated custom feature doesn't force rescoring. A changed value still changes the
-  hash through the value.
-- New tables `tenant_vocabularies` and `tenant_feature_defs` (§5.6, §5.7).
-- No change to `links`, `subjects`, `labels` or `corpus_examples`.
+- **Weights.** Per rule, keyed by namespaced name. The local math is unchanged.
+- **Starter weights.** Each pack has `config/packs/<pack>/starter.yaml`, with one rule named
+  `<pack>_starter`. Every weight has a `sign:`. `core`'s starter includes
+  `core.history_truncated`, set so the §5.7 invariant holds.
+- **Uniform priors, shadow only.** `weights: uniform` binds a local scorer with, for `k` inputs:
+  - normalisation `x̂ᵢ = min(max(xᵢ, 0), Boundᵢ) / Boundᵢ`, which clamps to `[0, 1]`;
+  - `wᵢ = sᵢ · 4/k`, where `sᵢ` is the input's prior sign: `FeatureDef.PriorSign` for pack
+    features, `prior_sign` for custom ones, default `+`;
+  - `bias = −2 + (4/k) · |{i : sᵢ = −1}|`.
+
+  So `risk ∈ [sigmoid(−2), sigmoid(2)] ≈ [0.12, 0.88]`. The loader rejects uniform weights in
+  advise (`uniform_not_shadow`). Promotion needs a real weights file plus a gate run.
+- **Eval by profile.** `abusekit eval --profile examples/tenants/<x>` or `--pack <p>`.
+  - Floor entries gain `profile:`; an entry without one belongs to the reference profile.
+  - The manifest gains `profile_sha`, `pack_versions` and `feature_key_space`.
+  - Corpus v2 is corpus-v1 plus `profile`, `vocab_version` and `feature_key_space: ns-v1`.
+- **`packtest`** runs for every pack in CI and checks:
+  - starter-weight signs match their `sign:`;
+  - zeroing any weight moves a pack fixture band or an isolated scenario;
+  - results are deterministic under shuffled arrival;
+  - no future leakage;
+  - the pack stays in its namespace and within `Bound`;
+  - the truncation invariant holds;
+  - the flood property (criterion 6).
+- **Held-out fixtures** for the bootstrap criterion live in
+  `examples/tenants/<x>/fixtures/{dev,heldout}/`.
+  - Held-out fixtures are authored in a separate commit after the features are frozen, with
+    non-overlapping generator seeds.
+  - CI evaluates criterion 2 only on the held-out set.
+  - A PR that changes a scenario's features and its held-out fixtures together fails a CI check;
+    held-out fixtures change only in their own PR.
+- **Bootstrap.** A new product:
+  1. writes its profile;
+  2. runs `core_starter` (plus `brand_starter` if it has display names) and a `custom_uniform`
+     rule, all in shadow;
+  3. collects labels through `POST /v1/labels`;
+  4. once the harness passes on its labelled set, hand-tunes a weights file and promotes it
+     through the normal path.
+
+### 5.10 Storage (expand-only)
+
+- `events`: add `vocab_version text NULL` and `subject_kind text NOT NULL DEFAULT 'account'`.
+- New table `event_subjects(tenant, subject_kind, subject, event_seq)`. It indexes `also` and
+  parent rows, and the scoring loader reads through it.
+- `subjects`: the key becomes `(tenant, kind, subject)`, via a new `kind` column (default
+  `account`) and a unique index.
+- `links`: add `key_id` for rotation.
+- `corpus_examples`: add `feature_key_space`.
+- `verdicts`: add `profile_sha` and `reason_version`.
+- New table `tenant_config_versions`, the runtime guard (§5.6).
+
+**S3b erasure must be vocabulary-aware.** Which stored fields are raw text, skeleton or
+pseudonymised hash depends on each row's `vocab_version`, and the erasure ledger records the
+version it applied. S3b's design pass must include this.
 
 ### 5.11 API surface summary
 
 | Surface | Change | Compatibility |
 | --- | --- | --- |
-| `POST /v1/events` | `delivery.sent` built-in; tenant-declared types redacted by kind; undeclared fields hashed | Additive on the wire. Storage of undeclared types changes (pre-GA, §5.4). |
-| `GET /v1/subjects/{id}`, `evaluate` | Signal `reason` templates may name namespaced features in prose | Additive; the shape is unchanged. |
-| Per-item codes | none new (`redaction_failed`, `bad_type` reused) | unchanged |
-| Config YAML | tenant profiles; `rules.yaml` still loads as the default profile | Backward compatible. Flat names are deprecated with a warning. |
-| Weights, floors, corpus files | namespaced keys; `profile:`; corpus-v2 | v1 read forever via the alias table |
-| `pkg/abusekit` client | `DeliverySent` event helper; no removals | additive |
+| `POST /v1/events` | Optional `subject_kind`, `also`, `links.custom` and `x_` extensions; declared types; stricter domain kind; card/IP/phone scan; re-HMAC; undeclared values dropped | Wire additive. Storage semantics change (pre-GA; decisions Q3, Q14). |
+| `GET /v1/subjects/{id}`, `evaluate` | Optional `?kind=`; per-tenant `model` version; reasons use namespaced names; `warming_until` on warming signals | Additive |
+| Per-item codes | None new | Unchanged |
+| `abusekit score --jsonl` | Namespaced names; flat names return `feature_renamed` | Breaks once, pre-GA (P1) |
+| Config | Per-tenant profiles in a private mount; `rules.yaml` replaced by `examples/tenants/reference` | Breaks once, pre-GA |
 
-**Rejected API alternative:** a `PUT /v1/vocabulary` endpoint that would let producers declare
-schemas at runtime. It would let a producer key widen its own redaction boundary, which is a
-privilege escalation. It would also move a privacy decision out of code review.
+**Rejected: runtime vocabulary declaration over HTTP** (`PUT /v1/vocabulary`). It would let a
+producer key widen its own redaction boundary.
 
 ### 5.12 Alternatives considered
 
-- **CEL (cel-go) for predicates and features.** It is sandboxed, has cost estimation, and is a
-  known quantity. It lost for four reasons:
-  1. Features aggregate over time-windowed sequences of events. CEL has no windowed aggregates,
-     so we would still have to write count, distinct, peak, time-between and history-relative as
-     custom functions. CEL would only wrap the predicate, which is the easy part.
-  2. It pulls in a large dependency (cel-go plus protobuf), against the repo's minimal-dependency
-     convention.
-  3. CEL's cost estimate is per expression. Ours has to be per subject history, which needs our
-     own model anyway.
-  4. Its error messages and semantics (`has()`, dynamic types) are harder for a product engineer
-     to get right than a closed YAML schema whose load errors carry JSON pointers.
-
-  CEL remains the fallback **for `where` only** if the closed predicate set proves too small
-  (§12 Q9).
-- **A home-grown expression language.** It would bring a parser, a grammar, precedence rules and
-  an injection surface, all needing a security review, for no coverage beyond the six closed
-  operations the target signals need.
-- **A plugin ABI.** Go `plugin` needs an identical toolchain and build flags and has no sandbox.
-  WASM (wazero) is sandboxed with fuel metering, but it deploys arbitrary code disguised as
-  config, reviewers can't read it, and float determinism depends on the guest. Products that
-  need code contribute a Go pack upstream. The `Pack` seam is where that code goes, and
-  `packtest` gates it.
-- **SQL-defined features against the store.** They couple to the schema, their cost is
-  unbounded, and they are a tenant-isolation hazard. Rejected.
-- **Keep flat names and prefix only new features.** No migration, but also no enablement
-  boundary, and two naming styles forever. Rejected in favour of the canonical-key bridge, which
-  costs one frozen table.
-- **Translate `content.sent` to `delivery.sent` at ingest.** See §5.4. Rejected for the
-  body-hash and migration costs.
-- **Rename everything and rescore once.** This gives a simpler hash with no canonical keys. It
-  lost because summation order changes the last bits of risk (breaking the bit-for-bit
-  criterion), and any vendor cassette recorded before cutover would go stale.
+- **CEL.** It has no windowed aggregates, so we would still write every op. It is also a large
+  dependency, costs expressions rather than histories, and gives product engineers worse errors.
+  It remains a possible later leaf kind for `where` only (§12 Q9).
+- **A home-grown expression language.** A parser, a grammar and an injection surface, with no
+  coverage beyond the closed ops.
+- **A plugin ABI.** Go `plugin` is fragile and unsandboxed; WASM is code disguised as config, and
+  reviewers can't read it. Code belongs in a Go pack upstream, gated by `packtest`.
+- **SQL features.** They would couple features to the store's schema, give unbounded cost, and
+  put tenant isolation at risk.
+- **A canonical-key bridge (revision 1).** It lost because nothing stored needs it (A1), and it
+  would keep two names alive forever.
+- **A neutral built-in `delivery.sent` (revision 1).** It lost because "delivery" is still an
+  email-shaped abstraction with channels bolted on. Declared types with field roles are genuinely
+  neutral, and `content.sent` stays the email pack's own type.
+- **Hashing undeclared strings (revision 1).** It lost because the hash of an unreviewed field is
+  still pseudonymous personal data nobody asked for. Dropping it is strictly safer, and declaring
+  a field is cheap.
+- **Wall-clock deadlines (revision 1).** They lost because they are non-deterministic and
+  host-dependent, and because a timeout that marks a rule unscored rewards flooding. A step
+  budget plus truncation-as-signal has neither problem.
 
 ## 6. Edge cases and failure handling
 
-- **A pack's `Extract` errors or the custom pack exceeds its deadline.** The orchestrator
-  records the failure per pack, not per subject. Rules whose inputs include any feature of that
-  pack become `unscored` with `error_code: feature_error` or `feature_timeout`, and
-  `degraded: true` is set. Rules that don't read the pack still score. This fails closed:
-  `unknown` or `degraded`, never `low` by absence (main §5). A pack that fails for every subject
-  of a tenant pages through the existing metric.
-- **A profile is rejected on reload.** The previous profile stays live for that tenant only.
-  On a cold start with no valid profile, the tenant's subjects stay unscored (`unknown`) and
-  `/healthz` is red. The service never falls back to a different tenant's rules.
-- **Events of a type arrive before its declaration (deploy ordering).** They are stored under
-  the undeclared-type rule (strings hashed). Features declared later can't read those strings,
-  but they can still count the events. The runbook says to declare first, and the harness
-  reports the row counts per `vocab_version`.
-- **A declared kind or channel is missing on an event.** Undeclared kinds count as `other`, as
-  in §5.4. For channels, `delivery.sent` with an undeclared channel is rejected
-  (`redaction_failed`), because silently counting it under a guessed channel would corrupt the
-  email features.
-- **Absent optional fields in custom features.** Predicates are false. `sum` uses `default`.
-  `share` with a zero denominator uses `if_empty`. `time_between` with no `from` event uses
-  `if_absent`. There is never a NaN: the compiler proves every op total, and the orchestrator
-  rejects a non-finite value as a pack error.
-- **Duplicates and out-of-order events.** Ingest idempotency is unchanged. Features are
-  set-functions with `(at, id)` tie-breaks.
-- **Clock skew and future events.** Excluded from custom windows, but they schedule a rescore
-  at their `at`. The frozen legacy exceptions are listed in §5.5.
-- **Disabling a pack that rules still reference.** The load fails with `feature_not_enabled`.
-  Past verdicts stay; they are provenance.
-- **A tenant enables `email` for a non-email channel.** `email.channels` must name declared
-  channels whose `destination` kind is `domain`. Otherwise the load fails (`pack_params_invalid`).
-  This stops webmail and domain logic running over hashes.
-- **Alias misuse.** A rule lists both `sends_1h` and `email.sends_1h` → `duplicate_feature`. A
-  custom feature named after an alias is impossible because of the `custom.` prefix.
-- **Hostile config.** There is no code and no regex. Every string set is hashed at load. Every
-  size is capped. The loader is fuzzed with the §5.7 limits as the oracle.
-- **Hostile events against a custom feature.** An attacker can't exceed the per-subject scan or
-  deadline bounds. Flooding one subject raises only that subject's cost, which the existing
-  per-subject budgets cap. `distinct` memory is O(cap).
-- **Brand pack on a product whose display names are routinely brand-adjacent**, such as a
-  marketplace reselling branded goods. `brand.*` stays shadow until that tenant's own labels
-  justify a weight. That tenant can also point `brand.extra` at an empty list and a narrowed
-  public list through `pack_params.brand.list` (§12 Q10).
+- **A pack errors (a bug).** Rules that read that pack are unscored with `feature_error` and
+  marked degraded; other rules still score. Hitting a budget or truncating is not an error (§5.7).
+- **A profile is rejected.** The tenant's previous profile stays live. On a cold start with no
+  valid profile, the tenant's scores are `unknown` and `/healthz` is red. Another tenant's rules
+  are never borrowed.
+- **Events arrive before their declaration.** Undeclared data is dropped (§5.6 rule 3). A feature
+  declared later sees only the type and time of those rows. Warm-up keeps rules that use it in
+  shadow until its window is fully covered.
+- **Unknown values.**
+  - An undeclared resource kind is treated as `other` and counted in a metric; in `strict` mode it
+    is rejected.
+  - An undeclared `subject_kind` or `also` kind is rejected with `redaction_failed`.
+  - An undeclared link kind is rejected with `bad_links`.
+- **Absent fields.** A predicate on an absent field is false, and `sum` uses `default`.
+  `share`/`ratio` use `if_empty`, and `time_between` uses `if_absent`. Every op is total; a
+  non-finite value is a pack error.
+- **Duplicates, out-of-order arrival, ties.** Idempotency is unchanged. Features are set functions
+  over the history ordered `(at, producer, id)`.
+- **Clock skew and future events.** They are excluded from custom windows, but loaded (within
+  24 h) so they can schedule a rescore. The legacy exceptions are listed in §5.5.
+- **Key rotation during a burst.** Dual keys (§5.6) keep `distinct` and neighbour equality exact.
+- **`also` abuse.** A producer naming arbitrary subjects is limited to 3 per event. Each dirty
+  mark counts against the per-tenant rescore and scoring budgets.
+- **Parent fan-in.** Many `api_key` subjects mark the same parent account dirty. Dirty marks
+  coalesce per subject through `dirty_seq`, so the parent costs O(1) per scoring round.
+- **Hostile config.** No code or regex, every set hashed, every size capped, and the loader is
+  fuzzed.
+- **Hostile events.** Byte caps, the step budget, and capped groups and keys bound the cost.
+  Truncation raises risk rather than lowering it (§5.7).
+- **The brand pack on a marketplace that resells branded goods.** `brand.*` stays in shadow until
+  the tenant's own labels justify it. The tenant may also narrow the brand list (§12 Q10).
 
-## 7. Worked examples (fictional)
+## 7. Genericity walk: five scenarios (fictional)
 
-All three products, their names, ids and domains are invented. Timestamps use the fictional
-2031 convention.
+All products, ids and domains are invented; timestamps use the 2031 convention. Each profile is
+committed in P6b as `examples/tenants/<name>/`, with dev and held-out fixtures.
 
 ### 7a. File sharing: malware-distribution burst ("Driftbox")
 
-The pattern: a fresh account uploads an executable or archive, creates many public share links
-quickly, and those links are downloaded from many distinct networks within an hour.
+The pattern: a fresh account uploads executables or archives and creates many public links, which
+are then downloaded from many distinct networks within the hour.
 
 ```yaml
-tenant: driftbox
-packs: [core@1, brand@1]            # no email pack: Driftbox doesn't deliver mail
+packs: [core@1, brand@1]
 vocabulary:
   version: 1
-  resource_kinds:
-    workspace: {role: workspace}
-    api_token: {role: credential}
-    folder:    {role: content}
+  resource_kinds: {api_token: {role: credential}}
   types:
     share.link_created:
+      role: activity
       fields:
         visibility: {kind: enum, values: [public, org, private]}
         file_kind:  {kind: enum, values: [document, archive, executable, image, other]}
-        size_bytes: {kind: number, min: 0, integer: true}
+        folder_title: {kind: text, role: title, max_len: 120}      # skeleton-only
     share.downloaded:
       fields:
         link_hash:           {kind: hash}
-        downloader_ip24:     {kind: hash}     # producer-keyed hash; never a raw IP
-        downloader_is_owner: {kind: bool}
+        downloader_ip24:     {kind: hash}
+        downloader_is_owner: {kind: bool, role: self}
 features:
-  - name: custom.public_links_1h
-    version: 1
-    description: public share links created in the last hour
-    count: {type: share.link_created, where: {field: visibility, eq: public}}
-    window: 1h
-    transform: {log1p: true, cap: 6}
-  - name: custom.risky_file_link_share_24h
-    version: 1
-    description: share of new links pointing at executables or archives
-    share:
-      type: share.link_created
-      match: {field: file_kind, in: [executable, archive]}
-    window: 24h
-    transform: {cap: 1}
-  - name: custom.distinct_downloader_nets_1h
-    version: 1
-    description: distinct downloader /24 networks, excluding the owner
-    distinct:
-      type: share.downloaded
-      where: {field: downloader_is_owner, eq: false}
-      field: downloader_ip24
-    window: 1h
-    transform: {log1p: true, cap: 9}          # track_max = ceil(expm1(9)) = 8103 ≤ 10,000
-  - name: custom.download_peak_10m_vs_history
-    version: 1
-    description: 10-minute download peak relative to the account's own past
-    peak: {type: share.downloaded, where: {field: downloader_is_owner, eq: false}, size: 10m}
-    window: 24h
-    relative_to_history: {lookback: 30d, exclude_recent: 24h, age_decay: {}}
-    transform: {log1p: true, cap: 6}
-  - name: custom.signup_to_first_public_link_min
-    version: 1
-    description: minutes from sign-up to the first public link
-    time_between:
-      from: {type: subject.created}
-      to:   {type: share.link_created, where: {field: visibility, eq: public}}
-      until_now: true
-      if_absent: 1440
-    transform: {cap: 1440}
-    prior_sign: "-"                            # faster = riskier
+  - {name: custom.public_links_1h, version: 1, description: public links in the last hour,
+     count: {type: share.link_created, where: {field: visibility, eq: public}},
+     window: 1h, transform: {log1p: true, cap: 6}}
+  - {name: custom.risky_link_share_24h, version: 1, description: links to executables or archives,
+     share: {type: share.link_created, match: {field: file_kind, in: [executable, archive]}},
+     window: 24h, transform: {cap: 1}}
+  - {name: custom.distinct_downloader_nets_1h, version: 1, description: distinct downloader networks,
+     distinct: {type: share.downloaded, where: {field: downloader_is_owner, eq: false}, field: downloader_ip24},
+     window: 1h, transform: {log1p: true, cap: 9}}                 # track_max 8103
+  - {name: custom.max_downloads_per_link_1h, version: 1, description: busiest link's downloads,
+     count: {type: share.downloaded, where: {field: downloader_is_owner, eq: false},
+             group_by: {field: link_hash, reduce: max, max_groups: 1000}},
+     window: 1h, transform: {log1p: true, cap: 8}}
+  - {name: custom.download_peak_vs_history, version: 1, description: 10-min download peak vs own past,
+     peak: {type: share.downloaded, size: 10m}, window: 24h,
+     relative_to_history: {lookback: 30d, exclude_recent: 24h, age_decay: {}},
+     transform: {log1p: true, cap: 6}}
+  - {name: custom.signup_to_first_public_link_min, version: 1, description: minutes to first public link,
+     time_between: {from: {type: subject.created}, to: {type: share.link_created, where: {field: visibility, eq: public}},
+                    until_now: true, if_absent: 1440},
+     transform: {cap: 1440}, prior_sign: "-"}
 rules:
-  - name: core_starter
-    mode: shadow
-    scorer: local
-    weights: packs/core/starter.yaml
-    inputs: [core.subject_age_h, core.credential_velocity_1h, core.resource_velocity_1h,
-             core.declines_before_first_success, core.first_funding_prepaid,
-             core.linked_deleted_n, core.linked_labelled_abusive_n, core.burst_ratio_24h_vs_lifetime]
-    labels: [benign, abusive]
-    benign_label: benign
-    threshold: 0.6
-  - name: malware_burst
-    mode: shadow
-    scorer: local
-    weights: uniform
-    inputs: [custom.public_links_1h, custom.risky_file_link_share_24h,
-             custom.distinct_downloader_nets_1h, custom.download_peak_10m_vs_history,
-             custom.signup_to_first_public_link_min, brand.name_match]
-    labels: [benign, abusive]
-    benign_label: benign
-    threshold: 0.7
+  - {name: malware_burst, mode: shadow, scorer: local, weights: uniform,
+     inputs: [custom.public_links_1h, custom.risky_link_share_24h, custom.distinct_downloader_nets_1h,
+              custom.max_downloads_per_link_1h, custom.download_peak_vs_history,
+              custom.signup_to_first_public_link_min, brand.title_match, core.history_truncated],
+     labels: [benign, abusive], benign_label: benign, threshold: 0.7}
 ```
-
-Sample events:
 
 ```json
-{"id":"db-001","subject":"acct_example_db_1","type":"subject.created","at":"2031-03-02T09:00:00Z","links":{"email_hash":"<64-hex>"},"data":{"channel":"signup","email_domain_class":"disposable"}}
-{"id":"db-002","subject":"acct_example_db_1","type":"resource.created","at":"2031-03-02T09:01:10Z","data":{"kind":"workspace","name":"Official Document Center"}}
-{"id":"db-003","subject":"acct_example_db_1","type":"share.link_created","at":"2031-03-02T09:03:00Z","data":{"visibility":"public","file_kind":"archive","size_bytes":812345}}
-{"id":"db-004","subject":"acct_example_db_1","type":"share.link_created","at":"2031-03-02T09:03:20Z","data":{"visibility":"public","file_kind":"executable","size_bytes":402112}}
-{"id":"db-005","subject":"acct_example_db_1","type":"share.downloaded","at":"2031-03-02T09:05:02Z","data":{"link_hash":"lk_4f1c9a0e7b2d","downloader_ip24":"ip_9a1b2c3d4e5f","downloader_is_owner":false}}
+{"id":"db-003","subject":"acct_example_db_1","type":"share.link_created","at":"2031-03-02T09:03:00Z","data":{"visibility":"public","file_kind":"archive","folder_title":"Invoice Center"}}
+{"id":"db-005","subject":"acct_example_db_1","type":"share.downloaded","at":"2031-03-02T09:05:02Z","data":{"link_hash":"lk_4f1c9a0e7b2d11","downloader_ip24":"ip_9a1b2c3d4e5f66","downloader_is_owner":false}}
 ```
 
-The benign counterpart fixture: an older workspace sharing documents with an organisation. Its
-links are `org`-visibility, with a few downloads from two networks.
+**Declarative:** everything above. **Go-only:** file-content verdicts, such as a malware hash or a
+sandbox result. The product emits these as `content.verdict`, and `core.verdict_max_24h` reads
+them.
 
-### 7b. Payments or marketplace: card testing ("Tallyport")
+### 7b. Marketplace: card testing ("Tallyport")
 
-The pattern: a merchant account (the subject) pushes many small charge attempts across many
-distinct cards, most of them declined, in short bursts.
+The pattern: a merchant account pushes many small charge attempts across many cards, and most are
+declined. A card that turns up across many merchants is suspicious in itself.
 
 ```yaml
-tenant: tallyport
-packs: [core@1, brand@1]           # core also scores the merchant's own onboarding payments
+packs: [core@1, brand@1]
 vocabulary:
   version: 1
-  resource_kinds:
-    api_key:  {role: credential}
-    storefront: {role: workspace}
+  subject_kinds: {account: {}, card: {}}
+  resource_kinds: {api_key: {role: credential}}
   types:
     charge.attempted:
+      role: activity
       fields:
         outcome:      {kind: enum, values: [succeeded, declined, blocked]}
         decline_code: {kind: enum, values: [insufficient_funds, do_not_honor, incorrect_cvc, expired_card, fraudulent, other]}
         amount_minor: {kind: number, min: 0, integer: true}
-        card_hash:    {kind: hash}
+        card_hash:    {kind: hash, join_domain: card}
 features:
-  - name: custom.declines_10m_peak
-    version: 1
-    description: largest number of declined charges in any 10 minutes today
-    peak: {type: charge.attempted, where: {field: outcome, eq: declined}, size: 10m}
-    window: 24h
-    transform: {log1p: true, cap: 7}
-  - name: custom.distinct_cards_1h
-    version: 1
-    description: distinct cards charged in the last hour
-    distinct: {type: charge.attempted, field: card_hash}
-    window: 1h
-    transform: {log1p: true, cap: 7}
-  - name: custom.small_charge_share_1h
-    version: 1
-    description: share of charges at or under 2.00 in minor units
-    share: {type: charge.attempted, match: {field: amount_minor, lte: 200}}
-    window: 1h
-    transform: {cap: 1}
-  - name: custom.decline_share_1h
-    version: 1
-    description: share of charges declined
-    share: {type: charge.attempted, match: {field: outcome, in: [declined, blocked]}}
-    window: 1h
-    transform: {cap: 1}
-  - name: custom.cvc_declines_vs_history
-    version: 1
-    description: CVC/expiry declines this hour vs the merchant's own past
-    count:
-      type: charge.attempted
-      where: {all: [{field: outcome, eq: declined}, {field: decline_code, in: [incorrect_cvc, expired_card]}]}
-    window: 1h
-    relative_to_history: {lookback: 30d, exclude_recent: 24h, age_decay: {}}
-    transform: {log1p: true, cap: 6}
+  - {name: custom.max_declines_per_card_1h, version: 1, description: most declines on one card,
+     count: {type: charge.attempted, where: {field: outcome, eq: declined},
+             group_by: {field: card_hash, reduce: max, max_groups: 1000}},
+     window: 1h, transform: {cap: 20}}
+  - {name: custom.cards_with_3plus_declines_1h, version: 1, description: cards declined 3+ times,
+     count: {type: charge.attempted, where: {field: outcome, eq: declined},
+             group_by: {field: card_hash, reduce: {count_gte: 3}, max_groups: 1000}},
+     window: 1h, transform: {log1p: true, cap: 6}}
+  - {name: custom.distinct_cards_1h, version: 1, description: distinct cards,
+     distinct: {type: charge.attempted, field: card_hash}, window: 1h, transform: {log1p: true, cap: 7}}
+  - {name: custom.small_charges_1h, version: 1, description: charges at or under 200 minor units,
+     count: {type: charge.attempted, where: {field: amount_minor, lte: 200}}, window: 1h, transform: {cap: 500}}
+  - {name: custom.charges_1h, version: 1, description: all charges,
+     count: {type: charge.attempted}, window: 1h, transform: {cap: 500}}
+  - {name: custom.small_charge_ratio_1h, version: 1, description: small ÷ all charges,
+     ratio: {num: custom.small_charges_1h, den: custom.charges_1h, if_empty: 0}, transform: {cap: 1}}
+  - {name: custom.declines_10m_peak, version: 1, description: declines in busiest 10 min today,
+     peak: {type: charge.attempted, where: {field: outcome, eq: declined}, size: 10m},
+     window: 24h, transform: {log1p: true, cap: 7}}
+  - {name: custom.card_merchants_24h, version: 1, subject_kinds: [card],
+     description: distinct merchants that charged this card,
+     distinct: {type: charge.attempted, field: x_primary_subject_hash}, window: 24h, transform: {cap: 50}}
 rules:
-  - name: card_testing
-    mode: shadow
-    scorer: local
-    weights: uniform
-    inputs: [custom.declines_10m_peak, custom.distinct_cards_1h, custom.small_charge_share_1h,
-             custom.decline_share_1h, custom.cvc_declines_vs_history, core.credential_velocity_1h]
-    labels: [benign, abusive]
-    benign_label: benign
-    threshold: 0.7
+  - {name: card_testing, mode: shadow, scorer: local, weights: uniform, applies_to: [account],
+     inputs: [custom.max_declines_per_card_1h, custom.cards_with_3plus_declines_1h, custom.distinct_cards_1h,
+              custom.small_charge_ratio_1h, custom.declines_10m_peak, core.credential_velocity_1h,
+              core.history_truncated], labels: [benign, abusive], benign_label: benign, threshold: 0.7}
+  - {name: tested_card, mode: shadow, scorer: local, weights: uniform, applies_to: [card],
+     inputs: [custom.card_merchants_24h], labels: [benign, abusive], benign_label: benign, threshold: 0.7}
 ```
+
+Each charge is also indexed under the card subject, through `also`:
 
 ```json
-{"id":"tp-101","subject":"acct_example_tp_7","type":"charge.attempted","at":"2031-06-10T02:14:01Z","data":{"outcome":"declined","decline_code":"incorrect_cvc","amount_minor":100,"card_hash":"cd_1a2b3c4d5e6f"}}
-{"id":"tp-102","subject":"acct_example_tp_7","type":"charge.attempted","at":"2031-06-10T02:14:04Z","data":{"outcome":"declined","decline_code":"expired_card","amount_minor":100,"card_hash":"cd_7f8e9d0c1b2a"}}
-{"id":"tp-103","subject":"acct_example_tp_7","type":"charge.attempted","at":"2031-06-10T02:14:09Z","data":{"outcome":"succeeded","amount_minor":100,"card_hash":"cd_0f1e2d3c4b5a"}}
+{"id":"tp-101","subject":"acct_example_tp_7","also":[{"kind":"card","id":"card_example_c1"}],"type":"charge.attempted","at":"2031-06-10T02:14:01Z","data":{"outcome":"declined","decline_code":"incorrect_cvc","amount_minor":100,"card_hash":"cd_1a2b3c4d5e6f77"}}
 ```
 
-The benign counterparts: a storefront with steady larger charges and an ordinary decline rate,
-and a storefront whose flash sale has high volume but few distinct-card declines. The second
-exercises `relative_to_history`, because the merchant's own past peaks raise the baseline.
+`x_primary_subject_hash` is a **derived** field. Ingest adds it to every row indexed through
+`also`, as the re-HMACed id of the primary subject (join domain `subject:<kind>`). It is declared
+implicitly for any type used with `also`, so a secondary subject can count distinct primaries.
 
-`payment.attempt` is **not** used for the charges. In the core vocabulary, `payment.attempt`
-means the subject paying the product, and it feeds onboarding facts. Card testing is the
-merchant's product activity, so it is a custom type. The example makes that distinction
-explicit.
+**Declarative:** everything above. **Go-only:** issuer and BIN intelligence, and velocity seen by
+external card networks. Products can supply these as `content.verdict` or enum fields.
 
 ### 7c. Chat or community: spam invites ("Hearthchat")
 
-The pattern: new accounts with brand-like display names send large volumes of invites to
-people outside their own communities, with external links in the invite text.
-
-This product uses the **neutral built-in** `delivery.sent`, which is what it is for.
+The pattern: new accounts with brand-like names invite people outside their own communities,
+often with links, and the recipients block them soon after.
 
 ```yaml
-tenant: hearthchat
 packs: [core@1, brand@1]
 vocabulary:
   version: 1
-  resource_kinds:
-    profile:   {role: identity}
-    community: {role: workspace}
-    bot_token: {role: credential}
-  channels:
-    invite:
-      destination: hash                 # keyed community id
-      destination_class: [own_community, other_community]
-    direct_message:
-      destination: hash
+  link_kinds: {phone_hash: {evidence: true}}
+  types:
+    invite.sent:
+      role: activity
+      fields:
+        invitee_hash: {kind: hash, join_domain: member}
+        target_class: {kind: enum, values: [own_community, other_community]}
+        preview:      {kind: text, role: title, max_len: 200}
+        link_host:    {kind: domain, reduce: etld1}
+    block.received:
+      fields: {blocker_hash: {kind: hash, join_domain: member}}
 features:
-  - name: custom.invites_10m_peak
-    version: 1
-    description: largest invite fan-out in any 10 minutes today
-    peak: {type: delivery.sent, where: {field: channel, eq: invite}, sum: {field: recipient_count, default: 1, cap_each: 50}, size: 10m}
-    window: 24h
-    transform: {log1p: true, cap: 7}
-  - name: custom.distinct_invitees_1h
-    version: 1
-    description: distinct invitees in the last hour
-    distinct: {type: delivery.sent, where: {field: channel, eq: invite}, field: recipient_hash}
-    window: 1h
-    transform: {log1p: true, cap: 7}
-  - name: custom.external_invite_share_24h
-    version: 1
-    description: share of invites to communities the sender doesn't own
-    share:
-      type: delivery.sent
-      where: {field: channel, eq: invite}
-      match: {field: destination_class, eq: other_community}
-    window: 24h
-    transform: {cap: 1}
-  - name: custom.linked_invite_share_24h
-    version: 1
-    description: share of invites carrying an external link
-    share:
-      type: delivery.sent
-      where: {field: channel, eq: invite}
-      match: {field: link_host, exists: true}
-    window: 24h
-    transform: {cap: 1}
-  - name: custom.signup_to_first_invite_min
-    version: 1
-    description: minutes from sign-up to the first invite
-    time_between:
-      from: {type: subject.created}
-      to:   {type: delivery.sent, where: {field: channel, eq: invite}}
-      until_now: true
-      if_absent: 1440
-    transform: {cap: 1440}
-    prior_sign: "-"
+  - {name: custom.invites_10m_peak, version: 1, description: invites in busiest 10 min today,
+     peak: {type: invite.sent, size: 10m}, window: 24h, transform: {log1p: true, cap: 7}}
+  - {name: custom.external_invite_share_24h, version: 1, description: invites outside own communities,
+     share: {type: invite.sent, match: {field: target_class, eq: other_community}}, window: 24h, transform: {cap: 1}}
+  - {name: custom.invites_blocked_within_10m, version: 1, description: invitees who blocked within 10 min,
+     sequence: {a: {type: invite.sent}, b: {type: block.received}, within: 10m, on: {a: invitee_hash, b: blocker_hash}},
+     window: 24h, transform: {log1p: true, cap: 6}}
+  - {name: custom.linked_invite_share_24h, version: 1, description: invites with links,
+     share: {type: invite.sent, match: {field: link_host, exists: true}}, window: 24h, transform: {cap: 1}}
+  - {name: custom.phone_siblings_7d, version: 1, description: accounts sharing a phone created this week,
+     neighbours: {via: [phone_hash], where: {created_within: 7d}}, transform: {cap: 20}}
 rules:
-  - name: invite_spam
-    mode: shadow
-    scorer: local
-    weights: uniform
-    inputs: [custom.invites_10m_peak, custom.distinct_invitees_1h, custom.external_invite_share_24h,
-             custom.linked_invite_share_24h, custom.signup_to_first_invite_min,
-             brand.name_match, brand.title_match, core.linked_deleted_n]
-    labels: [benign, abusive]
-    benign_label: benign
-    threshold: 0.7
+  - {name: invite_spam, mode: shadow, scorer: local, weights: uniform,
+     inputs: [custom.invites_10m_peak, custom.external_invite_share_24h, custom.invites_blocked_within_10m,
+              custom.linked_invite_share_24h, custom.phone_siblings_7d, brand.name_match,
+              brand.title_match, core.linked_deleted_n, core.history_truncated],
+     labels: [benign, abusive], benign_label: benign, threshold: 0.7}
+```
+
+`invitee_hash` and `blocker_hash` share `join_domain: member`. The same member id therefore hashes
+identically in both types, and `sequence.on` can join them.
+
+**Declarative:** everything above. **Go-only:** classifying message text. The product emits that
+as `content.verdict`.
+
+### 7d. Developer API: credential stuffing through customer API keys ("Keyforge")
+
+The pattern: a customer's API key drives many end-user login attempts across many distinct
+usernames. Most fail, with the occasional success shortly after a failure on the same username.
+
+```yaml
+packs: [core@1]
+vocabulary:
+  version: 1
+  subject_kinds: {account: {}, api_key: {parent: account}}
+  resource_kinds: {api_key: {role: credential}}
+  types:
+    auth.attempted:
+      role: activity
+      fields:
+        outcome:     {kind: enum, values: [succeeded, failed, locked]}
+        login_hash:  {kind: hash, join_domain: login}
+        client_ip24: {kind: hash}
+        client_asn:  {kind: enum, values: [residential, mobile, hosting, unknown]}
+features:
+  - {name: custom.distinct_logins_10m, version: 1, subject_kinds: [api_key],
+     description: distinct usernames tried, distinct: {type: auth.attempted, field: login_hash},
+     window: 10m, transform: {log1p: true, cap: 8}}
+  - {name: custom.failures_1h, version: 1, subject_kinds: [api_key, account], description: failed logins,
+     count: {type: auth.attempted, where: {field: outcome, eq: failed}}, window: 1h, transform: {cap: 10000}}
+  - {name: custom.attempts_1h, version: 1, subject_kinds: [api_key, account], description: all logins,
+     count: {type: auth.attempted}, window: 1h, transform: {cap: 10000}}
+  - {name: custom.failure_ratio_1h, version: 1, subject_kinds: [api_key, account], description: failed ÷ all,
+     ratio: {num: custom.failures_1h, den: custom.attempts_1h, if_empty: 0}, transform: {cap: 1}}
+  - {name: custom.success_after_failure_10m, version: 1, subject_kinds: [api_key],
+     description: successes shortly after a failure on the same username,
+     sequence: {a: {type: auth.attempted, where: {field: outcome, eq: failed}},
+                b: {type: auth.attempted, where: {field: outcome, eq: succeeded}},
+                within: 10m, on: {a: login_hash, b: login_hash}},
+     window: 24h, transform: {log1p: true, cap: 6}}
+  - {name: custom.hosting_share_1h, version: 1, subject_kinds: [api_key], description: attempts from hosting networks,
+     share: {type: auth.attempted, match: {field: client_asn, eq: hosting}}, window: 1h, transform: {cap: 1}}
+  - {name: custom.max_attempts_per_ip_1h, version: 1, subject_kinds: [api_key], description: busiest client network,
+     count: {type: auth.attempted, group_by: {field: client_ip24, reduce: max, max_groups: 1000}},
+     window: 1h, transform: {log1p: true, cap: 9}}
+  - {name: custom.attempts_vs_history, version: 1, subject_kinds: [api_key], description: attempts vs own past,
+     count: {type: auth.attempted}, window: 1h,
+     relative_to_history: {lookback: 30d, exclude_recent: 24h}, transform: {log1p: true, cap: 6}}
+rules:
+  - {name: stuffing_key, mode: shadow, scorer: local, weights: uniform, applies_to: [api_key],
+     inputs: [custom.distinct_logins_10m, custom.failure_ratio_1h, custom.success_after_failure_10m,
+              custom.hosting_share_1h, custom.max_attempts_per_ip_1h, custom.attempts_vs_history,
+              core.history_truncated], labels: [benign, abusive], benign_label: benign, threshold: 0.7}
 ```
 
 ```json
-{"id":"hc-201","subject":"acct_example_hc_3","type":"resource.created","at":"2031-08-01T18:00:05Z","data":{"kind":"profile","name":"Support Team - Official"}}
-{"id":"hc-202","subject":"acct_example_hc_3","type":"delivery.sent","at":"2031-08-01T18:02:11Z","data":{"channel":"invite","destination":"cm_5e6f7a8b9c0d","destination_class":"other_community","recipient_hash":"iv_0a1b2c3d4e5f","title":"You have been selected - claim now","link_host":"claim-prize.example.test"}}
+{"id":"kf-9001","subject":"key_example_k3","subject_kind":"api_key","type":"auth.attempted","at":"2031-09-04T11:00:01Z","data":{"outcome":"failed","login_hash":"lg_8c7b6a5f4e3d21","client_ip24":"ip_1f2e3d4c5b6a77","client_asn":"hosting"}}
 ```
 
-The benign counterpart: a community organiser inviting 20 people over an evening to their own
-community, with no links. It exercises `external_invite_share_24h` = 0 and a low peak.
+**Declarative:** everything above. `client_asn` is an enum the product classifies. **Go-only:**
+whether a username appears in a breach corpus (this needs an external lookup), and ASN reputation
+finer than the product's own enum.
 
-**What the three examples demonstrate:** none needs the email pack. All three reuse `core` and
-`brand`. Every product-specific signal is declarative. 7c uses the neutral delivery type
-directly, and 7a and 7b show that custom types cover what `delivery.sent` doesn't. Slice G6
-commits each example as a loadable profile with fixtures, which is success criterion 2.
+### 7e. AI inference: free-tier farming ("Lumenloop")
+
+The pattern: many free accounts share a device or an OAuth identity. Each one exhausts its free
+token quota soon after sign-up, favours the most expensive models, and is then abandoned.
+
+```yaml
+packs: [core@1]
+vocabulary:
+  version: 1
+  link_kinds: {oauth_sub_hash: {evidence: true}}
+  types:
+    usage.recorded:
+      role: activity
+      fields:
+        model_tier:   {kind: enum, values: [small, medium, large]}
+        tokens:       {kind: number, min: 0, integer: true}
+        quota_state:  {kind: enum, values: [ok, near_limit, exhausted]}
+features:
+  - {name: custom.signup_to_quota_exhausted_min, version: 1, description: minutes to exhaust free quota,
+     time_between: {from: {type: subject.created}, to: {type: usage.recorded, where: {field: quota_state, eq: exhausted}},
+                    until_now: false, if_absent: 10080}, transform: {cap: 10080}, prior_sign: "-"}
+  - {name: custom.large_model_token_share_24h, version: 1, description: tokens spent on large models,
+     share: {type: usage.recorded, match: {field: model_tier, eq: large}, sum: {field: tokens, default: 0, cap_each: 200000}},
+     window: 24h, transform: {cap: 1}}
+  - {name: custom.tokens_10m_peak, version: 1, description: tokens in busiest 10 min,
+     peak: {type: usage.recorded, sum: {field: tokens, default: 0, cap_each: 200000}, size: 10m},
+     window: 24h, transform: {log1p: true, cap: 15}}
+  - {name: custom.minutes_since_last_use, version: 1, description: idle time after last use,
+     time_between: {from: {type: usage.recorded, anchor: last}, to: {type: abusekit.never}, until_now: true, if_absent: 0},
+     transform: {cap: 10080}}
+  - {name: custom.oauth_siblings_deleted, version: 1, description: deleted accounts sharing the OAuth identity,
+     neighbours: {via: [oauth_sub_hash, device_hash], where: {deleted: permanent}}, transform: {cap: 20}}
+  - {name: custom.oauth_siblings_new_7d, version: 1, description: accounts sharing identity created this week,
+     neighbours: {via: [oauth_sub_hash, device_hash], where: {created_within: 7d}}, transform: {cap: 20}}
+rules:
+  - {name: free_tier_farm, mode: shadow, scorer: local, weights: uniform,
+     inputs: [custom.signup_to_quota_exhausted_min, custom.large_model_token_share_24h, custom.tokens_10m_peak,
+              custom.oauth_siblings_deleted, custom.oauth_siblings_new_7d, core.first_funding_prepaid,
+              core.linked_deleted_n, core.history_truncated],
+     labels: [benign, abusive], benign_label: benign, threshold: 0.7}
+```
+
+`abusekit.never` is a reserved type that never occurs. With `anchor: last` and `until_now`,
+`time_between` becomes "minutes since the last event of type A". That gives the idle-time
+primitive with no new op.
+
+`custom.minutes_since_last_use` is deliberately left out of the rule. Abandonment only means
+something alongside the neighbour counts, and uniform priors can't express that combination. The
+feature is kept for hand-tuned weights later.
+
+**Declarative:** everything above. **Go-only:**
+- prompt-content similarity across accounts, which needs cross-subject text clustering and a text
+  scorer;
+- feature interactions ("abandoned **and** has farmed siblings"). A uniform-prior logistic model
+  can't capture these; they need tuned or fitted weights, or a multiplicative custom feature. §12
+  Q15 asks whether `ratio` should gain a `product` form.
+
+### 7f. What the walk shows
+
+| Need | Primitive |
+| --- | --- |
+| Per-entity maxima and counts (per card, per link, per IP) | `group_by` |
+| Cause, then effect within a time limit (fail → success, invite → block, signup → exhaustion) | `sequence`, `time_between` |
+| Rates | `ratio` |
+| Cross-account farms | Declared link kinds + `neighbours` |
+| Non-account actors (cards, API keys) | Subject kinds + `also` + `parent` |
+
+**Still Go-only across all five:**
+- content understanding (files, messages, prompts);
+- external reputation lookups;
+- text similarity across subjects;
+- non-linear feature interactions under uniform priors.
+
+The first two already have a channel: products emit `content.verdict` or enum fields.
 
 ## 8. Migration plan for e2a
 
-**Emitter: no change required.** e2a keeps emitting `content.sent` and the rest of main §4.12,
-and S6 is built as currently specified. Switching to `delivery.sent{channel: email}` later is
-optional and equivalent by construction; the translation test (below) proves it.
+- **Emitter.** No change. S6 emits `content.sent` and the rest of main §4.12 as designed.
+- **Profile.** e2a's private profile starts as a byte copy of `examples/tenants/reference/`:
+  - `packs: [core@1, email@1, brand@1]`;
+  - the implicit legacy vocabulary, made explicit: `key: credential` with #7's aliases, and
+    `agent: other`;
+  - `new_account_velocity` with namespaced inputs.
 
-**Config mapping.** The default profile (§5.8) serves e2a until G7. G7 then commits
-`config/tenants/e2a.yaml`:
-- `packs: [core@1, email@1, brand@1]`
-- `vocabulary`: the implicit legacy declaration from §5.4, made explicit: `agent` →
-  `identity`, `key` → `credential` with S2b's aliases, and `email` → `{destination: domain}`.
-- `pack_params`: the brand `extra` path (the private list, as `--brands-extra` today) and
-  `email.webmail_set: default` (`config/packs/email/webmail.yaml`, moved from
-  `config/webmail.yaml`).
-- The `new_account_velocity` inputs rewritten through the alias table. The weights file moves
-  to `config/tenants/e2a/weights.yaml` with namespaced keys and the same values.
-- Floors move to `eval/tenants/e2a/floors.yaml` with `profile: tenant:e2a`, with numbers
-  unchanged.
+  The weights move to the private mount. The private brand list stays private (`brand.extra`).
+  Floors for e2a's real corpus live privately; the public reference floors stay here.
+- **Golden (P0).** `abusekit eval --golden out.jsonl` extends the existing eval replay rather than
+  adding a new command. It runs on `main` after #5 and #7 merge, and its output is committed as
+  `eval/golden/reference-flat.jsonl`. For every fixture, subject, event instant and scheduled
+  rescore instant, it records:
+  - feature values, as `Float64bits`;
+  - `NextRescoreAt`;
+  - per-rule input hashes, risks and tiers;
+  - the score;
+  - the local `Version()`.
+- **Rename (P1).** P1 re-baselines under the semantic-identity rules of criterion 1:
+  - identical feature bits under the rename map;
+  - identical `NextRescoreAt` and tiers;
+  - `|Δrisk| ≤ 1e-12`, with no score near a cut point;
+  - every hash recorded as changed, exactly once.
 
-**Proof of identical scores: the golden replay.**
-1. **G0 runs first, on the pre-migration code.** It adds `cmd/abusekit golden` (test-only
-   build tag), which replays every fixture. Each subject is scored by the real `feature.Extract`
-   → `core.Plan` → local scorer → `core.Combine` path after every event instant and at every
-   `NextRescoreAt` the replay produces. The command writes `eval/tenants/e2a/golden/v0.jsonl`,
-   one row per (fixture, subject, instant):
-   `{features: {canonical_key: float64-bits-hex}, next_rescore_at, input_hash{rule},
-   risk_bits{rule}, score_bits, tier, local_version}`.
-   It also records the harness `run.json` for the synthetic corpus with volatile fields removed.
-   Fixtures come from `eval/fixtures/*.jsonl` (including all of #7's), and the generated corpus
-   comes from `eval/fixtures/synthetic/`.
-2. **Every later slice** runs `TestGoldenReplay_BitIdentical`, which compares exactly, row for
-   row, including the row count. Any diff fails CI and prints the first differing feature.
-3. **The translation test** rewrites every `content.sent` in every fixture as
-   `delivery.sent{channel: email, ...}` (field mapping in §5.4), replays it, and asserts the
-   same golden file.
-4. **A corpus round-trip** loads the corpus-v1 synthetic corpus, exports it as v2, reloads it,
-   and requires identical `run.json` metrics.
-
-**Stored state at cutover, if S8 has already shipped** (assumption A1 says it hasn't):
-- Verdict `input_hash`: unchanged (canonical keys), so no subject is rescored and no vendor call
-  repeats.
-- Local `Version()`: unchanged (canonical keys).
-- Cassettes: unchanged keys.
-- Rows stored before G5: `vocab_version` is NULL, which reads as the built-in-only schema.
-
-**Rollback.** Every slice up to G7 is behaviour-neutral for e2a, and the golden replay guards
-it. G7 is a config move. Reverting it restores the default profile, which yields the same
-golden.
+  The result is committed as `eval/golden/reference-ns.jsonl`. Every later slice asserts
+  **exact** equality with that file.
+- **Other one-time baseline changes, each isolated in its own slice:**
+  - the `(at, producer, id)` tie order, in P0, before capture;
+  - re-HMAC of hash values and links, in P3: feature values unchanged, stored bytes changed;
+  - the domain kind at `RedactionSchemaVersion` 3, also in P3. Fixtures use `.test`, so nothing
+    changes.
+- **Rollback.** Before S8, each slice can be reverted on its own. After S8, the rename can't be
+  undone without re-scoring, which is why it lands first.
 
 ## 9. Slices
 
-These fit after #5 and #7 merge. Each is its own PR with the usual review.
+These come after #5 and #7 merge. The early slices are small, and pack gating arrives only after
+the machinery exists.
 
-| # | Slice | Contents | Done when |
-| --- | --- | --- | --- |
-| G0 | Golden capture | `cmd/abusekit golden` (test build tag); `eval/tenants/e2a/golden/v0.jsonl` generated from `main` after #5 and #7; `TestGoldenReplay_BitIdentical` | Golden committed, generated by pre-migration code; the test passes on `main`; perturbing one weight's last bit fails it |
-| G1 | Canonical keys | `FeatureDef` metadata table (name, legacy, quantum, bound, reads) for today's 25 features; `core.Vector`; `inputHash` over canonical keys with quanta from data (the name switch removed); local scorer order and version by canonical key; alias resolution in rules, weights and corpus loaders; the frozen-table CI check | Golden bit-identical; a rules file in flat names and one in namespaced names load to equal `Config`s; `quantizeAgeFeaturesForHash` deleted |
-| G2 | Vocabulary and delivery view | `internal/vocab` (built-in schema moved unchanged); `delivery.sent` built-in; `event.View`; `content.sent` projection; declared resource kinds with roles and aliases (implicit legacy declaration); `pkg/abusekit` `DeliverySent` | Golden bit-identical; translation test green; redaction tests moved and green; `delivery.sent` contract tests (happy, `recipient_hash`+count>1 rejection, undeclared channel rejection) |
-| G3 | Packs and tenant profiles | `internal/pack` registry, `core`/`email`/`brand` adapters (code moved, not rewritten); `feature.Extract(profile, …)` orchestrator with per-pack failure isolation; `config/tenants/*.yaml` loader; default profile from `rules.yaml`; per-tenant atomic reload; `/healthz` per tenant; `brand.title_match`; new additive core features | Golden bit-identical; `feature_not_enabled` and `pack_requires` load tests; a tenant with only `core` computes no `email.*`; one tenant's bad profile leaves another's reload applied |
-| G4 | Declarative features | `internal/pack/custom` compiler and evaluator, all six ops plus the modifier, predicates, limits and cost model, rescore candidates, `tenant_feature_defs`; naive reference evaluator in tests; property tests; loader fuzz; benchmark | Criterion 4 met (equality on 10k randomized histories; p99 ≤ 50 ms at the limits); a declarative `custom.key_velocity_1h` and `custom.resource_total_lifetime` match their Go twins bit for bit on every fixture (lifetime excluding future events, documented); fuzzing finds no over-limit profile that loads |
-| G5 | Declared types and redaction | field kinds; masking of `text`; hashing of undeclared fields and types with the abusekit-held per-tenant key; `vocab_version` column; `tenant_vocabularies` ledger and the widening-only check; `strict` mode | Criterion 5 property tests; `vocab_incompatible` tests; e2a golden bit-identical (e2a declares no custom types) |
-| G6 | Per-pack eval and bootstrap | `packtest` harness; per-pack starter weights with `sign:`; pack fixtures and floors; `--profile`; corpus-v2 schema and export; uniform priors plus `uniform_not_shadow`; the three §7 profiles committed as fixtures | Every pack passes `packtest`; `make gate` runs e2a and every pack profile; each §7 abusive fixture outranks its benign fixtures under uniform priors (criterion 2); #5's floors file still loads unchanged |
-| G7 | e2a explicit profile | `config/tenants/e2a.yaml`, weights and floors moved; flat-name deprecation warning on; docs updated (main §4.5 and §4.12 pointers) | Golden bit-identical against the explicit profile; the default profile is used by no tenant in the hosted config; the reverting diff also passes golden |
+| # | Slice | Contents | Depends on | Done when |
+| --- | --- | --- | --- | --- |
+| P0 | Golden replay | `abusekit eval --golden`; scoring loader ordered `(at, producer, id)`; `eval/golden/reference-flat.jsonl` | #5, #7 | Golden committed; test green; flipping one weight's last bit fails it |
+| P1 | One-time rename | Every §5.2 consumer, each with its test; the `FeatureDef` metadata table (quantum, bound, prior sign, truncation direction, reads); `core.Vector`; reason v2; the corpus key-space column and migration; the cassette header; `feature_renamed`; stage gate limited to advise-mode local rules | P0 | `reference-ns.jsonl` meets criterion 1; the grep test finds no flat literals; all existing suites green |
+| P2 | Tenant profiles | Private-mount loader; `examples/tenants/reference`; per-tenant atomic reload and `/healthz`; per-tenant rule sets (`computeVerdict`, `currentRuleNames`); per-tenant local scorer and version; per-tenant fair queue and concurrency cap. Every built-in feature is available to every tenant. | P1 | Golden exact; tenant-isolation tests (rules, reload, view); fairness test |
+| P3 | Declared types and kind redaction | `internal/vocab`; `internal/secret` (`Keys`, file adapter); field kinds; roles (`credential`/`other`, `activity`, `title`, `self`); `x_` extensions; the PSL-based domain kind; card/IP/phone scan; re-HMAC of all hash fields and links, with `join_domain`; undeclared values dropped; skeleton-only custom text; `vocab_version`; config history plus `abusekit config check` | P2 | Criterion 5 property tests; golden exact (features unchanged); `vocab_incompatible` and history CI tests |
+| P4a | DSL core: `count`, `distinct`, `share`, `peak` | Compiler; windows (`window`, `first`, `lifetime`); predicates; transforms; caps and limits; the bounded loader (§5.7) and step budget; `core.history_truncated` with its truncation invariant; end-to-end benchmark and `cost_table.yaml` | P3 | Reference equality on 10k histories for these four ops; criterion 4 at P4a limits; criterion 6 flood property; loader fuzz |
+| P4b | DSL extended: `time_between`, `before_first`, `relative_to_history`, `group_by`, `sequence`, `ratio` | Plus proportional rescore coalescing, the per-tenant rescore budget, and warm-up | P4a | Reference equality for every op; every "expressible" #7/S2 feature equals its Go twin bit for bit; warm-up test |
+| P5 | Pack gating | `internal/pack` registry; `core`/`email`/`brand` adapters (code moved); enablement and dependency validation; `brand.title_match`; `packtest`; starter weights | P2 (P4a for `packtest`'s flood check) | Golden exact; `feature_not_enabled`; every pack passes `packtest` |
+| P6a | Link kinds, `neighbours`, subject kinds | `links.custom`; `neighbours`; `subject_kind`, `also`, `parent`; `event_subjects`; `?kind=`; `applies_to`; derived `x_primary_subject_hash` | P4a, P5 | Contract tests for kinds and `also`; neighbour caps; golden exact |
+| P6b | Scenarios and bootstrap | The five `examples/tenants/*` profiles, with dev and held-out fixtures; uniform priors; `--profile`; corpus v2; floors with `profile:` | P4b, P6a | Criterion 2 on held-out fixtures; the held-out isolation CI check |
+| P7 | e2a cutover | e2a's profile in the ops repo's private mount (outside this repo); hosted-config CI runs `abusekit config check`; the `rules.yaml` path removed | P5 (and S8's mount) | Golden exact against the private copy; the hosted deploy loads it |
 
-G0 must land before any other G slice. G1 → G2 → G3 are sequential. G4 and G5 can run in
-parallel after G3. G6 needs G4. G7 needs G3 (G5 and G6 are optional for it). **Recommended
-ordering against the v0 plan:** G0–G3 before S5, so that vendor render templates are born with
-namespaced names, and before S8, so that nothing stored needs the bridge in anger. S3b and S6
-are independent of all G slices.
+- **Ordering against the v0 plan.** P0 and P1 must land before S5 and S8, because assumption A1
+  is what makes a rename without a bridge safe.
+- **S3b (erasure)** must be vocabulary-aware (§5.10), and is easiest to build after P3.
+- **S6** is independent of every P slice.
 
 ## 10. Scalability and extensibility
 
-- **Custom features per tenant.** Bounded by 64 features and 256 cost units. Compiled plans are
-  cached per `profile_sha`, and a reload recompiles one tenant only.
-- **Extraction cost.** One pass per subject: O(E) dispatch plus O(E) per windowed scan, with E
-  ≤ 50,000. `distinct` memory is O(cap). The existing per-subject budget and the priority queue
-  are unchanged. What grows is `EventsForSubject`'s load. Later the store can bound the query to
-  `max(lookback, window) + exclude_recent`, plus `subjects.first_seen` for `start`. That is a
-  store-only change the pack interface already permits, because `Input.Start` is explicit.
-- **Tenants.** About 100 tenants × 64 features is a config and plan-cache concern, not a
-  database one. Metrics are labelled `{tenant, pack}`, not `{feature}`, to bound cardinality.
-- **Made easier later.**
-  - A new domain pack (`sms`, `marketplace`) is one Go package plus `packtest`.
-  - A popular custom feature can be promoted into a pack upstream, keeping its name through a
-    per-pack alias.
-  - Cross-tenant linking is untouched by this design.
-  - Weight fitting consumes corpus-v2 per profile.
-  - CEL for `where` alone, if ever needed, slots in as a new leaf kind.
+- **Per-subject cost** is bounded by bytes and steps, not by event count. The loader fetches only
+  as far back as the profile's largest lookback, capped at 8 MiB of history plus 1 MiB of
+  onboarding events. Compiled plans are cached per `profile_sha`.
+- **Tenants.** The fair queue and the per-tenant concurrency cap let about 100 tenants share one
+  worker pool without starving each other. Metrics are labelled `{tenant, pack}`.
+- **Rescores.**
+  - Timer rescores come only from features that feed non-shadow rules.
+  - Their coalescing buckets scale with the feature's window.
+  - Each tenant has an hourly budget.
+- **Neighbours.** At most 4 queries per extraction; each is indexed, fan-in capped, and cached for
+  the extraction.
+- **Made easier later:**
+  - new Go packs, gated by `packtest`;
+  - promoting a popular custom feature into a pack upstream;
+  - weight fitting on corpus v2;
+  - CEL as a `where` leaf;
+  - cross-tenant linking, which this design leaves untouched.
 
 ## 11. Verification strategy
 
-The seams tested are the ones callers cross: the config loader (profiles in, errors out),
-`feature.Extract` (events in, vector out), `POST /v1/events` (redaction), and the harness
-(`--profile`).
+Tests sit at the seams callers actually cross:
+- the profile loader: profiles in, errors out;
+- `LoadHistory` + `feature.Extract`: history in, vector out;
+- `POST /v1/events`: redaction;
+- `abusekit eval --profile`.
 
-1. The golden replay and the translation test (§8), in every slice's CI.
-2. `packtest` for every pack (§5.9).
-3. The DSL conformance suite: the naive reference versus the compiled evaluator on randomized
-   histories (shuffled order, future events, ties, empty windows, anchored windows before
-   `start`); table tests for every predicate leaf and each op's edge (window boundary
-   inclusivity, `if_absent`, `if_empty`, cap and log1p order, `distinct` early stop).
-4. Loader tests for every §5.8 code, plus the fuzzer, with limits as the oracle.
-5. Redaction property tests: mask versus reject per kind; undeclared fields hashed; no email
-   shape stored outside masked text.
-6. HTTP contract tests: `delivery.sent`, declared types, `strict` mode, per-tenant `/healthz`.
-7. A benchmark at the limits (criterion 4).
-8. **Most likely regressions:** summation order (caught by golden), a quantum lost for the age
-   features (golden input hashes), the S2b alias list drifting in the vocabulary move (golden
-   `core.credential_*`), and window-boundary off-by-one in a DSL op (conformance suite).
-9. **Manual checks:** load each §7 profile in a local instance, post its sample events, and read
-   the shadow signals and reasons.
+The checks:
+1. **Golden replay.** Criterion 1 in P1, then exact equality in every later slice.
+2. **`packtest`** for every pack (§5.9).
+3. **DSL conformance.** The naive reference against the compiled evaluator. Table tests for each
+   op's edge cases, clipping, `before_first` inclusivity, `track_max`, and the group and key caps.
+4. **Redaction property tests.**
+   - Mask versus reject, by kind.
+   - Re-HMAC, including `join_domain` equality and separation.
+   - Undeclared values dropped.
+   - Domain PSL and IP checks.
+   - Luhn, IP and phone detection, with explicit false-positive fixtures.
+5. **Loader fuzzer**, with the §5.7 limits as the oracle, plus config-history CI tests.
+6. **Performance and flooding.** The end-to-end benchmark (criterion 4) and the flood property
+   (criterion 6).
+7. **Tenant isolation.** Rules, reload, view, the fair queue and the rescore budget.
+8. **HTTP contract tests.** `subject_kind`, `also`, `links.custom`, `?kind=` and `feature_renamed`.
+9. **Most likely regressions, and what catches each:**
+
+| Regression | Caught by |
+| --- | --- |
+| A stage lookup missed by the rename | grep test + stage test |
+| A lost hash quantum | hash-drift test |
+| Tie order | golden |
+| A weights edit that breaks the truncation invariant | `packtest` |
+| PSL snapshot drift | pinned version + test |
 
 ## 12. Open questions (owner decisions)
 
-1. **Ordering.** Land G0–G3 before S5 (vendor adapters) and S8 (hosted deploy)? Recommended:
-   yes.
-2. **What S6 emits.** `content.sent` as designed (recommended, no churn), or the neutral
-   `delivery.sent{channel: email}`?
-3. **Undeclared-type storage change.** Approve moving unknown types from "kept as-is" to
-   "strings keyed-hashed" (a pre-GA semantic change, §5.4 and §5.6)?
-4. **abusekit-held per-tenant redaction key.** This is a new secret per tenant, separate from
-   the producer's link key. Approve?
-5. **Legacy window quirks.** `core.resource_total` and `core.credential_total` count
-   future-dated events, and `email.first_day_distinct_domains` has an inclusive end. Keep them
-   frozen in `@1` and harmonise in `@2` later (recommended), or harmonise now and accept a golden
-   diff?
-6. **The `credential` rename.** `key_*` → `core.credential_*`: accept the neutral role vocabulary
-   (`credential`, `identity`, `workspace`, `content`, `other`)?
-7. **Limits.** 64 features, 256 units, 30-day max window, 50,000 events scanned, 250 ms deadline.
-   Confirm or adjust.
-8. **Bootstrap policy.** Uniform priors are shadow-only, with no fitting in scope. Confirm that
-   advise always needs a hand-set or fitted weights file plus a passing gate.
-9. **CEL fallback.** Pre-approve CEL for `where` only if the closed predicate set proves
-   insufficient, or require a new design pass?
-10. **Brand list scope.** Is `config/packs/brand/brands.yaml` one global public list, or may a
-    tenant narrow it (`pack_params.brand.list`) as well as extend it (`extra`)?
-11. **The custom namespace.** `custom.*` scoped per tenant (proposed), or `<tenant>.*` so names
-    are globally unique in logs and corpora?
-12. **Per-tenant reload isolation.** Replaces the main design's whole-config rejection. Confirm.
+Where the review's answer differs from revision 1's recommendation, both are shown.
+
+1. **Bridge vs rename.** Revision 1: a frozen canonical-key bridge. Review, and now recommended:
+   rename once in P1 and re-baseline under semantic identity. Reason: nothing stored needs a
+   bridge yet (A1), and a bridge would keep two names alive forever. Approve?
+2. **Ordering.** Revision 1: G0–G3 before S5 and S8. Now: P0 and P1 **must** land before S5 and
+   S8, because the no-bridge rename depends on it. Approve?
+3. **Undeclared data.** Revision 1: keyed-hash undeclared strings. Review, and now: drop every
+   undeclared value and keep only type, time and field names. Reason: the hash of an unreviewed
+   field is still personal data. Approve?
+4. **Built-in re-HMAC.** Re-HMAC `recipient_hash` and every `links` value at ingest. Stored bytes
+   change; feature values don't. Approve?
+5. **Legacy window quirks.** Freeze them in `@1` and harmonise in `@2` (recommendation unchanged).
+   Confirm?
+6. **Roles.** Revision 1: five resource roles. Review, and now: only `credential` and `other`,
+   plus the `activity` type role and the `title`/`self` field roles. Approve?
+7. **Load bounds.** Revision 1: the 50,000 newest events and a 250 ms deadline. Review, and now: a
+   time-bounded load, onboarding types in full, byte caps of 8 MiB and 1 MiB, a calibrated step
+   budget, and truncation as a positive signal. Confirm the defaults?
+8. **Bootstrap.** Uniform priors, shadow only, no fitting, and held-out fixtures. Confirm?
+9. **CEL.** Add it later as a `where` leaf only, or require a new design pass? (Unchanged.)
+10. **Brand list.** May a tenant narrow the list as well as extend it? (Unchanged.)
+11. **Custom namespace.** `custom.*` per tenant, or `<tenant>.*`? (Unchanged.)
+12. **Config history.** Revision 1: history held in the DB. Review, and now: history in the config
+    tree, checked in CI, with the DB as a runtime guard only; atomic reload per tenant. Approve?
+13. **What S6 emits.** Revision 1 offered a choice between `content.sent` and `delivery.sent`.
+    Review, and now: `delivery.sent` is dropped, so S6 emits `content.sent`. Settled unless you
+    object.
+14. **Domain kind.** Require a PSL suffix or an RFC 6761 special-use name, and reject IP literals
+    and all-numeric labels, **including on built-in domain fields** (`RedactionSchemaVersion` 3).
+    Declared fields also get an optional `reduce: etld1`. Approve?
+15. **Feature interactions.** Should `ratio` gain a `product` form (depth-1 DAG, capped) for the
+    interactions that §7e shows uniform priors can't capture, or should that wait for fitted
+    weights?
+16. **Subject kinds and `also`.** Add the wire fields `subject_kind` and `also` (at most 3), with
+    subjects keyed `(tenant, kind, id)`. Both are additive. Approve?
+17. **Stage-gate fix.** Stage gates consider only advise-mode local rules. This changes behaviour
+    on `main`. Approve?
+18. **Profiles and secrets.** Tenant profiles live in a private mount, with only fictional
+    examples in the repo, and the key interface is provider-agnostic. Approve?
+19. **Rescore control.** Proportional coalescing applies to DSL features only (built-ins keep
+    5 minutes for semantic identity). Only non-shadow rules schedule timer rescores, under a
+    per-tenant hourly budget. Confirm the default of 20 × active subjects per hour?
+
+## 13. Changes from revision 1
+
+**Blockers:**
+- **B1:** the canonical-key bridge is dropped. The rename happens once, with a test for every
+  consumer it touches (§5.2), and the golden checks semantic identity against a derived
+  floating-point bound.
+- **B2:** the event-count bound and the wall-clock deadline are replaced (§5.7) by:
+  - a time-bounded load, with onboarding types loaded in full;
+  - byte caps and a deterministic step budget;
+  - truncation as a positively weighted signal, with a checked invariant and an argument that
+    flooding can't evade.
+- **B3 (§5.6):**
+  - every hash is re-HMACed at ingest, with length prefixes and `join_domain`;
+  - undeclared values are dropped;
+  - domains are checked against the PSL and rejected if they are IP literals;
+  - the leak scan covers card, IP and phone shapes;
+  - custom text is stored skeleton-only;
+  - stored values are described as pseudonymised throughout.
+- **B4:** new primitives `group_by`, `sequence`, `ratio`, `neighbours` with declared link kinds,
+  `before_first`, `anchor: last`, and subject kinds with `also` and `parent`. All five scenarios
+  are walked, and what remains Go-only is stated (§7).
+
+**Should-fix:**
+- `delivery.sent` is dropped in favour of declared types with `title`/`self` roles and an
+  `activity` type role; `x_` extension fields are added.
+- Warm-up, and dual-key rotation.
+- Exact `relative_to_history` equations, with a list of what the DSL can't express.
+- A benchmark-calibrated cost table and a per-type fan-out cap.
+- Scheduling: rescore-storm control, a fair queue, and stage gates limited to advise-mode rules.
+- Config history in the config tree; profiles in a private mount.
+- `(at, producer, id)` tie-breaks; held-out fixtures; `PriorSign` on `FeatureDef`; per-tenant
+  rule names.
+- Re-slicing into P0 → P7; S3b erasure made vocabulary-aware.
+
+**Nits:**
+- Only the `credential`/`other` resource roles.
+- A provider-agnostic `Keys` interface.
+- A per-tenant scorer version.
+- `peak` clipping specified.
+- Uniform-prior normalisation written out.
