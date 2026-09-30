@@ -12,6 +12,8 @@ import (
 	"sort"
 	"time"
 
+	"golang.org/x/sys/cpu"
+
 	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/core"
 	"github.com/tokencanopy/abusekit/internal/event"
@@ -21,19 +23,19 @@ import (
 // GoldenRow pins the unbounded evaluator's exact output at an event or timer.
 // Floats are hex IEEE-754 bits so comparison never introduces decimal tolerance.
 type GoldenRow struct {
-	Architecture  string            `json:"architecture"`
-	Fixture       string            `json:"fixture"`
-	Subject       string            `json:"subject"`
-	At            string            `json:"at"`
-	Trigger       string            `json:"trigger"`
-	Producer      string            `json:"producer,omitempty"`
-	EventID       string            `json:"event_id,omitempty"`
-	Features      map[string]string `json:"features"`
-	NextRescoreAt string            `json:"next_rescore_at"`
-	Rules         []GoldenRule      `json:"rules"`
-	Score         string            `json:"score"`
-	Tier          string            `json:"tier"`
-	Degraded      bool              `json:"degraded"`
+	NumericProfile string            `json:"numeric_profile"`
+	Fixture        string            `json:"fixture"`
+	Subject        string            `json:"subject"`
+	At             string            `json:"at"`
+	Trigger        string            `json:"trigger"`
+	Producer       string            `json:"producer,omitempty"`
+	EventID        string            `json:"event_id,omitempty"`
+	Features       map[string]string `json:"features"`
+	NextRescoreAt  string            `json:"next_rescore_at"`
+	Rules          []GoldenRule      `json:"rules"`
+	Score          string            `json:"score"`
+	Tier           string            `json:"tier"`
+	Degraded       bool              `json:"degraded"`
 }
 
 type GoldenRule struct {
@@ -43,6 +45,18 @@ type GoldenRule struct {
 	Risk      string `json:"risk"`
 	Status    string `json:"status"`
 	Flagged   bool   `json:"flagged"`
+}
+
+// GoldenProfile identifies the math implementation independently of replay output.
+// AMD64 baselines use GOAMD64=v1. Like Go's math.Exp dispatch, FMA needs AVX too.
+func GoldenProfile() string {
+	if runtime.GOARCH == "amd64" {
+		if cpu.X86.HasAVX && cpu.X86.HasFMA {
+			return "amd64-fma"
+		}
+		return "amd64-no-fma"
+	}
+	return runtime.GOARCH
 }
 
 func floatBits(v float64) string { return fmt.Sprintf("%016x", math.Float64bits(v)) }
@@ -118,7 +132,7 @@ func WriteGolden(ctx context.Context, out io.Writer, name string, input io.Reade
 			return fmt.Errorf("golden: non-advancing timer for %s", subject)
 		}
 		values := result.Features.Map()
-		row := GoldenRow{Architecture: runtime.GOARCH, Fixture: name, Subject: subject, At: goldenTime(now), Trigger: trigger, Producer: e.Producer, EventID: e.ID, Features: map[string]string{}, NextRescoreAt: goldenTime(result.NextRescoreAt)}
+		row := GoldenRow{NumericProfile: GoldenProfile(), Fixture: name, Subject: subject, At: goldenTime(now), Trigger: trigger, Producer: e.Producer, EventID: e.ID, Features: map[string]string{}, NextRescoreAt: goldenTime(result.NextRescoreAt)}
 		for k, v := range values {
 			row.Features[k] = floatBits(v)
 		}

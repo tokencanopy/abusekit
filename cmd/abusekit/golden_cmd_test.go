@@ -5,12 +5,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/tokencanopy/abusekit/internal/model/local"
+
+	"github.com/tokencanopy/abusekit/eval"
 )
 
 func goldenArgs(t *testing.T, extra ...string) []string {
@@ -22,8 +23,8 @@ func goldenArgs(t *testing.T, extra ...string) []string {
 func TestGoldenLastBitWeightMutationFails(t *testing.T) {
 	root := repoRoot(t)
 	referenceName := "reference-flat.jsonl"
-	if runtime.GOARCH != "amd64" {
-		referenceName = "reference-flat-" + runtime.GOARCH + ".jsonl"
+	if profile := eval.GoldenProfile(); profile != "amd64-fma" {
+		referenceName = "reference-flat-" + profile + ".jsonl"
 	}
 	reference := filepath.Join(root, "eval", "golden", referenceName)
 	if err := runEval(goldenArgs(t, "--golden-check", reference)); err != nil {

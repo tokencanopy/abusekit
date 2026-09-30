@@ -27,6 +27,9 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GOAMD64: v1
+
 jobs:
   build-and-unit-test:
     name: build, vet, unit tests
@@ -42,17 +45,15 @@ jobs:
       - name: lint (gofmt + go vet)
         run: make lint
       - name: unit tests (no DB)
+        env:
+          ABUSEKIT_GOLDEN_EXPECT_PROFILE: amd64-fma
         run: make test
-      - name: capture exact replay on failure
-        if: failure()
-        run: |
-          go run ./cmd/abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml --out "${{ runner.temp }}/golden-actual.jsonl"
-          GODEBUG=cpu.fma=off go run ./cmd/abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml --golden-check eval/golden/reference-flat.jsonl
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: golden-actual
-          path: ${{ runner.temp }}/golden-actual.jsonl
+      - name: exact golden replay without optional FMA
+        env:
+          GOAMD64: v1
+          GODEBUG: cpu.fma=off
+          ABUSEKIT_GOLDEN_EXPECT_PROFILE: amd64-no-fma
+        run: go test ./eval ./cmd/abusekit -run TestGolden -count=1
 
   gate:
     name: eval harness gate
@@ -100,3 +101,17 @@ jobs:
           # report green while testing nothing.
           ABUSEKIT_REQUIRE_DB: "1"
         run: make test-db
+
+  golden-arm64:
+    name: exact golden replay (ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: ARM64 baseline and mutation tests
+        env:
+          ABUSEKIT_GOLDEN_EXPECT_PROFILE: arm64
+        run: go test ./eval ./cmd/abusekit -run TestGolden -count=1

@@ -1,6 +1,7 @@
 # Exact scoring baseline
 
-`reference-flat.jsonl` (AMD64) and `reference-flat-arm64.jsonl` (ARM64) are the
+`reference-flat.jsonl` (AMD64 with FMA), `reference-flat-amd64-no-fma.jsonl`,
+and `reference-flat-arm64.jsonl` are the
 P0 oracles for the generic-feature migration. Each is
 built exclusively from the committed synthetic event fixtures: all root-level
 `eval/fixtures/*.jsonl` and `eval/fixtures/synthetic/events.jsonl`. Each file is an
@@ -16,7 +17,9 @@ go run ./cmd/abusekit eval --golden \
 ```
 
 On ARM64, use `--golden-check eval/golden/reference-flat-arm64.jsonl`.
-`go test ./eval` selects the reference for the executing CPU and performs the same comparison. A mismatch is a failure, not an
+On AMD64 without FMA, use `--golden-check eval/golden/reference-flat-amd64-no-fma.jsonl`.
+Set `GODEBUG=cpu.fma=off` before starting the process to exercise that math path.
+`go test ./eval` selects the reference from the executing CPU capabilities and performs the same comparison. A mismatch is a failure, not an
 instruction to regenerate. To propose an intentionally reviewed new oracle,
 replace `--golden-check` with `--out /tmp/candidate-golden.jsonl` and inspect the
 diff. Keep the flat oracle through P1; the renamed oracle is a separate file.
@@ -39,7 +42,7 @@ within timestamp ties. The subject is scored at the event/timer's exact time;
 the neighbor lookup's exclusive cutoff is advanced one nanosecond to include the
 accepted current event. Ground-truth labels are never used as evidence.
 
-Each row names its CPU architecture and stores every feature, combined score, and per-rule risk as 16-digit
+Each row names its numeric profile and stores every feature, combined score, and per-rule risk as 16-digit
 `math.Float64bits` hex, plus tier, degraded state, per-rule input hash and scorer
 version, and exact UTC `NextRescoreAt` (empty when unscheduled). Rules run through
 `core.Plan` and `core.Combine` with fresh rule states: the oracle pins calculated
@@ -59,18 +62,29 @@ JSON value. Output files must be outside a fixture input directory and cannot
 alias any input, configuration, or reference file (including symlinks and hard
 links). Successful output replacement is atomic.
 
-## Why there are two exact files
+## Why there are three exact files
 
-A single cross-CPU bit oracle is not valid for the existing scorer. With identical
-source, Go 1.26.1, features, coefficients, and iteration order, ARM64 and AMD64
-weighted sums differ in their final bits. For example the `fastonb-evt-007` sum
-is `bfd4fc9f493bb207` on ARM64 and `bfd4fc9f493bb206` on AMD64. Those differences
-propagate through the sigmoid. Across this corpus, 499 risks/scores differ; all
-features, input hashes, scorer versions, timers, tiers, and flags are identical.
-Linux ARM64 also matches macOS ARM64. This is an existing CPU arithmetic
-difference, not an intended scoring change.
+A single cross-CPU bit oracle is not valid for the existing scorer. ARM64 and
+AMD64 weighted sums differ in their final bits. For example the
+`fastonb-evt-007` sum is `bfd4fc9f493bb207` on ARM64 and
+`bfd4fc9f493bb206` on AMD64. Across this corpus, 499 risks/scores differ
+between ARM64 and AMD64 without FMA.
 
-Both files retain exact bit comparison with no tolerance and no changes to the
-scorer. The architecture field makes accidental cross-CPU comparisons fail even
-for inputs whose scores happen to match. P1 must prove parity separately on both
-CPUs; a new CPU needs its own deliberately reviewed oracle.
+AMD64's Go `math.Exp` also selects an FMA implementation when AVX and FMA are
+available. Native Linux CI differs from the no-FMA AMD64 oracle at 94 points;
+disabling FMA in that same CI runner gives exact equality. Go 1.23.0 and 1.26.1
+produce identical no-FMA outputs locally. These are existing arithmetic paths,
+not intended scoring changes. All profiles have identical point identities,
+features, input hashes, scorer versions, timers, tiers, and flags.
+
+`GoldenProfile` selects the file independently of scores using runtime CPU
+capabilities (`HasAVX && HasFMA`, matching Go's math dispatch). It never tries
+references until one matches. Baselines use Go 1.23.0 and `GOAMD64=v1`; native
+ARM64 and AMD64 without FMA were also verified on Go 1.26.1. Other toolchains or
+AMD64 build levels require deliberate verification; higher build levels may
+make FMA mandatory and ignore runtime disabling. CI exercises native FMA,
+forced no-FMA, and ARM64. Profile metadata makes cross-profile checks fail.
+
+Every file retains exact bit comparison with no tolerance and no scorer changes.
+P1 must prove parity on all three profiles. Unknown profiles have no reference
+and fail instead of skipping. Keep the flat oracles through the migration.

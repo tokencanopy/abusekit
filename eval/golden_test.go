@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/tokencanopy/abusekit/internal/event"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tokencanopy/abusekit/internal/event"
 )
 
 func TestGoldenEventsAndTimers(t *testing.T) {
@@ -47,14 +47,17 @@ func TestGoldenEventsAndTimers(t *testing.T) {
 }
 
 func TestGoldenReference(t *testing.T) {
+	if want := os.Getenv("ABUSEKIT_GOLDEN_EXPECT_PROFILE"); want != "" && GoldenProfile() != want {
+		t.Fatalf("CI requires numeric profile %s, got %s", want, GoldenProfile())
+	}
 	cfg, brands, webmail := loadShippedRuleConfig(t)
 	var out bytes.Buffer
 	if err := WriteGoldenFixtures(context.Background(), &out, filepath.Join(repoRoot(t), "eval", "fixtures"), cfg, brands, webmail); err != nil {
 		t.Fatal(err)
 	}
 	name := "reference-flat.jsonl"
-	if runtime.GOARCH != "amd64" {
-		name = "reference-flat-" + runtime.GOARCH + ".jsonl"
+	if profile := GoldenProfile(); profile != "amd64-fma" {
+		name = "reference-flat-" + profile + ".jsonl"
 	}
 	want, err := os.ReadFile(filepath.Join(repoRoot(t), "eval", "golden", name))
 	if err != nil {
