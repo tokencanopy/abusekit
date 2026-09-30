@@ -161,8 +161,17 @@ func (n *datasetNeighbors) labelledAsOf(subject string, asOf time.Time, benignLa
 // query time).
 func (n *datasetNeighbors) neighborsByKinds(subject string, kinds []string, asOf time.Time) (subjects []string, truncated bool) {
 	seen := map[string]bool{subject: true}
-	for _, kind := range kinds {
-		for _, refs := range n.byKindHash[kind] {
+	// Match the store's ORDER BY kind, hash before applying the total cap.
+	orderedKinds := append([]string(nil), kinds...)
+	sort.Strings(orderedKinds)
+	for _, kind := range orderedKinds {
+		hashes := make([]string, 0, len(n.byKindHash[kind]))
+		for hash := range n.byKindHash[kind] {
+			hashes = append(hashes, hash)
+		}
+		sort.Strings(hashes)
+		for _, hash := range hashes {
+			refs := n.byKindHash[kind][hash]
 			selfVisible := false
 			for _, r := range refs {
 				if r.subject == subject && r.at.Before(asOf) {

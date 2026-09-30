@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"github.com/tokencanopy/abusekit/internal/event"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGoldenEventsAndTimers(t *testing.T) {
@@ -118,5 +121,38 @@ func TestGoldenPreservesLabelIdentity(t *testing.T) {
 	}
 	if row.EventID != "original-label" || row.Producer != "operator" {
 		t.Fatalf("label identity changed: %+v", row)
+	}
+}
+
+func TestGoldenRejectsTrailingJSON(t *testing.T) {
+	cfg, brands, webmail := loadShippedRuleConfig(t)
+	row := `{"id":"x","subject":"acct_x","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{}}`
+	if err := WriteGolden(context.Background(), &bytes.Buffer{}, "trailing", strings.NewReader(row+" "+row), cfg, brands, webmail); err == nil {
+		t.Fatal("silently discarded the second JSON value")
+	}
+}
+
+func TestNeighborsCapUsesCanonicalKeys(t *testing.T) {
+	at := time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
+	histories := map[string][]event.Event{}
+	for group := 0; group < 5; group++ {
+		hash := fmt.Sprintf("%064x", group+1)
+		histories["target"] = append(histories["target"], event.Event{At: at, Links: event.Links{DeviceHash: hash}})
+		for member := 0; member < 50; member++ {
+			subject := fmt.Sprintf("group%d_member%02d", group, member)
+			histories[subject] = []event.Event{{At: at, Links: event.Links{DeviceHash: hash}}}
+		}
+	}
+	n := newDatasetNeighbors(histories, nil)
+	for attempt := 0; attempt < 30; attempt++ {
+		subjects, truncated := n.neighborsByKinds("target", []string{"device_hash"}, at.Add(time.Second))
+		if !truncated || len(subjects) != 200 {
+			t.Fatalf("unexpected cap: %d, %v", len(subjects), truncated)
+		}
+		for _, subject := range subjects {
+			if strings.HasPrefix(subject, "group4_") {
+				t.Fatal("cap selected a later key before an earlier one")
+			}
+		}
 	}
 }

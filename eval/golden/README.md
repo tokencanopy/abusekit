@@ -50,3 +50,9 @@ not rewrite the reference. Normal evaluation flags such as `--skip-invalid`,
 `--labels`, and `--scorer` are rejected in golden mode. The one-bit weight mutation
 test verifies that even an IEEE-754 coefficient change is detected (including
 when sigmoid rounding preserves a score, because the scorer version changes).
+
+Capped neighbor discovery visits kinds and hashes in sorted order, matching the
+store before applying the total cap. Every event line must contain exactly one
+JSON value. Output files must be outside a fixture input directory and cannot
+alias any input, configuration, or reference file (including symlinks and hard
+links). Successful output replacement is atomic.

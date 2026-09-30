@@ -449,6 +449,10 @@ func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[str
 		if err := dec.Decode(&row); err != nil {
 			return fail(peekSubject(raw), "bad_json", "events: invalid JSON or unknown field: %w", err)
 		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			return fail(row.Subject, "bad_json", "events: expected exactly one JSON object per line")
+		}
 		if row.Subject == "" || row.Type == "" || row.At == "" {
 			return fail(row.Subject, "missing_field", "events: subject, type, and at are all required")
 		}

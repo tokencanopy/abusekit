@@ -217,8 +217,14 @@ go run ./cmd/abusekit serve --check --database-url postgres://e2a:e2a@localhost:
 
 ### Exact migration replay
 
-`abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml
---golden-check eval/golden/reference-flat.jsonl` checks every committed event
-fixture and synthetic subject after each event and scheduled rescore. It pins
+The golden replay checks every committed event fixture and synthetic subject
+after each event and scheduled rescore:
+
+```sh
+abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml \
+  --golden-check eval/golden/reference-flat.jsonl
+```
+
+It pins
 float64 bits, rule hashes, scorer versions, and rescore times without a database
 or vendor calls. See [the baseline contract](eval/golden/README.md).

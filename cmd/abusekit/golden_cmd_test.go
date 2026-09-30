@@ -50,3 +50,39 @@ func TestGoldenFlagsRejectIgnoredOptions(t *testing.T) {
 		}
 	}
 }
+
+func TestGoldenOutputCannotOverwriteSources(t *testing.T) {
+	for _, kind := range []string{"directory-fixture", "symlink", "hardlink"} {
+		t.Run(kind, func(t *testing.T) {
+			dir := t.TempDir()
+			fixtures := filepath.Join(dir, "fixtures")
+			os.MkdirAll(filepath.Join(fixtures, "synthetic"), 0755)
+			src := filepath.Join(fixtures, "case.jsonl")
+			data := []byte(`{"id":"x","subject":"acct_x","type":"subject.created","at":"2031-01-01T00:00:00Z","data":{}}` + "\n")
+			os.WriteFile(src, data, 0600)
+			os.WriteFile(filepath.Join(fixtures, "synthetic", "events.jsonl"), data, 0600)
+			dataset, output := fixtures, src
+			if kind != "directory-fixture" {
+				dataset = src
+				output = filepath.Join(dir, "alias.jsonl")
+				var err error
+				if kind == "symlink" {
+					err = os.Symlink(src, output)
+				} else {
+					err = os.Link(src, output)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := runEval(goldenArgs(t, "--dataset", dataset, "--out", output))
+			if err == nil {
+				t.Fatal("accepted output alias of an input")
+			}
+			got, _ := os.ReadFile(src)
+			if string(got) != string(data) {
+				t.Fatal("input was modified")
+			}
+		})
+	}
+}
