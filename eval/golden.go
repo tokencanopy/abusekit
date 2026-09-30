@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 // GoldenRow pins the unbounded evaluator's exact output at an event or timer.
 // Floats are hex IEEE-754 bits so comparison never introduces decimal tolerance.
 type GoldenRow struct {
+	Architecture  string            `json:"architecture"`
 	Fixture       string            `json:"fixture"`
 	Subject       string            `json:"subject"`
 	At            string            `json:"at"`
@@ -116,7 +118,7 @@ func WriteGolden(ctx context.Context, out io.Writer, name string, input io.Reade
 			return fmt.Errorf("golden: non-advancing timer for %s", subject)
 		}
 		values := result.Features.Map()
-		row := GoldenRow{Fixture: name, Subject: subject, At: goldenTime(now), Trigger: trigger, Producer: e.Producer, EventID: e.ID, Features: map[string]string{}, NextRescoreAt: goldenTime(result.NextRescoreAt)}
+		row := GoldenRow{Architecture: runtime.GOARCH, Fixture: name, Subject: subject, At: goldenTime(now), Trigger: trigger, Producer: e.Producer, EventID: e.ID, Features: map[string]string{}, NextRescoreAt: goldenTime(result.NextRescoreAt)}
 		for k, v := range values {
 			row.Features[k] = floatBits(v)
 		}

@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,14 @@ func goldenArgs(t *testing.T, extra ...string) []string {
 
 func TestGoldenLastBitWeightMutationFails(t *testing.T) {
 	root := repoRoot(t)
+	referenceName := "reference-flat.jsonl"
+	if runtime.GOARCH != "amd64" {
+		referenceName = "reference-flat-" + runtime.GOARCH + ".jsonl"
+	}
+	reference := filepath.Join(root, "eval", "golden", referenceName)
+	if err := runEval(goldenArgs(t, "--golden-check", reference)); err != nil {
+		t.Fatalf("unmodified weights must pass first: %v", err)
+	}
 	path := filepath.Join(root, "config", "local_weights.yaml")
 	w, err := local.LoadWeightsFile(path)
 	if err != nil {
@@ -36,7 +45,7 @@ func TestGoldenLastBitWeightMutationFails(t *testing.T) {
 	}
 	mutated := filepath.Join(t.TempDir(), "weights.yaml")
 	os.WriteFile(mutated, []byte(changed), 0600)
-	err = runEval(goldenArgs(t, "--weights", mutated, "--golden-check", filepath.Join(root, "eval", "golden", "reference-flat.jsonl")))
+	err = runEval(goldenArgs(t, "--weights", mutated, "--golden-check", reference))
 	var exit *exitError
 	if !errors.As(err, &exit) || exit.code != 1 || !strings.Contains(err.Error(), "golden drift") {
 		t.Fatalf("want golden drift exit 1, got %v", err)

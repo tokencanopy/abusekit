@@ -225,6 +225,6 @@ abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml \
   --golden-check eval/golden/reference-flat.jsonl
 ```
 
-It pins
+On ARM64, select `eval/golden/reference-flat-arm64.jsonl` instead. The replay pins
 float64 bits, rule hashes, scorer versions, and rescore times without a database
 or vendor calls. See [the baseline contract](eval/golden/README.md).

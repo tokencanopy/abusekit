@@ -8,6 +8,7 @@ import (
 	"github.com/tokencanopy/abusekit/internal/event"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,11 @@ func TestGoldenReference(t *testing.T) {
 	if err := WriteGoldenFixtures(context.Background(), &out, filepath.Join(repoRoot(t), "eval", "fixtures"), cfg, brands, webmail); err != nil {
 		t.Fatal(err)
 	}
-	want, err := os.ReadFile(filepath.Join(repoRoot(t), "eval", "golden", "reference-flat.jsonl"))
+	name := "reference-flat.jsonl"
+	if runtime.GOARCH != "amd64" {
+		name = "reference-flat-" + runtime.GOARCH + ".jsonl"
+	}
+	want, err := os.ReadFile(filepath.Join(repoRoot(t), "eval", "golden", name))
 	if err != nil {
 		t.Fatal(err)
 	}

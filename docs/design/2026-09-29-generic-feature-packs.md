@@ -1733,6 +1733,12 @@ The first two already have a channel: `content.verdict` and enum fields.
   - It records bits for feature values, `NextRescoreAt`, per-rule hashes, risks, tiers, the score
     and `Version()`.
   - The output goes to `eval/golden/reference-flat.jsonl`.
+  - **P0 portability clarification (2026-09-30):** the existing weighted sum is CPU-specific
+    in its last bits. Keep `reference-flat.jsonl` for AMD64 and
+    `reference-flat-arm64.jsonl` for ARM64, with architecture metadata. All 8,671
+    point identities/features/hashes/timers/tiers/flags agree across CPUs; 499
+    risks/scores differ. Preserve the scorer and exact comparison on each CPU,
+    rather than adding tolerance. P1 and later slices must preserve both oracles.
 - **P1:** values, risks and tiers stay bit-exact under the rename map. Hashes, cassette keys,
   fake-scorer outputs and SHAs are recorded as changed once. The output goes to
   `reference-ns.jsonl`, and every later slice must match it exactly.
