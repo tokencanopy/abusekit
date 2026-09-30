@@ -6,6 +6,7 @@ require golang.org/x/text v0.24.0
 
 require (
 	github.com/jackc/pgx/v5 v5.7.6
+	golang.org/x/sys v0.32.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

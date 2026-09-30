@@ -1733,6 +1733,14 @@ The first two already have a channel: `content.verdict` and enum fields.
   - It records bits for feature values, `NextRescoreAt`, per-rule hashes, risks, tiers, the score
     and `Version()`.
   - The output goes to `eval/golden/reference-flat.jsonl`.
+  - **P0 portability clarification (2026-09-30):** existing weighted sums and
+    Go's optional AMD64 FMA math path differ in their last bits. Keep exact
+    references for ARM64, AMD64 with FMA (`reference-flat.jsonl`), and AMD64
+    without FMA (`reference-flat-amd64-no-fma.jsonl`), with numeric-profile
+    metadata selected independently of replay outputs. All 8,671 point identities,
+    features, hashes, timers, tiers, and flags agree; only risks/scores differ.
+    Preserve scorer behavior and exact comparison on every profile. See
+    `eval/golden/README.md` for reproduction, build settings, and CI coverage.
 - **P1:** values, risks and tiers stay bit-exact under the rename map. Hashes, cassette keys,
   fake-scorer outputs and SHAs are recorded as changed once. The output goes to
   `reference-ns.jsonl`, and every later slice must match it exactly.

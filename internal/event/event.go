@@ -98,12 +98,14 @@ func (l Links) Kinds() []struct{ Kind, Hash string } {
 // POST /v1/events batch. Construct it from the wire JSON, then call
 // Validate (structure) and Redact (data) before it reaches the store.
 type Event struct {
-	ID      string         `json:"id"`
-	Subject string         `json:"subject"`
-	Type    string         `json:"type"`
-	At      time.Time      `json:"at"`
-	Links   Links          `json:"links,omitempty"`
-	Data    map[string]any `json:"data,omitempty"`
+	// Producer is authenticated storage metadata, never a producer-controlled wire field.
+	Producer string         `json:"-"`
+	ID       string         `json:"id"`
+	Subject  string         `json:"subject"`
+	Type     string         `json:"type"`
+	At       time.Time      `json:"at"`
+	Links    Links          `json:"links,omitempty"`
+	Data     map[string]any `json:"data,omitempty"`
 }
 
 // Code enumerates the per-item rejection reasons from design §4.3.
