@@ -43,6 +43,16 @@ jobs:
         run: make lint
       - name: unit tests (no DB)
         run: make test
+      - name: capture exact replay on failure
+        if: failure()
+        run: |
+          go run ./cmd/abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml --out "${{ runner.temp }}/golden-actual.jsonl"
+          GODEBUG=cpu.fma=off go run ./cmd/abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml --golden-check eval/golden/reference-flat.jsonl
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: golden-actual
+          path: ${{ runner.temp }}/golden-actual.jsonl
 
   gate:
     name: eval harness gate
