@@ -237,16 +237,16 @@ type StoredEvent struct {
 }
 
 // EventsForSubject returns every event stored for (tenant, subject),
-// oldest first (by event time, then insertion order for same-timestamp
+// oldest first (by event time, then producer and id for same-timestamp
 // events). This is the raw material internal/feature (S2) extracts
 // windows from; S1 has no caller for it yet beyond tests, but the method
 // belongs to the store's contract regardless of who calls it first.
 func (s *Store) EventsForSubject(ctx context.Context, tenant, subject string) ([]StoredEvent, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, subject, type, at, links, data, received_at
+		SELECT id, subject, type, at, links, data, received_at, producer
 		FROM events
 		WHERE tenant = $1 AND subject = $2
-		ORDER BY at ASC, seq ASC
+		ORDER BY at ASC, producer COLLATE "C" ASC, id COLLATE "C" ASC
 	`, tenant, subject)
 	if err != nil {
 		return nil, fmt.Errorf("store: query events for subject %s: %w", subject, err)
@@ -260,7 +260,7 @@ func (s *Store) EventsForSubject(ctx context.Context, tenant, subject string) ([
 			linksJSON, dataJSON []byte
 		)
 		if err := rows.Scan(&se.Event.ID, &se.Event.Subject, &se.Event.Type, &se.Event.At,
-			&linksJSON, &dataJSON, &se.ReceivedAt); err != nil {
+			&linksJSON, &dataJSON, &se.ReceivedAt, &se.Event.Producer); err != nil {
 			return nil, fmt.Errorf("store: scan event row: %w", err)
 		}
 		if err := json.Unmarshal(linksJSON, &se.Event.Links); err != nil {

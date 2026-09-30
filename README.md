@@ -214,3 +214,11 @@ targets, and `AGENTS.md` for the worktree/lint/corpus conventions that apply to 
 go run ./cmd/abusekit migrate --database-url postgres://e2a:e2a@localhost:5433/abusekit_dev
 go run ./cmd/abusekit serve --check --database-url postgres://e2a:e2a@localhost:5433/abusekit_dev
 ```
+
+### Exact migration replay
+
+`abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml
+--golden-check eval/golden/reference-flat.jsonl` checks every committed event
+fixture and synthetic subject after each event and scheduled rescore. It pins
+float64 bits, rule hashes, scorer versions, and rescore times without a database
+or vendor calls. See [the baseline contract](eval/golden/README.md).

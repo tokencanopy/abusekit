@@ -79,8 +79,10 @@ type linkRef struct {
 // every incarnation in a chain would trivially see every other
 // incarnation's held-out answer).
 type labelledAt struct {
-	at    time.Time
-	value string
+	producer string
+	id       string
+	at       time.Time
+	value    string
 }
 
 type datasetNeighbors struct {

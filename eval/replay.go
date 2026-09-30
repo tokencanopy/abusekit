@@ -45,12 +45,13 @@ const labelEventType = "label"
 // there) still runs unchanged over a row that never had to think about
 // event ids.
 type eventRow struct {
-	ID      string         `json:"id"`
-	Subject string         `json:"subject"`
-	Type    string         `json:"type"`
-	At      string         `json:"at"`
-	Links   event.Links    `json:"links"`
-	Data    map[string]any `json:"data"`
+	Producer string         `json:"producer"`
+	ID       string         `json:"id"`
+	Subject  string         `json:"subject"`
+	Type     string         `json:"type"`
+	At       string         `json:"at"`
+	Links    event.Links    `json:"links"`
+	Data     map[string]any `json:"data"`
 }
 
 // LabelRow is the wire shape of one event-replay labels-file line (task
@@ -183,7 +184,7 @@ func LoadReplayDataset(in ReplayInput, brands feature.BrandSet, webmail feature.
 		return Dataset{}, nil, err
 	}
 	for s := range eventsBySubject {
-		sort.Slice(eventsBySubject[s], func(i, j int) bool { return eventsBySubject[s][i].At.Before(eventsBySubject[s][j].At) })
+		sort.Slice(eventsBySubject[s], func(i, j int) bool { return event.Less(eventsBySubject[s][i], eventsBySubject[s][j]) })
 	}
 
 	labels, labelErrs, err := parseLabelRows(in.LabelsPath, in.Labels)
@@ -456,6 +457,10 @@ func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[str
 			return fail(row.Subject, "bad_at", "events: at: %w", err)
 		}
 
+		id := row.ID
+		if id == "" {
+			id = fmt.Sprintf("replay-line-%d", line)
+		}
 		if row.Type == labelEventType {
 			value, ok := dataStringField(row.Data, "label")
 			if !ok || value == "" {
@@ -468,16 +473,12 @@ func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[str
 				rowErrs = append(rowErrs, RowError{Source: path, Line: line, Code: "bad_label_event", Err: fmt.Errorf("events: subject %q: a %q event needs a non-empty string data.label", row.Subject, labelEventType)})
 				return nil
 			}
-			labelEvents[row.Subject] = append(labelEvents[row.Subject], labelledAt{at: at, value: value})
+			labelEvents[row.Subject] = append(labelEvents[row.Subject], labelledAt{producer: row.Producer, id: id, at: at, value: value})
 			return nil
 		}
 
 		stripNullFields(row.Data) // fix round P3: absent-is-null, before Redact ever sees it
-		id := row.ID
-		if id == "" {
-			id = fmt.Sprintf("replay-line-%d", line) // task brief's events-row shape omits id; synthesize one (see eventRow's doc comment)
-		}
-		e := event.Event{ID: id, Subject: row.Subject, Type: row.Type, At: at, Links: row.Links, Data: row.Data}
+		e := event.Event{Producer: row.Producer, ID: id, Subject: row.Subject, Type: row.Type, At: at, Links: row.Links, Data: row.Data}
 		// Validated against its OWN `at` as "now" (matching
 		// internal/worker's ingestFixture): a replay of historical or
 		// fictional-timestamped data has no business being checked

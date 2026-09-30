@@ -22,6 +22,8 @@ import (
 // convention (envOr) so a deployment's existing ABUSEKIT_RULES_CONFIG
 // etc. work unchanged for the harness too.
 type evalFlags struct {
+	golden      bool
+	goldenCheck string
 	ruleConfigPaths
 	brandsExtraPath string
 	webmailPath     string
@@ -47,6 +49,8 @@ var errHelp = errors.New("eval: help requested")
 func parseEvalFlags(args []string) (evalFlags, error) {
 	fs := flag.NewFlagSet("eval", flag.ContinueOnError)
 	var f evalFlags
+	fs.BoolVar(&f.golden, "golden", false, "replay every event and timer with exact float bits (local scorers only)")
+	fs.StringVar(&f.goldenCheck, "golden-check", "", "compare golden JSONL against this reference; exit 1 on drift")
 	fs.StringVar(&f.rulesPath, "rules", envOr("ABUSEKIT_RULES_CONFIG", "config/rules.yaml"), "path to rules.yaml")
 	fs.StringVar(&f.vendorsPath, "vendors", envOr("ABUSEKIT_VENDORS_CONFIG", "config/vendors.yaml"), "path to vendors.yaml")
 	fs.StringVar(&f.weightsPath, "weights", envOr("ABUSEKIT_LOCAL_WEIGHTS", "config/local_weights.yaml"), "path to the local scorer's weights YAML")
@@ -74,6 +78,28 @@ func parseEvalFlags(args []string) (evalFlags, error) {
 			return evalFlags{}, errHelp
 		}
 		return evalFlags{}, exitCode2(err)
+	}
+	if f.golden {
+		if fs.NArg() != 0 {
+			return evalFlags{}, exitCode2(fmt.Errorf("unexpected positional arguments in golden mode"))
+		}
+		var incompatible string
+		fs.Visit(func(v *flag.Flag) {
+			switch v.Name {
+			case "labels", "rule", "scorer", "slice", "split", "cassettes", "record", "skip-invalid", "floors", "prompt-version":
+				incompatible = v.Name
+			}
+		})
+		if incompatible != "" {
+			return evalFlags{}, exitCode2(fmt.Errorf("--%s is incompatible with --golden", incompatible))
+		}
+		if f.dataset == "" {
+			f.dataset = "eval/fixtures"
+		}
+		return f, nil
+	}
+	if f.goldenCheck != "" {
+		return evalFlags{}, exitCode2(fmt.Errorf("--golden-check requires --golden"))
 	}
 	if f.dataset == "" {
 		return evalFlags{}, exitCode2(fmt.Errorf("--dataset is required"))
@@ -120,6 +146,9 @@ func runEval(args []string) error {
 	webmail, err := feature.LoadWebmailFile(f.webmailPath)
 	if err != nil {
 		return exitCode2(fmt.Errorf("load webmail config: %w", err))
+	}
+	if f.golden {
+		return runGolden(f, cfg, brands, webmail)
 	}
 	rule, ok := ruleByName(cfg, f.rule)
 	if !ok {
