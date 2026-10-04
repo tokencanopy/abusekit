@@ -18,18 +18,18 @@ func TestWeights_Validate(t *testing.T) {
 		w       Weights
 		wantErr bool
 	}{
-		{"valid", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": 1}}, false},
-		{"missing benign label", Weights{Weight: map[string]float64{"x": 1}}, true},
+		{"valid", Weights{BenignLabel: "benign", Weight: map[string]float64{"custom.x": 1}}, false},
+		{"missing benign label", Weights{Weight: map[string]float64{"custom.x": 1}}, true},
 		{"missing weights", Weights{BenignLabel: "benign"}, true},
 		// R5 (round 2): a NaN/Inf bias or weight makes the scorer's every
 		// answer NaN forever (NaN propagates through the linear sum and
 		// sigmoid) without ever failing anywhere — a "dark rule" that
 		// looks registered and healthy but can never usefully score.
 		// Reject it at load time instead.
-		{"NaN bias", Weights{BenignLabel: "benign", Bias: math.NaN(), Weight: map[string]float64{"x": 1}}, true},
-		{"Inf bias", Weights{BenignLabel: "benign", Bias: math.Inf(1), Weight: map[string]float64{"x": 1}}, true},
-		{"NaN weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": math.NaN()}}, true},
-		{"Inf weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"x": math.Inf(-1)}}, true},
+		{"NaN bias", Weights{BenignLabel: "benign", Bias: math.NaN(), Weight: map[string]float64{"custom.x": 1}}, true},
+		{"Inf bias", Weights{BenignLabel: "benign", Bias: math.Inf(1), Weight: map[string]float64{"custom.x": 1}}, true},
+		{"NaN weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"custom.x": math.NaN()}}, true},
+		{"Inf weight", Weights{BenignLabel: "benign", Weight: map[string]float64{"custom.x": math.Inf(-1)}}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,7 +84,7 @@ func TestScore_MissingFeatureContributesZero(t *testing.T) {
 	w := Weights{
 		BenignLabel: "benign",
 		Bias:        0,
-		Weight:      map[string]float64{"unset_feature": 5}, // never present in Features
+		Weight:      map[string]float64{"custom.unset_feature": 5}, // never present in Features
 	}
 	s, err := New(w)
 	if err != nil {
@@ -103,7 +103,7 @@ func TestScore_MissingFeatureContributesZero(t *testing.T) {
 }
 
 func TestScore_NonBenignMassSplitEvenly(t *testing.T) {
-	w := Weights{BenignLabel: "benign", Bias: 5, Weight: map[string]float64{"x": 0}}
+	w := Weights{BenignLabel: "benign", Bias: 5, Weight: map[string]float64{"custom.x": 0}}
 	s, err := New(w)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -127,8 +127,8 @@ func TestScore_NonBenignMassSplitEvenly(t *testing.T) {
 // internal/core's input-hash uses to force a rescore after any scorer
 // change (a Weights.Version string alone can't catch a forgotten bump).
 func TestVersion_ChangesWithWeightsContent(t *testing.T) {
-	base := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.0}}
-	edited := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.5}} // same version string, different weight
+	base := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"custom.x": 1.0}}
+	edited := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"custom.x": 1.5}} // same version string, different weight
 
 	sBase, err := New(base)
 	if err != nil {
@@ -148,7 +148,7 @@ func TestVersion_ChangesWithWeightsContent(t *testing.T) {
 }
 
 func TestVersion_DeterministicForIdenticalWeights(t *testing.T) {
-	w := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"x": 1.0, "y": 2.0}}
+	w := Weights{Version: "v1", BenignLabel: "benign", Bias: -2, Weight: map[string]float64{"custom.x": 1.0, "custom.y": 2.0}}
 	s1, err := New(w)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -181,7 +181,7 @@ func TestScore_DeterministicAcrossManyRandomFeatureMaps(t *testing.T) {
 	weight := make(map[string]float64, nTriples*3)
 	features := make(map[string]float64, nTriples*3)
 	for i := 0; i < nTriples; i++ {
-		big, negBig, small := fmt.Sprintf("big%02d", i), fmt.Sprintf("negbig%02d", i), fmt.Sprintf("small%02d", i)
+		big, negBig, small := fmt.Sprintf("custom.big%02d", i), fmt.Sprintf("custom.negbig%02d", i), fmt.Sprintf("custom.small%02d", i)
 		weight[big], weight[negBig], weight[small] = 1e16, -1e16, 1
 		features[big], features[negBig], features[small] = 1, 1, 1
 	}
@@ -208,7 +208,7 @@ func TestScore_DeterministicAcrossManyRandomFeatureMaps(t *testing.T) {
 }
 
 func TestScore_RejectsTextInput(t *testing.T) {
-	s, err := New(Weights{BenignLabel: "benign", Weight: map[string]float64{"x": 1}})
+	s, err := New(Weights{BenignLabel: "benign", Weight: map[string]float64{"custom.x": 1}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -50,7 +50,7 @@ func TestNamespaceMigrationRejectsLossyInputs(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires Postgres")
 	}
-	for name, features := range map[string]string{"collision": `{"key_total":1,"core.credential_total":2}`, "unknown": `{"unregistered_flat":3}`} {
+	for name, features := range map[string]string{"collision": `{"key_total":1,"core.credential_total":2}`, "unknown": `{"unregistered_flat":3}`, "reserved": `{"custom.foo__absent":1}`} {
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			pool, err := pgxpool.New(ctx, newThrowawayDatabaseURL(t))
@@ -72,6 +72,7 @@ func TestNamespaceMigrationRejectsLossyInputs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			defer tx.Rollback(ctx)
 			_, err = tx.Exec(ctx, string(sql))
 			if err == nil {
 				t.Fatal("migration accepted a lossy key conversion")

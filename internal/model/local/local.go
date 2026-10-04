@@ -55,6 +55,9 @@ type Weights struct {
 // weight must be set. Called by New so a malformed weights file fails at
 // construction, not on the first Score call.
 func (w Weights) Validate() error {
+	if err := registry.ValidateKeys(w.Weight); err != nil {
+		return fmt.Errorf("local weights: %w", err)
+	}
 	if w.BenignLabel == "" {
 		return fmt.Errorf("local: weights.benign_label is required")
 	}

@@ -32,7 +32,7 @@ DO $$ BEGIN
  IF EXISTS (
    SELECT 1 FROM corpus_examples c CROSS JOIN LATERAL jsonb_each(COALESCE(NULLIF(c.features,'null'::jsonb),'{}'::jsonb)) e
    LEFT JOIN abusekit_feature_rename r ON r.old_name=e.key
-   WHERE r.old_name IS NULL AND e.key !~ '^[a-z][a-z0-9]*[.][a-z][a-z0-9_]{0,55}$'
+   WHERE r.old_name IS NULL AND (e.key !~ '^[a-z][a-z0-9]*[.][a-z][a-z0-9_]{0,55}$' OR e.key LIKE '%\_\_absent')
  ) THEN RAISE EXCEPTION 'feature_renamed: corpus contains an unknown flat feature; migrate it explicitly'; END IF;
  IF EXISTS (
    SELECT c.id, COALESCE(r.new_name,e.key) FROM corpus_examples c
