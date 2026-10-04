@@ -51,7 +51,7 @@ func TestScore_HigherRiskFeaturesIncreaseRisk(t *testing.T) {
 	w := Weights{
 		BenignLabel: "benign",
 		Bias:        -2,
-		Weight:      map[string]float64{"resource_velocity_1h": 1.0},
+		Weight:      map[string]float64{"core.resource_velocity_1h": 1.0},
 	}
 	s, err := New(w)
 	if err != nil {
@@ -60,14 +60,14 @@ func TestScore_HigherRiskFeaturesIncreaseRisk(t *testing.T) {
 
 	low, err := s.Score(context.Background(), model.ScoreRequest{
 		Labels:   []string{"benign", "abusive"},
-		Features: map[string]float64{"resource_velocity_1h": 0},
+		Features: map[string]float64{"core.resource_velocity_1h": 0},
 	})
 	if err != nil {
 		t.Fatalf("Score(low): %v", err)
 	}
 	high, err := s.Score(context.Background(), model.ScoreRequest{
 		Labels:   []string{"benign", "abusive"},
-		Features: map[string]float64{"resource_velocity_1h": 10},
+		Features: map[string]float64{"core.resource_velocity_1h": 10},
 	})
 	if err != nil {
 		t.Fatalf("Score(high): %v", err)
@@ -76,7 +76,7 @@ func TestScore_HigherRiskFeaturesIncreaseRisk(t *testing.T) {
 	riskLow := 1 - low.Probs["benign"]
 	riskHigh := 1 - high.Probs["benign"]
 	if riskHigh <= riskLow {
-		t.Fatalf("expected higher resource_velocity_1h to raise risk: low=%v high=%v", riskLow, riskHigh)
+		t.Fatalf("expected higher core.resource_velocity_1h to raise risk: low=%v high=%v", riskLow, riskHigh)
 	}
 }
 
@@ -237,11 +237,11 @@ func TestLoadWeightsFile_ShippedConfig(t *testing.T) {
 	}
 
 	wantFeatures := []string{
-		"subject_age_h", "resource_velocity_1h", "resource_total", "key_velocity_1h", "key_total",
-		"upgrade_delay_min", "declines_before_first_success", "first_funding_prepaid",
-		"name_brand_match", "name_has_at", "first_day_distinct_domains", "self_send_before_external",
-		"linked_deleted_n", "linked_labelled_abusive_n", "fingerprint_seen_on_other_subjects",
-		"burst_ratio_24h_vs_lifetime",
+		"core.subject_age_h", "core.resource_velocity_1h", "core.resource_total", "core.credential_velocity_1h", "core.credential_total",
+		"core.upgrade_delay_min", "core.declines_before_first_success", "core.first_funding_prepaid",
+		"brand.name_match", "brand.name_has_at", "email.first_day_distinct_domains", "email.self_send_before_external",
+		"core.linked_deleted_n", "core.linked_labelled_abusive_n", "core.fingerprint_seen_on_other_subjects",
+		"core.burst_ratio_24h_vs_lifetime",
 	}
 	for _, f := range wantFeatures {
 		if _, ok := w.Weight[f]; !ok {
@@ -251,7 +251,7 @@ func TestLoadWeightsFile_ShippedConfig(t *testing.T) {
 
 	if _, err := s.Score(context.Background(), model.ScoreRequest{
 		Labels:   []string{"benign", "suspicious", "abusive"},
-		Features: map[string]float64{"resource_velocity_1h": 6, "key_velocity_1h": 4},
+		Features: map[string]float64{"core.resource_velocity_1h": 6, "core.credential_velocity_1h": 4},
 	}); err != nil {
 		t.Fatalf("Score with shipped weights: %v", err)
 	}

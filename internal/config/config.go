@@ -434,8 +434,8 @@ func validateNoDuplicatesOrEmpty(ruleName, kind string, values []string) []error
 // rest of config validation.
 var knownStageKeys = map[string]bool{
 	"min_local_risk":    true, // gate on the max risk so far of any rule scored by "local"
-	"max_subject_age_h": true, // gate on features["subject_age_h"] <= value
-	"min_subject_age_h": true, // gate on features["subject_age_h"] >= value
+	"max_subject_age_h": true, // gate on features["core.subject_age_h"] <= value
+	"min_subject_age_h": true, // gate on features["core.subject_age_h"] >= value
 }
 
 func validateStage(r Rule) error {

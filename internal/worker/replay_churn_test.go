@@ -19,7 +19,7 @@ import (
 // and check its tier, exactly matching design §1 success criterion 2(c):
 // "every subject from the third onward at high on its first
 // resource.created" (B1 fix round, proven: with S1's original weights and
-// unsaturated linked_deleted_n, the first subject to reach high was the
+// unsaturated core.linked_deleted_n, the first subject to reach high was the
 // ninth, not the third).
 //
 // This needs the real store (not a fake Neighbors) since it's the
@@ -81,7 +81,7 @@ func TestReplay_ChurnHighFromThirdSubjectOnward(t *testing.T) {
 			assertBand(t, "churn subject 3", view.Score, 0.8, 0.95)
 		}
 		if i+1 == numSubjects {
-			// linked_deleted_n saturates at 3 (S1 fix round): the LAST
+			// core.linked_deleted_n saturates at 3 (S1 fix round): the LAST
 			// subject's score should be no different from the 4th's, not
 			// growing without bound as more subjects churn.
 			assertBand(t, "churn subject (saturated)", view.Score, 0.9, 1.0)

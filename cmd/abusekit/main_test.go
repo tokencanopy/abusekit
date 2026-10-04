@@ -151,7 +151,7 @@ func TestBoot_RejectsMissingRulesFile(t *testing.T) {
 func TestBoot_RejectsInvalidRules(t *testing.T) {
 	c := shippedConfig(t)
 	bad := filepath.Join(t.TempDir(), "bad-rules.yaml")
-	if err := os.WriteFile(bad, []byte("tiers: {medium: 0.4, high: 0.8}\nrules:\n  - name: r\n    mode: advise\n    scorer: does_not_exist\n    inputs: [subject_age_h]\n    labels: [benign, abusive]\n    benign_label: benign\n    threshold: 0.5\n"), 0o644); err != nil {
+	if err := os.WriteFile(bad, []byte("tiers: {medium: 0.4, high: 0.8}\nrules:\n  - name: r\n    mode: advise\n    scorer: does_not_exist\n    inputs: [core.subject_age_h]\n    labels: [benign, abusive]\n    benign_label: benign\n    threshold: 0.5\n"), 0o644); err != nil {
 		t.Fatalf("write bad rules file: %v", err)
 	}
 	c.rulesPath = bad

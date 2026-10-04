@@ -77,7 +77,7 @@ func loadShippedConfig(t *testing.T) *config.Config {
 
 // loadShippedBrands loads the real config/brands.yaml this repo ships
 // (S3 fix round) — used alongside loadShippedConfig by every replay test
-// so name_brand_match is exercised against the actual curated list, not
+// so brand.name_match is exercised against the actual curated list, not
 // silently held at 0 by an unset Deps.Brands.
 func loadShippedBrands(t *testing.T) feature.BrandSet {
 	t.Helper()
@@ -109,7 +109,7 @@ rules:
   - name: fake_rule
     mode: advise
     scorer: fake_test_scorer
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -151,14 +151,14 @@ rules:
   - name: fake_rule_a
     mode: advise
     scorer: fake_scorer_a
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
   - name: fake_rule_b
     mode: advise
     scorer: fake_scorer_b
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5

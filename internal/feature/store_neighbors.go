@@ -39,7 +39,7 @@ var allLinkKinds = []string{
 // specific. ip24_hash, ua_hash and asn are opt-in: proven, a single shared
 // ua_hash ALONE (e.g. two subjects that both used the same email client or
 // SDK — extremely common, not evidence of anything) produced
-// linked_deleted_n=1 for a totally unrelated subject. asn was already
+// core.linked_deleted_n=1 for a totally unrelated subject. asn was already
 // excluded by design for the coarser reason that a large ISP/cloud
 // provider's ASN can be shared by thousands of subjects.
 type Config struct {

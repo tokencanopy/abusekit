@@ -38,7 +38,7 @@ type incarnation struct {
 // --seed) are never byte-identical in shape.
 //
 // Ground truth labels every incarnation "abusive" (including the first
-// two, before linked_deleted_n has saturated) — design §1.2(c)'s "every
+// two, before core.linked_deleted_n has saturated) — design §1.2(c)'s "every
 // subject from the third onward at high" is a claim about the SCORER's
 // recall, not about ground truth; the corpus's job is to let eval.Run
 // measure that honestly, including wherever the first two incarnations
@@ -100,7 +100,7 @@ func genChurnChain(rng *rand.Rand, kind string, chainIdx, length int) []incarnat
 		b.add(t, "subject.deleted", event.Links{}, map[string]any{"mode": "permanent"})
 		t += time.Duration(10+rng.Intn(20)) * time.Second
 		// Fix round T4: an operator/outcome label recorded shortly after
-		// takedown, so linked_labelled_abusive_n (design §4.2, weight
+		// takedown, so core.linked_labelled_abusive_n (design §4.2, weight
 		// 1.5) is actually exercised by this corpus at all — B1 closed
 		// off ground-truth leakage into this feature, so without an
 		// EVENT like this one, nothing anywhere in the generated corpus

@@ -210,7 +210,18 @@ func runServe(args []string) error {
 // returns, so a caller can rely on the worker having actually stopped
 // touching the store by the time it does. The `/v1/*` HTTP surface itself
 // is still S3's job — nothing here listens on a port.
+func requireProductionKeySpace(environment, keySpace string) error {
+	if environment == "production" && keySpace != "ns-v1" {
+		return fmt.Errorf("production requires feature key space ns-v1")
+	}
+	return nil
+}
+
 func runServeWithContext(ctx context.Context, c serveConfig) error {
+	if err := requireProductionKeySpace(os.Getenv("ABUSEKIT_ENV"), feature.KeySpace); err != nil {
+		return err
+	}
+
 	s, cfg, deps, err := boot(ctx, c)
 	if err != nil {
 		return err

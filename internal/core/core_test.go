@@ -6,6 +6,7 @@ import (
 
 	"github.com/tokencanopy/abusekit/internal/config"
 	"github.com/tokencanopy/abusekit/internal/core"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"github.com/tokencanopy/abusekit/internal/model"
 )
 
@@ -42,15 +43,15 @@ func floatp(f float64) *float64 { return &f }
 // --- Plan ---------------------------------------------------------------
 
 func TestPlan_BuildsRequestFromInputsAndText(t *testing.T) {
-	features := map[string]float64{"subject_age_h": 2, "resource_velocity_1h": 6, "unrelated": 99}
+	features := map[string]float64{"core.subject_age_h": 2, "core.resource_velocity_1h": 6, "unrelated": 99}
 	text := map[string][]string{"subject_line_skeleton": {"urgent action"}, "other_text": {"ignored"}}
 
 	rules := []core.RuleState{
-		{Rule: rule("feature_rule", config.ModeAdvise, withInputs("subject_age_h", "resource_velocity_1h"))},
+		{Rule: rule("feature_rule", config.ModeAdvise, withInputs("core.subject_age_h", "core.resource_velocity_1h"))},
 		{Rule: rule("text_rule", config.ModeShadow, withText("subject_line_skeleton"))},
 	}
 
-	calls := core.Plan(features, text, rules)
+	calls := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, text, rules)
 	if len(calls) != 2 {
 		t.Fatalf("expected 2 calls, got %d", len(calls))
 	}
@@ -59,7 +60,7 @@ func TestPlan_BuildsRequestFromInputsAndText(t *testing.T) {
 	if featureCall.Skip {
 		t.Fatalf("expected feature_rule not to be skipped")
 	}
-	if got := featureCall.Request.Features; got["subject_age_h"] != 2 || got["resource_velocity_1h"] != 6 {
+	if got := featureCall.Request.Features; got["core.subject_age_h"] != 2 || got["core.resource_velocity_1h"] != 6 {
 		t.Fatalf("unexpected features in request: %#v", got)
 	}
 	if _, ok := featureCall.Request.Features["unrelated"]; ok {
@@ -76,7 +77,7 @@ func TestPlan_MissingFeatureDefaultsToZero(t *testing.T) {
 	rules := []core.RuleState{
 		{Rule: rule("r", config.ModeAdvise, withInputs("never_set"))},
 	}
-	calls := core.Plan(map[string]float64{}, nil, rules)
+	calls := core.Plan(core.Vector{Values: map[string]float64{}, HashQuantum: registry.HashQuanta()}, nil, rules)
 	if v, ok := calls[0].Request.Features["never_set"]; !ok || v != 0 {
 		t.Fatalf("expected missing feature to default to 0, got %#v", calls[0].Request.Features)
 	}
@@ -87,20 +88,20 @@ func TestPlan_SkipsOnUnchangedInputHash(t *testing.T) {
 	r := rule("r", config.ModeAdvise, withInputs("x"))
 
 	// First round: no prior hash, must not skip.
-	first := core.Plan(features, nil, []core.RuleState{{Rule: r}})
+	first := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r}})
 	if first[0].Skip {
 		t.Fatalf("expected first round not to skip")
 	}
 
 	// Second round with the same features and the recorded hash: must skip.
-	second := core.Plan(features, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+	second := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
 	if !second[0].Skip || second[0].SkipReason != core.SkipInputUnchanged {
 		t.Fatalf("expected second round to skip with reason %q, got skip=%v reason=%q",
 			core.SkipInputUnchanged, second[0].Skip, second[0].SkipReason)
 	}
 
 	// Third round with a changed feature: must not skip, and the hash differs.
-	third := core.Plan(map[string]float64{"x": 2}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+	third := core.Plan(core.Vector{Values: map[string]float64{"x": 2}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
 	if third[0].Skip {
 		t.Fatalf("expected a changed feature to avoid the skip")
 	}
@@ -115,7 +116,7 @@ func TestPlan_StageMinLocalRisk(t *testing.T) {
 		withStage(map[string]float64{"min_local_risk": 0.3}))
 
 	// No prior local risk at all -> gated off.
-	calls := core.Plan(map[string]float64{"x": 1}, map[string][]string{"t": {"hi"}}, []core.RuleState{
+	calls := core.Plan(core.Vector{Values: map[string]float64{"x": 1}, HashQuantum: registry.HashQuanta()}, map[string][]string{"t": {"hi"}}, []core.RuleState{
 		{Rule: localRule},
 		{Rule: shadowRule},
 	})
@@ -124,7 +125,7 @@ func TestPlan_StageMinLocalRisk(t *testing.T) {
 	}
 
 	// Prior local risk below the gate -> still gated off.
-	below := core.Plan(map[string]float64{"x": 1}, map[string][]string{"t": {"hi"}}, []core.RuleState{
+	below := core.Plan(core.Vector{Values: map[string]float64{"x": 1}, HashQuantum: registry.HashQuanta()}, map[string][]string{"t": {"hi"}}, []core.RuleState{
 		{Rule: localRule, LastRisk: floatp(0.2)},
 		{Rule: shadowRule},
 	})
@@ -133,7 +134,7 @@ func TestPlan_StageMinLocalRisk(t *testing.T) {
 	}
 
 	// Prior local risk at/above the gate -> runs.
-	above := core.Plan(map[string]float64{"x": 1}, map[string][]string{"t": {"hi"}}, []core.RuleState{
+	above := core.Plan(core.Vector{Values: map[string]float64{"x": 1}, HashQuantum: registry.HashQuanta()}, map[string][]string{"t": {"hi"}}, []core.RuleState{
 		{Rule: localRule, LastRisk: floatp(0.5)},
 		{Rule: shadowRule},
 	})
@@ -155,7 +156,7 @@ func TestPlan_NaNFeatureNeverPermanentlySkips(t *testing.T) {
 	r := rule("r", config.ModeAdvise, withInputs("x"))
 	features := map[string]float64{"x": math.NaN()}
 
-	first := core.Plan(features, nil, []core.RuleState{{Rule: r}})
+	first := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r}})
 	if first[0].InputHash != "" {
 		t.Fatalf("expected a NaN feature to produce the empty sentinel hash, got %q", first[0].InputHash)
 	}
@@ -165,7 +166,7 @@ func TestPlan_NaNFeatureNeverPermanentlySkips(t *testing.T) {
 
 	// Simulate the caller recording round 1's (empty) hash, then Plan
 	// running again with the SAME NaN feature: it must still not skip.
-	second := core.Plan(features, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+	second := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
 	if second[0].Skip {
 		t.Fatalf("expected a NaN feature to never trigger input_unchanged skipping, even across rounds")
 	}
@@ -182,11 +183,11 @@ func TestPlan_BenignLabelChangeForcesRescore(t *testing.T) {
 	base.Labels = []string{"benign", "abusive"}
 	base.BenignLabel = "benign"
 
-	first := core.Plan(features, nil, []core.RuleState{{Rule: base}})
+	first := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: base}})
 
 	changed := base
 	changed.BenignLabel = "abusive" // same Labels list, different benign label
-	second := core.Plan(features, nil, []core.RuleState{{Rule: changed, LastInputHash: first[0].InputHash}})
+	second := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: changed, LastInputHash: first[0].InputHash}})
 
 	if second[0].InputHash == first[0].InputHash {
 		t.Fatalf("expected a benign_label change to change the input hash")
@@ -205,8 +206,8 @@ func TestPlan_ScorerVersionChangeForcesRescore(t *testing.T) {
 	features := map[string]float64{"x": 1}
 	r := rule("r", config.ModeAdvise, withInputs("x"))
 
-	v1 := core.Plan(features, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v1"}})
-	v2 := core.Plan(features, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v2", LastInputHash: v1[0].InputHash}})
+	v1 := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v1"}})
+	v2 := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, ScorerVersion: "weights-v2", LastInputHash: v1[0].InputHash}})
 
 	if v2[0].InputHash == v1[0].InputHash {
 		t.Fatalf("expected a ScorerVersion change to change the input hash")
@@ -223,8 +224,8 @@ func TestPlan_CalibrationIDChangeForcesRescore(t *testing.T) {
 	features := map[string]float64{"x": 1}
 	r := rule("r", config.ModeAdvise, withInputs("x"))
 
-	c1 := core.Plan(features, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_1"}})
-	c2 := core.Plan(features, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_2", LastInputHash: c1[0].InputHash}})
+	c1 := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_1"}})
+	c2 := core.Plan(core.Vector{Values: features, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, CalibrationID: "cal_2", LastInputHash: c1[0].InputHash}})
 
 	if c2[0].InputHash == c1[0].InputHash {
 		t.Fatalf("expected a CalibrationID change to change the input hash")
@@ -235,7 +236,7 @@ func TestPlan_CalibrationIDChangeForcesRescore(t *testing.T) {
 }
 
 // TestPlan_AgeDriftWithinAnHourBucketStillSkips is R7 round 2. Proven:
-// subject_age_h and upgrade_delay_min (internal/feature's B5 fix round)
+// core.subject_age_h and core.upgrade_delay_min (internal/feature's B5 fix round)
 // are continuously-drifting elapsed-time features for any subject not yet
 // at their clamp ceiling — they change on literally every tick, even with
 // no new event at all — so hashing them at full precision meant a rule
@@ -243,20 +244,20 @@ func TestPlan_CalibrationIDChangeForcesRescore(t *testing.T) {
 // NEVER skipped as input_unchanged for exactly the population — new,
 // still-under-clamp accounts — this system most needs to score
 // efficiently. The hash must instead be stable within a 1-hour bucket for
-// subject_age_h and a 60-minute bucket for upgrade_delay_min, so a round
+// core.subject_age_h and a 60-minute bucket for core.upgrade_delay_min, so a round
 // with no OTHER relevant change reuses the prior verdict.
 func TestPlan_AgeDriftWithinAnHourBucketStillSkips(t *testing.T) {
-	r := rule("r", config.ModeAdvise, withInputs("subject_age_h", "upgrade_delay_min"))
+	r := rule("r", config.ModeAdvise, withInputs("core.subject_age_h", "core.upgrade_delay_min"))
 
-	first := core.Plan(map[string]float64{"subject_age_h": 5.05, "upgrade_delay_min": 303}, nil, []core.RuleState{{Rule: r}})
+	first := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 5.05, "core.upgrade_delay_min": 303}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r}})
 	if first[0].Skip {
 		t.Fatalf("expected the first round not to skip")
 	}
 
 	t.Run("drift within the same hour/60-minute bucket still skips", func(t *testing.T) {
-		second := core.Plan(map[string]float64{"subject_age_h": 5.75, "upgrade_delay_min": 345}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+		second := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 5.75, "core.upgrade_delay_min": 345}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
 		if second[0].InputHash != first[0].InputHash {
-			t.Fatalf("expected subject_age_h 5.05->5.75 and upgrade_delay_min 303->345 (same hour/60-min bucket) to hash identically")
+			t.Fatalf("expected core.subject_age_h 5.05->5.75 and core.upgrade_delay_min 303->345 (same hour/60-min bucket) to hash identically")
 		}
 		if !second[0].Skip || second[0].SkipReason != core.SkipInputUnchanged {
 			t.Fatalf("expected a same-bucket drift to skip as input_unchanged, got skip=%v reason=%q", second[0].Skip, second[0].SkipReason)
@@ -264,7 +265,7 @@ func TestPlan_AgeDriftWithinAnHourBucketStillSkips(t *testing.T) {
 	})
 
 	t.Run("crossing into the next hour/60-minute bucket does not skip", func(t *testing.T) {
-		third := core.Plan(map[string]float64{"subject_age_h": 6.02, "upgrade_delay_min": 361}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
+		third := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 6.02, "core.upgrade_delay_min": 361}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r, LastInputHash: first[0].InputHash}})
 		if third[0].InputHash == first[0].InputHash {
 			t.Fatalf("expected crossing into hour 6 / minute-bucket 360 to change the input hash")
 		}
@@ -274,11 +275,11 @@ func TestPlan_AgeDriftWithinAnHourBucketStillSkips(t *testing.T) {
 	})
 
 	t.Run("a genuinely different non-time feature is unaffected by quantization", func(t *testing.T) {
-		r2 := rule("r2", config.ModeAdvise, withInputs("subject_age_h", "resource_total"))
-		f1 := core.Plan(map[string]float64{"subject_age_h": 5.05, "resource_total": 3}, nil, []core.RuleState{{Rule: r2}})
-		f2 := core.Plan(map[string]float64{"subject_age_h": 5.75, "resource_total": 4}, nil, []core.RuleState{{Rule: r2, LastInputHash: f1[0].InputHash}})
+		r2 := rule("r2", config.ModeAdvise, withInputs("core.subject_age_h", "core.resource_total"))
+		f1 := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 5.05, "core.resource_total": 3}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r2}})
+		f2 := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 5.75, "core.resource_total": 4}, HashQuantum: registry.HashQuanta()}, nil, []core.RuleState{{Rule: r2, LastInputHash: f1[0].InputHash}})
 		if f2[0].InputHash == f1[0].InputHash {
-			t.Fatalf("expected a real resource_total change to still change the input hash despite subject_age_h's quantization")
+			t.Fatalf("expected a real core.resource_total change to still change the input hash despite core.subject_age_h's quantization")
 		}
 	})
 }
@@ -286,12 +287,12 @@ func TestPlan_AgeDriftWithinAnHourBucketStillSkips(t *testing.T) {
 func TestPlan_StageSubjectAge(t *testing.T) {
 	old := rule("old_gate", config.ModeShadow, withText("t"), withStage(map[string]float64{"max_subject_age_h": 168}))
 
-	young := core.Plan(map[string]float64{"subject_age_h": 10}, map[string][]string{"t": {"x"}}, []core.RuleState{{Rule: old}})
+	young := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 10}, HashQuantum: registry.HashQuanta()}, map[string][]string{"t": {"x"}}, []core.RuleState{{Rule: old}})
 	if young[0].Skip {
 		t.Fatalf("expected a young subject to pass max_subject_age_h")
 	}
 
-	agedOut := core.Plan(map[string]float64{"subject_age_h": 200}, map[string][]string{"t": {"x"}}, []core.RuleState{{Rule: old}})
+	agedOut := core.Plan(core.Vector{Values: map[string]float64{"core.subject_age_h": 200}, HashQuantum: registry.HashQuanta()}, map[string][]string{"t": {"x"}}, []core.RuleState{{Rule: old}})
 	if !agedOut[0].Skip {
 		t.Fatalf("expected an old subject to be stage-skipped by max_subject_age_h")
 	}

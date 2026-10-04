@@ -44,7 +44,7 @@ type Label struct {
 //
 // An "abusive" label ALSO propagates to l.Subject's same-tenant
 // neighbours (S2 fix round, PropagateToNeighbors): their
-// linked_labelled_abusive_n feature just became stale the instant this
+// core.linked_labelled_abusive_n feature just became stale the instant this
 // label landed, and would otherwise sit wrong until something else
 // happened to touch them. Propagation runs AFTER commit (via the pool,
 // not this transaction — matching AppendEvents' own convention, since it

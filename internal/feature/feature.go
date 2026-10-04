@@ -14,6 +14,7 @@ package feature
 import (
 	"context"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"math"
 	"time"
 
@@ -33,7 +34,7 @@ const resourceKindKey = "key"
 // subjectAgeClampHours and upgradeDelayClampMinutes bound the two
 // unbounded-by-construction time features (B5 fix round, proven to
 // otherwise swamp the local scorer's linear model for a multi-day-old
-// account: a 14-day-old dormant-then-blast subject's raw upgrade_delay_min
+// account: a 14-day-old dormant-then-blast subject's raw core.upgrade_delay_min
 // alone could run into the tens of thousands). Both features saturate at
 // 24h once an account is at least that old/that far from a paid upgrade,
 // which is exactly the design's own suggested treatment.
@@ -51,7 +52,7 @@ const (
 // meaningful past this point" ceiling of its own.
 const selfSendBeforeExternalCap = 2
 
-// firstDayDistinctDomainsLogScale scales first_day_distinct_domains'
+// firstDayDistinctDomainsLogScale scales email.first_day_distinct_domains'
 // log1p(n) curve (D2 round 3) so that n=10 reproduces EXACTLY the
 // contribution R1 round 2's hard cap of 10 gave it — chosen so
 // config/local_weights.yaml's weight for this feature didn't need to
@@ -67,40 +68,16 @@ const selfSendBeforeExternalCap = 2
 // zero.
 var firstDayDistinctDomainsLogScale = 10 / math.Log1p(10)
 
-// Names is the ordered, canonical list of every v0 feature Extract
-// computes — matching design §4.5's new_account_velocity inputs list
-// exactly. cmd/abusekit builds its FeatureSet from this (not a
-// hand-copied literal) so the registered feature names and what Extract
-// actually computes can never drift apart. Order doesn't affect scoring
-// (internal/core.Plan/Combine only ever look features up by name via
-// Features.Map) but is fixed for deterministic iteration/output.
-var Names = []string{
-	"subject_age_h",
-	"resource_velocity_1h",
-	"resource_total",
-	"key_velocity_1h",
-	"key_total",
-	"upgrade_delay_min",
-	"upgraded",
-	"declines_before_first_success",
-	"first_funding_prepaid",
-	"name_brand_match",
-	"name_has_at",
-	"first_day_distinct_domains",
-	"self_send_before_external",
-	"linked_deleted_n",
-	"linked_labelled_abusive_n",
-	"fingerprint_seen_on_other_subjects",
-	"neighbors_truncated",
-	"burst_ratio_24h_vs_lifetime",
-	"sends_10m_max",
-	"sends_1h",
-	"sends_first_day",
-	"webmail_recipient_share",
-	"webmail_sends_1h",
-	"distinct_recipients_1h",
-	"subject_brand_match",
-}
+// KeySpace names the serialized feature contract. Registry order preserves the
+// legacy local scorer's arithmetic independently of feature spelling.
+const KeySpace = registry.KeySpace
+
+type FeatureDef = registry.FeatureDef
+
+var Names = registry.Names()
+
+func Definitions() []FeatureDef      { return registry.Definitions() }
+func HashQuanta() map[string]float64 { return registry.HashQuanta() }
 
 // Features is one subject's v0 feature vector (design §4.5), as of the
 // instant a Windows value fixes. A subject with no events yet is the zero
@@ -110,7 +87,7 @@ type Features struct {
 	// Windows.Now, floored at 0 (a clock-skewed event slightly in the
 	// future would otherwise make this negative) and capped at
 	// subjectAgeClampHours (B5: an old account must not swamp the linear
-	// model through this feature alone — burst_ratio_24h_vs_lifetime is
+	// model through this feature alone — core.burst_ratio_24h_vs_lifetime is
 	// what actually distinguishes "old and quiet" from "old and just
 	// burst").
 	SubjectAgeH float64
@@ -201,7 +178,7 @@ type Features struct {
 	// NeighborsTruncated is 1 when the same-tenant neighbour discovery
 	// backing the linked_* features above hit design §4.2's fan-in cap (S1
 	// fix round: the design explicitly calls for surfacing this as a
-	// feature — "neighbors_truncated=true (a feature)" — rather than
+	// feature — "core.neighbors_truncated=true (a feature)" — rather than
 	// silently under-counting evidence when a link key fans out wide).
 	NeighborsTruncated float64
 	// BurstRatio24hVsLifetime is the fraction of the subject's lifetime
@@ -274,31 +251,31 @@ type Features struct {
 // Combine consume (via a rule's `inputs` selecting a subset by name).
 func (f Features) Map() map[string]float64 {
 	return map[string]float64{
-		"subject_age_h":                      f.SubjectAgeH,
-		"resource_velocity_1h":               f.ResourceVelocity1h,
-		"resource_total":                     f.ResourceTotal,
-		"key_velocity_1h":                    f.KeyVelocity1h,
-		"key_total":                          f.KeyTotal,
-		"upgrade_delay_min":                  f.UpgradeDelayMin,
-		"upgraded":                           f.Upgraded,
-		"declines_before_first_success":      f.DeclinesBeforeFirstSuccess,
-		"first_funding_prepaid":              f.FirstFundingPrepaid,
-		"name_brand_match":                   f.NameBrandMatch,
-		"name_has_at":                        f.NameHasAt,
-		"first_day_distinct_domains":         f.FirstDayDistinctDomains,
-		"self_send_before_external":          f.SelfSendBeforeExternal,
-		"linked_deleted_n":                   f.LinkedDeletedN,
-		"linked_labelled_abusive_n":          f.LinkedLabelledAbusiveN,
-		"fingerprint_seen_on_other_subjects": f.FingerprintSeenOnOtherSubjects,
-		"neighbors_truncated":                f.NeighborsTruncated,
-		"burst_ratio_24h_vs_lifetime":        f.BurstRatio24hVsLifetime,
-		"sends_10m_max":                      f.Sends10mMax,
-		"sends_1h":                           f.Sends1h,
-		"sends_first_day":                    f.SendsFirstDay,
-		"webmail_recipient_share":            f.WebmailRecipientShare,
-		"webmail_sends_1h":                   f.WebmailSends1h,
-		"distinct_recipients_1h":             f.DistinctRecipients1h,
-		"subject_brand_match":                f.SubjectBrandMatch,
+		"core.subject_age_h":                      f.SubjectAgeH,
+		"core.resource_velocity_1h":               f.ResourceVelocity1h,
+		"core.resource_total":                     f.ResourceTotal,
+		"core.credential_velocity_1h":             f.KeyVelocity1h,
+		"core.credential_total":                   f.KeyTotal,
+		"core.upgrade_delay_min":                  f.UpgradeDelayMin,
+		"core.upgraded":                           f.Upgraded,
+		"core.declines_before_first_success":      f.DeclinesBeforeFirstSuccess,
+		"core.first_funding_prepaid":              f.FirstFundingPrepaid,
+		"brand.name_match":                        f.NameBrandMatch,
+		"brand.name_has_at":                       f.NameHasAt,
+		"email.first_day_distinct_domains":        f.FirstDayDistinctDomains,
+		"email.self_send_before_external":         f.SelfSendBeforeExternal,
+		"core.linked_deleted_n":                   f.LinkedDeletedN,
+		"core.linked_labelled_abusive_n":          f.LinkedLabelledAbusiveN,
+		"core.fingerprint_seen_on_other_subjects": f.FingerprintSeenOnOtherSubjects,
+		"core.neighbors_truncated":                f.NeighborsTruncated,
+		"core.burst_ratio_24h_vs_lifetime":        f.BurstRatio24hVsLifetime,
+		"email.sends_10m_max":                     f.Sends10mMax,
+		"email.sends_1h":                          f.Sends1h,
+		"email.sends_first_day":                   f.SendsFirstDay,
+		"email.webmail_recipient_share":           f.WebmailRecipientShare,
+		"email.webmail_sends_1h":                  f.WebmailSends1h,
+		"email.distinct_recipients_1h":            f.DistinctRecipients1h,
+		"email.subject_brand_match":               f.SubjectBrandMatch,
 	}
 }
 
@@ -399,9 +376,9 @@ type Result struct {
 //
 // neighbors nil is treated as NoNeighbors, a convenience for a caller (or
 // test) that doesn't care about the linked_* features. brands' zero value
-// (BrandSet{}) holds name_brand_match/subject_brand_match at 0; webmail's
-// zero value (WebmailSet{}) holds webmail_recipient_share/
-// webmail_sends_1h at 0 (S2b).
+// (BrandSet{}) holds brand.name_match/email.subject_brand_match at 0; webmail's
+// zero value (WebmailSet{}) holds email.webmail_recipient_share/
+// email.webmail_sends_1h at 0 (S2b).
 func Extract(ctx context.Context, tenant, subject string, events []event.Event, neighbors Neighbors, windows Windows, brands BrandSet, webmail WebmailSet) (Result, error) {
 	if windows.Now.IsZero() {
 		return Result{}, fmt.Errorf("feature: windows.Now must be set")
@@ -486,7 +463,7 @@ func boolToFloat(b bool) float64 {
 	return 0
 }
 
-// saturate caps n at max (S1 fix round: linked_deleted_n's saturating cap).
+// saturate caps n at max (S1 fix round: core.linked_deleted_n's saturating cap).
 func saturate(n, max int) float64 {
 	if n > max {
 		n = max

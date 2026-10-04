@@ -1,6 +1,6 @@
 # config/webmail.yaml — a PUBLIC list of major consumer webmail provider
 # domains (internal/feature.LoadWebmailFile, design §4.5), used only to
-# compute webmail_recipient_share and webmail_sends_1h.
+# compute email.webmail_recipient_share and email.webmail_sends_1h.
 #
 # This is deliberately a flat, public list of well-known free/consumer
 # email provider domain NAMES (gmail.com, outlook.com, ...) — the same

@@ -11,8 +11,8 @@ import (
 // parses and lands under SliceFull.
 func TestLoadSnapshotCorpus_Happy(t *testing.T) {
 	in := strings.NewReader(`
-{"id":"c1","input":{"features":{"subject_age_h":1.0}},"label":"benign","split":"train","source":"operator"}
-{"id":"c2","input":{"text":{"subject_line_skeleton":["hello"]}},"label":"abusive"}
+{"feature_key_space":"ns-v1","id":"c1","input":{"features":{"core.subject_age_h":1.0}},"label":"benign","split":"train","source":"operator"}
+{"feature_key_space":"ns-v1","id":"c2","input":{"text":{"subject_line_skeleton":["hello"]}},"label":"abusive"}
 `)
 	ds, rowErrs, err := LoadSnapshotCorpus(in)
 	if err != nil {
@@ -31,8 +31,8 @@ func TestLoadSnapshotCorpus_Happy(t *testing.T) {
 	if !ok {
 		t.Fatalf("subject 0 has no SliceFull point")
 	}
-	if pt.Features["subject_age_h"] != 1.0 {
-		t.Errorf("subject_age_h = %v, want 1.0", pt.Features["subject_age_h"])
+	if pt.Features["core.subject_age_h"] != 1.0 {
+		t.Errorf("core.subject_age_h = %v, want 1.0", pt.Features["core.subject_age_h"])
 	}
 }
 
@@ -41,14 +41,14 @@ func TestLoadSnapshotCorpus_Happy(t *testing.T) {
 // actually-bad line (task brief: "report per-row errors with the line
 // number").
 func TestLoadSnapshotCorpus_SchemaRejection(t *testing.T) {
-	in := strings.NewReader(`{"id":"ok","input":{"features":{"x":1}},"label":"benign"}
+	in := strings.NewReader(`{"feature_key_space":"ns-v1","id":"ok","input":{"features":{"custom.x":1}},"label":"benign"}
 not json at all
-{"id":"","input":{"features":{"x":1}},"label":"benign"}
-{"id":"dup","input":{"features":{"x":1}},"label":"benign"}
-{"id":"dup","input":{"features":{"x":1}},"label":"benign"}
-{"id":"nolabel","input":{"features":{"x":1}}}
-{"id":"badsplit","input":{"features":{"x":1}},"label":"benign","split":"bogus"}
-{"id":"empty","input":{},"label":"benign"}
+{"feature_key_space":"ns-v1","id":"","input":{"features":{"custom.x":1}},"label":"benign"}
+{"feature_key_space":"ns-v1","id":"dup","input":{"features":{"custom.x":1}},"label":"benign"}
+{"feature_key_space":"ns-v1","id":"dup","input":{"features":{"custom.x":1}},"label":"benign"}
+{"feature_key_space":"ns-v1","id":"nolabel","input":{"features":{"custom.x":1}}}
+{"feature_key_space":"ns-v1","id":"badsplit","input":{"features":{"custom.x":1}},"label":"benign","split":"bogus"}
+{"feature_key_space":"ns-v1","id":"empty","input":{},"label":"benign"}
 `)
 	_, rowErrs, err := LoadSnapshotCorpus(in)
 	if err == nil {

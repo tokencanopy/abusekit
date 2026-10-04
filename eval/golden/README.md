@@ -1,8 +1,8 @@
 # Exact scoring baseline
 
-`reference-flat.jsonl` (AMD64 with FMA), `reference-flat-amd64-no-fma.jsonl`,
-and `reference-flat-arm64.jsonl` are the
-P0 oracles for the generic-feature migration. Each is
+`reference-ns.jsonl` (AMD64 with FMA), `reference-ns-amd64-no-fma.jsonl`,
+and `reference-ns-arm64.jsonl` are the
+P1 oracles for the generic-feature migration. Each is
 built exclusively from the committed synthetic event fixtures: all root-level
 `eval/fixtures/*.jsonl` and `eval/fixtures/synthetic/events.jsonl`. Each file is an
 isolated replay world. No labels-file answer key, private dataset, database, or
@@ -13,16 +13,16 @@ Run from the repository root:
 ```sh
 go run ./cmd/abusekit eval --golden \
   --brands-extra eval/fixtures/test_brands.yaml \
-  --golden-check eval/golden/reference-flat.jsonl
+  --golden-check eval/golden/reference-ns.jsonl
 ```
 
-On ARM64, use `--golden-check eval/golden/reference-flat-arm64.jsonl`.
-On AMD64 without FMA, use `--golden-check eval/golden/reference-flat-amd64-no-fma.jsonl`.
+On ARM64, use `--golden-check eval/golden/reference-ns-arm64.jsonl`.
+On AMD64 without FMA, use `--golden-check eval/golden/reference-ns-amd64-no-fma.jsonl`.
 Set `GODEBUG=cpu.fma=off` before starting the process to exercise that math path.
 `go test ./eval` selects the reference from the executing CPU capabilities and performs the same comparison. A mismatch is a failure, not an
 instruction to regenerate. To propose an intentionally reviewed new oracle,
 replace `--golden-check` with `--out /tmp/candidate-golden.jsonl` and inspect the
-diff. Keep the flat oracle through P1; the renamed oracle is a separate file.
+diff. Keep both the flat and namespaced oracles through later slices.
 
 The baseline contains 8,671 points across 28 event fixtures plus the synthetic
 corpus. Every event (including historical label events) produces a fresh score
@@ -88,3 +88,17 @@ forced no-FMA, and ARM64. Profile metadata makes cross-profile checks fail.
 Every file retains exact bit comparison with no tolerance and no scorer changes.
 P1 must prove parity on all three profiles. Unknown profiles have no reference
 and fail instead of skipping. Keep the flat oracles through the migration.
+
+## P0-to-P1 migration proof
+
+The original `reference-flat*.jsonl` files remain byte-for-byte unchanged.
+`TestGoldenRenameParity` checks all three against `reference-ns*.jsonl`, using
+an explicit test-only rename map. Only feature keys, input hashes, and local
+scorer versions may change. Every feature value, risk, score, timer, tier and
+flag must remain bit-exact. Native replay then separately checks the renamed
+oracle; hashes and versions cannot drift after P1.
+
+The namespaced files were constructed by preserving each P0 profile's numeric
+values, renaming keys, and recording the new hashes/versions from the ARM64
+replay (those identities depend only on the identical feature maps). CI runs
+native replay on all three profiles to verify those files independently.

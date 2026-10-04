@@ -491,6 +491,19 @@ Revision 2's 1e-12 tolerance and cut-point proximity check are deleted.
   `feature.KeySpace == "ns-v1"`. The hosted deploy (S8) always sets that variable, so a pre-rename
   binary can't be deployed.
 
+**P1 implementation (2026-10-04).** The pure metadata registry lives in
+`internal/feature/registry`, avoiding a storage/extraction import cycle. P1 uses
+`FeatureDef.Name`, `Order`, and `HashQuantum`; the remaining pack metadata is
+introduced with the pack engine. `core.Vector` carries raw values and explicit
+hash quanta. The migration has no runtime translation table: legacy names are
+recognized only to return a replacement-name error; the SQL mapping is temporary
+and the parity mapping is test-only. Stored corpus keys are migrated atomically,
+with unknown flat keys and collisions failing closed. Existing reason text stays
+version 1; new and reused reasons carry their original version through storage
+and the Go client. P0's three files remain immutable; `reference-ns*.jsonl` adds
+the corresponding P1 references and `TestGoldenRenameParity` verifies the allowed
+changes. This slice neither enables hosted deployment nor implements P1s/P2.
+
 ### 5.3 Name grammar
 
 - **Features:** `^[a-z][a-z0-9]*\.[a-z][a-z0-9_]{0,55}$`.

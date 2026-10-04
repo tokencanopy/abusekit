@@ -33,7 +33,7 @@ func TestScoreSubject_SkipInputUnchangedAvoidsRecallingScorer(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// Round 1: dirty_seq=1, input is whatever subject_age_h computes to at
+	// Round 1: dirty_seq=1, input is whatever core.subject_age_h computes to at
 	// `now` — the scorer is called once.
 	d := store.DirtySubject{Tenant: testTenant, Subject: "acct_skip_unchanged", DirtySeq: 1, CurrentTier: "unknown"}
 	if _, err := w.scoreSubject(ctx, d, now); err != nil {
@@ -43,7 +43,7 @@ func TestScoreSubject_SkipInputUnchangedAvoidsRecallingScorer(t *testing.T) {
 		t.Fatalf("round 1: scorer called %d times, want 1", calls)
 	}
 
-	// Round 2: SAME now (so subject_age_h, the rule's only input, is
+	// Round 2: SAME now (so core.subject_age_h, the rule's only input, is
 	// byte-identical) and the SAME dirty_seq (simulating a rescore-at tick
 	// with no new event) — Plan should mark this input_unchanged, so the
 	// scorer must NOT be called again.
@@ -68,7 +68,7 @@ func TestScoreSubject_SkipInputUnchangedAvoidsRecallingScorer(t *testing.T) {
 		t.Errorf("reused risk = %v, want %v (identical to round 1's)", view.Signals[0].Risk, wantRisk)
 	}
 
-	// Round 3: a genuinely different `now` (input changes: subject_age_h
+	// Round 3: a genuinely different `now` (input changes: core.subject_age_h
 	// grows) must call the scorer again.
 	now2 := now.Add(time.Hour)
 	d2 := store.DirtySubject{Tenant: testTenant, Subject: "acct_skip_unchanged", DirtySeq: 1, CurrentTier: "unknown"}

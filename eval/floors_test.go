@@ -89,7 +89,7 @@ func TestFloors_For(t *testing.T) {
 // gate fail." Runs eval.Run twice against the real committed synthetic
 // corpus (the same one `make gate` scores) — once with the shipped
 // config/local_weights.yaml (must clear every floor in the shipped
-// eval/floors.yaml) and once with name_brand_match zeroed out in an
+// eval/floors.yaml) and once with brand.name_match zeroed out in an
 // otherwise-identical copy of those weights (must violate at least one
 // floor). This is a Go-level equivalent of `make gate`'s own shell
 // command, not a re-implementation of it — see Makefile's gate target
@@ -126,10 +126,10 @@ func TestGate_WeightRegressionFailsFloors(t *testing.T) {
 	for k, v := range baselineWeights.Weight {
 		mutatedWeights.Weight[k] = v
 	}
-	if _, ok := mutatedWeights.Weight["name_brand_match"]; !ok {
-		t.Fatalf("config/local_weights.yaml has no name_brand_match weight to mutate — this test needs updating")
+	if _, ok := mutatedWeights.Weight["brand.name_match"]; !ok {
+		t.Fatalf("config/local_weights.yaml has no brand.name_match weight to mutate — this test needs updating")
 	}
-	mutatedWeights.Weight["name_brand_match"] = 0 // the deliberate regression
+	mutatedWeights.Weight["brand.name_match"] = 0 // the deliberate regression
 
 	mutatedScorer, err := local.New(mutatedWeights)
 	if err != nil {
@@ -141,14 +141,14 @@ func TestGate_WeightRegressionFailsFloors(t *testing.T) {
 	}
 	violations := entry.Check(mutatedRun.Metrics)
 	if len(violations) == 0 {
-		t.Fatalf("zeroing name_brand_match did not violate any floor (baseline=%+v, mutated=%+v) — either the corpus doesn't exercise this weight, or the floors have too much slack",
+		t.Fatalf("zeroing brand.name_match did not violate any floor (baseline=%+v, mutated=%+v) — either the corpus doesn't exercise this weight, or the floors have too much slack",
 			baselineRun.Metrics.Threshold, mutatedRun.Metrics.Threshold)
 	}
 	t.Logf("mutated-weight run correctly failed the gate: %v", violations)
 }
 
 // TestGate_NegativeWeightRegressionCaughtByTightECEFloor is fix round
-// T3's own acceptance test: subject_age_h and upgrade_delay_min are both
+// T3's own acceptance test: core.subject_age_h and core.upgrade_delay_min are both
 // NEGATIVE-signed weights, so zeroing either one can only ever move
 // recall/high-tier-recall UP, never down — no minimum-recall-shaped
 // floor can catch either going missing. Only ECE (and, in principle,
@@ -168,7 +168,7 @@ func TestGate_NegativeWeightRegressionCaughtByTightECEFloor(t *testing.T) {
 	}
 	baselineWeights := loadShippedLocalWeights(t)
 
-	for _, weightName := range []string{"subject_age_h", "upgrade_delay_min"} {
+	for _, weightName := range []string{"core.subject_age_h", "core.upgrade_delay_min"} {
 		t.Run(weightName, func(t *testing.T) {
 			mutated := baselineWeights
 			mutated.Weight = make(map[string]float64, len(baselineWeights.Weight))

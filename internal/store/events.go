@@ -77,9 +77,9 @@ func (s *Store) AppendEvents(ctx context.Context, tenant, producer string, event
 	// permanentDeletions collects subjects whose PERMANENT subject.deleted
 	// event lands in this batch (S2 fix round): after commit, their
 	// same-tenant neighbours get PropagateToNeighbors'd so
-	// linked_deleted_n's now-stale evidence gets rescored. Only "permanent"
+	// core.linked_deleted_n's now-stale evidence gets rescored. Only "permanent"
 	// (N3 fix round) — a trash-mode deletion doesn't change
-	// linked_deleted_n at all (see NeighborOutcomes), so it has nothing to
+	// core.linked_deleted_n at all (see NeighborOutcomes), so it has nothing to
 	// propagate.
 	var permanentDeletions []string
 	for i, e := range events {

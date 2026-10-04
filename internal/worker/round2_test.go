@@ -15,10 +15,10 @@ import (
 // TestScoreSubject_AgeDriftAloneReusesResultAcrossRounds is R7 round 2's
 // integration-level proof, exercising the real store/worker wiring (not
 // just internal/core's pure inputHash unit test): a subject whose ONLY
-// input to a rule is subject_age_h, rescored repeatedly with no new event
+// input to a rule is core.subject_age_h, rescored repeatedly with no new event
 // at all — only elapsed time passing — must call the scorer at most twice
 // across 10 rounds (once at the start, and at most once more when
-// subject_age_h happens to cross into the next hour bucket partway
+// core.subject_age_h happens to cross into the next hour bucket partway
 // through), not once per round.
 //
 // scoreSubject is called directly (bypassing ClaimDirtySubjects'
@@ -54,7 +54,7 @@ func TestScoreSubject_AgeDriftAloneReusesResultAcrossRounds(t *testing.T) {
 	}
 	d := dirty[0]
 
-	// baseNow: subject_age_h starts at 5.0 (comfortably under the 24h
+	// baseNow: core.subject_age_h starts at 5.0 (comfortably under the 24h
 	// clamp, so it keeps drifting rather than sitting still). 10 rounds, 8
 	// minutes apart, span 72 minutes — enough to cross from hour-bucket 5
 	// into hour-bucket 6 partway through, matching R7's own "<=2 calls"
@@ -87,7 +87,7 @@ func TestScoreSubject_AgeDriftAloneReusesResultAcrossRounds(t *testing.T) {
 // "unchanged, reuse it" once a rule's backoff clears — the round that
 // produced that hash never actually answered, so there is nothing valid
 // to reuse. Before worker.go's fix (only a "scored" LatestVerdict feeds
-// RuleState.LastInputHash), a still-quantization-stable subject_age_h
+// RuleState.LastInputHash), a still-quantization-stable core.subject_age_h
 // made a past-backoff rule silently skip retrying forever, stuck on the
 // same recorded error.
 func TestScoreSubject_ErroredRoundNeverSkipsAsInputUnchanged(t *testing.T) {
@@ -118,7 +118,7 @@ func TestScoreSubject_ErroredRoundNeverSkipsAsInputUnchanged(t *testing.T) {
 	}
 	d := dirty[0]
 
-	// now1: subject_age_h ~= 5.0h. now2: ~5.001h later, well past the 30s
+	// now1: core.subject_age_h ~= 5.0h. now2: ~5.001h later, well past the 30s
 	// rule backoff schedule but still inside the SAME 1-hour hash bucket —
 	// exactly the case R7's quantization makes common.
 	now1 := created.Add(5 * time.Hour)

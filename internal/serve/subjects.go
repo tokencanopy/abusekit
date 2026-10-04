@@ -18,16 +18,17 @@ import (
 )
 
 type wireSignal struct {
-	Rule        string   `json:"rule"`
-	Mode        string   `json:"mode,omitempty"`
-	Status      string   `json:"status"`
-	Risk        *float64 `json:"risk,omitempty"`
-	Flagged     *bool    `json:"flagged,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Checkpoint  string   `json:"checkpoint,omitempty"`
-	Calibration string   `json:"calibration,omitempty"`
-	Reason      string   `json:"reason,omitempty"`
-	ErrorCode   string   `json:"error_code,omitempty"`
+	Rule          string   `json:"rule"`
+	Mode          string   `json:"mode,omitempty"`
+	Status        string   `json:"status"`
+	Risk          *float64 `json:"risk,omitempty"`
+	Flagged       *bool    `json:"flagged,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	Checkpoint    string   `json:"checkpoint,omitempty"`
+	Calibration   string   `json:"calibration,omitempty"`
+	Reason        string   `json:"reason,omitempty"`
+	ReasonVersion int      `json:"reason_version,omitempty"`
+	ErrorCode     string   `json:"error_code,omitempty"`
 }
 
 type wireSubject struct {
@@ -58,6 +59,7 @@ func signalFromStoreSignal(sig store.SubjectSignal) wireSignal {
 		ws.Checkpoint = sig.Checkpoint
 		ws.Calibration = sig.Calibration
 		ws.Reason = sig.Reason
+		ws.ReasonVersion = sig.ReasonVersion
 	}
 	return ws
 }

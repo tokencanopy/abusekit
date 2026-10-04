@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
+	"io"
 	"os"
 	"strings"
 
@@ -21,8 +23,9 @@ import (
 // (design §4.6) minus the label/split/source/meta bookkeeping fields —
 // score is a raw scoring pipe, not an evaluation.
 type scoreRow struct {
-	ID    string `json:"id"`
-	Input struct {
+	FeatureKeySpace string `json:"feature_key_space,omitempty"`
+	ID              string `json:"id"`
+	Input           struct {
 		Features map[string]float64  `json:"features"`
 		Text     map[string][]string `json:"text"`
 		Context  string              `json:"context"`
@@ -157,8 +160,18 @@ func readScoreRows(r *os.File) ([]scoreRow, error) {
 		if err := dec.Decode(&row); err != nil {
 			return nil, fmt.Errorf("stdin:%d: invalid JSON or unknown field: %w", line, err)
 		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			return nil, fmt.Errorf("stdin:%d: expected exactly one JSON value per line", line)
+		}
+
 		if row.ID == "" {
 			return nil, fmt.Errorf("stdin:%d: id is required", line)
+		}
+		if row.FeatureKeySpace != "" && row.FeatureKeySpace != registry.KeySpace {
+			return nil, fmt.Errorf("stdin:%d: feature_key_space must be %s", line, registry.KeySpace)
+		}
+		if err := registry.ValidateKeys(row.Input.Features); err != nil {
+			return nil, fmt.Errorf("stdin:%d: %w", line, err)
 		}
 		rows = append(rows, row)
 	}

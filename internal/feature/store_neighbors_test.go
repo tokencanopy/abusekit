@@ -239,7 +239,7 @@ func TestStoreNeighbors_FingerprintSharedIsCardSpecific(t *testing.T) {
 
 func TestStoreNeighbors_UAHashExcludedByDefault(t *testing.T) {
 	// S1 fix round, proven: a shared ua_hash ALONE (the same email client or
-	// SDK — extremely common) previously produced linked_deleted_n=1 for a
+	// SDK — extremely common) previously produced core.linked_deleted_n=1 for a
 	// totally unrelated subject.
 	s := newTestStore(t)
 	ctx := context.Background()

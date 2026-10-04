@@ -275,7 +275,7 @@ func TestInsertCorpusExample_RoundTrips(t *testing.T) {
 		LabelID:    labelID,
 		DecisionAt: now,
 		EventSlice: []map[string]any{{"id": "e1", "type": "subject.created"}},
-		Features:   map[string]float64{"subject_age_h": 0, "resource_total": 1},
+		Features:   map[string]float64{"core.subject_age_h": 0, "core.resource_total": 1},
 		Split:      "train",
 	})
 	if err != nil {
@@ -303,7 +303,7 @@ func TestListCorpusExamples_JoinsLabelAndFiltersSplit(t *testing.T) {
 	if _, err := s.InsertCorpusExample(ctx, testTenant, store.CorpusExample{
 		Subject: "acct_corpus_train", LabelID: trainLabelID, DecisionAt: now,
 		EventSlice: []map[string]any{{"id": "e1", "type": "subject.created"}},
-		Features:   map[string]float64{"subject_age_h": 0},
+		Features:   map[string]float64{"core.subject_age_h": 0},
 		Split:      "train",
 	}); err != nil {
 		t.Fatalf("InsertCorpusExample(train): %v", err)
@@ -317,7 +317,7 @@ func TestListCorpusExamples_JoinsLabelAndFiltersSplit(t *testing.T) {
 	if _, err := s.InsertCorpusExample(ctx, testTenant, store.CorpusExample{
 		Subject: "acct_corpus_test", LabelID: testLabelID, DecisionAt: now,
 		EventSlice: []map[string]any{{"id": "e2", "type": "subject.created"}},
-		Features:   map[string]float64{"subject_age_h": 1},
+		Features:   map[string]float64{"core.subject_age_h": 1},
 		Split:      "test",
 	}); err != nil {
 		t.Fatalf("InsertCorpusExample(test): %v", err)

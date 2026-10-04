@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"sort"
 	"strings"
 	"time"
@@ -103,7 +104,7 @@ type Subject struct {
 	// round T2, `--skip-invalid`'s own follow-up bug: scoring the subject
 	// anyway, on whatever events DID survive, would silently score a
 	// PARTIAL history — e.g. a dropped payment.attempt or resource.
-	// created changing declines_before_first_success/resource_total
+	// created changing core.declines_before_first_success/core.resource_total
 	// without anyone knowing). Run treats this unconditionally as
 	// unscored with ErrorCode "skipped_events", regardless of which slice
 	// is requested or whether that slice's Point would otherwise have
@@ -214,6 +215,7 @@ func (o Options) now() time.Time {
 // deterministic given the same Dataset/Rule/Scorer/Options except `At`,
 // which is why determinism_test.go compares two runs with At zeroed out.
 type Manifest struct {
+	FeatureKeySpace string `json:"feature_key_space"`
 	// SchemaVersion identifies run.json's own top-level shape (fix round
 	// S5) — bump it whenever a field is renamed/removed/retyped (an
 	// addition alone doesn't need a bump, per the repo's own additive-
@@ -443,6 +445,7 @@ func Run(ctx context.Context, dataset Dataset, rule config.Rule, scorer model.Sc
 	}
 
 	manifest := Manifest{
+		FeatureKeySpace:    registry.KeySpace,
 		SchemaVersion:      SchemaVersion,
 		AbusekitVersion:    AbusekitVersion,
 		GitSHA:             gitSHA(),

@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"math"
 	"sort"
 
@@ -26,7 +27,7 @@ import (
 // Version is recorded as ScoreResult.Checkpoint so a verdict pins exactly
 // which weight set produced it. Bump it whenever Weights.Version changes
 // in a shipped config/local_weights.yaml.
-const defaultCheckpoint = "v1"
+const defaultCheckpoint = "v2"
 
 // Weights is the local scorer's logistic model, loaded from
 // config/local_weights.yaml. Every field here is a v0 placeholder: hand-
@@ -81,7 +82,7 @@ func (w Weights) Validate() error {
 type Scorer struct {
 	weights    Weights
 	checkpoint string
-	// sortedFeatures is s.weights.Weight's keys, sorted once at
+	// sortedFeatures is s.weights.Weight's keys in registry order, fixed at
 	// construction (S10): Score must sum weight*feature in a fixed order
 	// — ranging over the map directly is non-deterministic (Go
 	// deliberately randomizes map iteration order, even across repeated
@@ -108,7 +109,7 @@ func New(w Weights) (*Scorer, error) {
 	for f := range w.Weight {
 		sortedFeatures = append(sortedFeatures, f)
 	}
-	sort.Strings(sortedFeatures)
+	sort.Slice(sortedFeatures, func(i, j int) bool { return registry.Less(sortedFeatures[i], sortedFeatures[j]) })
 	return &Scorer{weights: w, checkpoint: cp, sortedFeatures: sortedFeatures}, nil
 }
 

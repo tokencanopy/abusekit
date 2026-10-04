@@ -22,9 +22,9 @@ func goldenArgs(t *testing.T, extra ...string) []string {
 
 func TestGoldenLastBitWeightMutationFails(t *testing.T) {
 	root := repoRoot(t)
-	referenceName := "reference-flat.jsonl"
+	referenceName := "reference-ns.jsonl"
 	if profile := eval.GoldenProfile(); profile != "amd64-fma" {
-		referenceName = "reference-flat-" + profile + ".jsonl"
+		referenceName = "reference-ns-" + profile + ".jsonl"
 	}
 	reference := filepath.Join(root, "eval", "golden", referenceName)
 	if err := runEval(goldenArgs(t, "--golden-check", reference)); err != nil {
@@ -35,12 +35,12 @@ func TestGoldenLastBitWeightMutationFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	old := w.Weight["resource_velocity_1h"]
+	old := w.Weight["core.resource_velocity_1h"]
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	changed := strings.Replace(string(raw), "resource_velocity_1h: "+strconv.FormatFloat(old, 'g', -1, 64), "resource_velocity_1h: "+strconv.FormatFloat(math.Float64frombits(math.Float64bits(old)^1), 'g', -1, 64), 1)
+	changed := strings.Replace(string(raw), "core.resource_velocity_1h: "+strconv.FormatFloat(old, 'g', -1, 64), "core.resource_velocity_1h: "+strconv.FormatFloat(math.Float64frombits(math.Float64bits(old)^1), 'g', -1, 64), 1)
 	if changed == string(raw) {
 		t.Fatal("test did not mutate weight")
 	}

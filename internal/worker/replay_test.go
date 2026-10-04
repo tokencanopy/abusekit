@@ -163,7 +163,7 @@ func TestReplay_ReferenceOperatorReachesHigh(t *testing.T) {
 
 // TestReplay_BenignTransactionalStaysLow replays eval/fixtures/
 // benign_transactional.jsonl — an ordinary customer account with a slow
-// (but real — B5 fix round: `upgraded` must not fire risk on its own)
+// (but real — B5 fix round: `core.upgraded` must not fire risk on its own)
 // upgrade, no self-send rehearsal, no brand-like names, and sends outside
 // the first day — and asserts it stays at tier "low".
 func TestReplay_BenignTransactionalStaysLow(t *testing.T) {
@@ -231,7 +231,7 @@ func TestReplay_BurstFinalTierHigh(t *testing.T) {
 // 3 agents + 1 key in 10 minutes, one self-send, one external send, no
 // payment at all — previously scored 0.925, tier high) and asserts it now
 // stays below high. Upper edge widened to 0.45 (D2 round 3): switching
-// first_day_distinct_domains from a hard cap to a log1p curve anchored at
+// email.first_day_distinct_domains from a hard cap to a log1p curve anchored at
 // n=10 (see internal/feature.firstDayDistinctDomainsLogScale) makes a
 // SMALL domain count (this fixture's) contribute MORE than the old
 // literal-count formula did — log1p is concave, so it sits above the
@@ -251,7 +251,7 @@ func TestReplay_BenignFastOnboardingStaysBelowHigh(t *testing.T) {
 // named after real SaaS integrations in the first hour, no payment,
 // previously scored 0.912, tier high) and asserts it now stays below high
 // — in particular that none of "Stripe Webhook Relay"/"Google Calendar
-// Sync"/"Microsoft Teams Relay" trip name_brand_match (S3 fix round: those
+// Sync"/"Microsoft Teams Relay" trip brand.name_match (S3 fix round: those
 // generic single-word brands are excluded from config/brands.yaml).
 func TestReplay_BenignIntegrationHeavyStaysBelowHigh(t *testing.T) {
 	view := runReplay(t, "benign_integration_heavy.jsonl", "acct_example_integration_heavy_1")
@@ -305,20 +305,20 @@ func TestReplay_SelfSendOnlyStaysBelowHigh(t *testing.T) {
 // benign_receipts_fanout.jsonl — R1 round 2, proven: a day-1 receipts
 // account (1 agent) fanning out to 30 distinct, genuinely external
 // customer domains previously scored 0.9634 (tier high) on
-// first_day_distinct_domains alone; R1's hard cap brought it down to
+// email.first_day_distinct_domains alone; R1's hard cap brought it down to
 // ~0.15, and D2 round 3's log1p replacement (still anchored so n=10 gives
 // the same contribution the old cap did) leaves it at ~0.34.
 //
 // Round 2's R1 fix round widened the upper edge of this band from 0.4 to
 // 0.55: this fixture, like dormant_then_blast, has NO prior sending
-// history, so sends_10m_max/sends_1h/distinct_recipients_1h's new
+// history, so email.sends_10m_max/email.sends_1h/email.distinct_recipients_1h's new
 // burst_factor reads its 30-recipient, 1-hour fan-out at close to full
 // strength too — the SAME history-relative measure that (correctly)
 // carries dormant_then_blast to `high` on a much larger, more
 // concentrated burst also pushes this smaller, more spread-out one from
 // `low` into low `medium`. Documented trade-off, not a fixture
 // regression: this fixture's own defining shape (30 recipients spread
-// across a full hour, one legitimate account) keeps its sends_10m_max far
+// across a full hour, one legitimate account) keeps its email.sends_10m_max far
 // below dormant_then_blast's (a burst concentrated into 10 minutes), so
 // it still lands clearly short of `high` — the qualitative claim this
 // test exists to protect.
@@ -358,7 +358,7 @@ func TestReplay_VariantAStaysBelowHigh(t *testing.T) {
 // (recipient_is_own_identity=true, 10 sends, no external send ever)
 // previously scored 0.9880 (tier high) — from TWO compounding causes: the
 // pre-R6 brand matcher had no integration-token exclusion at all (so
-// "PayPal integration" tripped name_brand_match), AND
+// "PayPal integration" tripped brand.name_match), AND
 // selfSendBeforeExternal was uncapped. Both are now fixed independently
 // (R6's BrandSet.Matches integration-token gate; R1's cap here) — this
 // fixture proves the COMBINATION resolves too, not just either fix in
@@ -382,7 +382,7 @@ func TestReplay_SelfSendBrandNameStaysBelowHigh(t *testing.T) {
 // Round 2's R1 fix round raised the band from medium-sized ([0.55, 0.85])
 // to this: with no prior sending history at all, burst_factor now reads
 // this 100-in-10-minutes burst at close to full strength on BOTH
-// sends_10m_max and webmail_sends_1h at once (the account's single
+// email.sends_10m_max and email.webmail_sends_1h at once (the account's single
 // webmail domain means every one of these new weights fires together,
 // unlike a fixture that splits its volume across webmail and non-webmail
 // recipients) — the qualitative claim ("at least medium") still holds
@@ -441,7 +441,7 @@ func TestReplay_EstablishedNewsletterStaysBelowMedium(t *testing.T) {
 // its first hour — a plausible day-0 legitimate marketplace seller as
 // much as a suspicious blast. Also exercises S2 in a realistic combined
 // scenario: the agent's own name already matches "Fictashop"
-// (name_brand_match=1), so subject_brand_match must NOT also credit the
+// (brand.name_match=1), so email.subject_brand_match must NOT also credit the
 // identical brand mentioned in every subject line. Must stay below tier
 // "high".
 func TestReplay_Day0MarketplaceSellerStaysBelowHigh(t *testing.T) {
@@ -492,13 +492,13 @@ func TestReplay_PaidLaunch5dStaysBelowHigh(t *testing.T) {
 
 // TestReplay_WebmailSpread1hMediumBand replays eval/fixtures/
 // webmail_spread_1h.jsonl — round 2's R6: a fixture that isolates
-// webmail_sends_1h from sends_10m_max specifically, so the mutation
-// sweep can prove webmail_sends_1h load-bearing on its own (see
+// email.webmail_sends_1h from email.sends_10m_max specifically, so the mutation
+// sweep can prove email.webmail_sends_1h load-bearing on its own (see
 // mutation_test.go's "webmail_spread_1h" scenario). 80 webmail
 // recipients spread evenly across a full hour (8-minute intervals) —
 // deliberately NOT concentrated into any 10-minute window the way
-// webmail_blast's burst is, so sends_10m_max stays modest (20) while
-// webmail_sends_1h/sends_1h/distinct_recipients_1h (80 each) carry most
+// webmail_blast's burst is, so email.sends_10m_max stays modest (20) while
+// email.webmail_sends_1h/email.sends_1h/email.distinct_recipients_1h (80 each) carry most
 // of the signal.
 func TestReplay_WebmailSpread1hMediumBand(t *testing.T) {
 	view := runReplay(t, "webmail_spread_1h.jsonl", "acct_example_webmail_spread_1")
@@ -528,7 +528,7 @@ func TestReplay_WebmailSpread1hMediumBand(t *testing.T) {
 // burst of comparable size, and a subject line that matches a curated
 // brand. R1's blocker-level outcomes (a calendar-evadable dormant
 // account must still reach `high` on volume alone, an established
-// sender must not) require sends_10m_max/webmail_sends_1h to carry a
+// sender must not) require email.sends_10m_max/email.webmail_sends_1h to carry a
 // day-0, no-history burst most of the way to `high` by themselves —
 // weakening that weight to spare this fixture would also weaken
 // dormant_branded_burst_8d's own required outcome. This v0 feature set
@@ -579,14 +579,14 @@ func TestReplay_BrandColonCountryVariant20mReachesHigh(t *testing.T) {
 // webmail recipients) but spread thin — 15 recipients once per hour for 6
 // hours (90 total) — instead of concentrated into one burst.
 //
-// KNOWN GAP: this never reaches `high`, only `medium`. sends_10m_max and
-// webmail_sends_1h (this model's two most heavily-weighted volume
+// KNOWN GAP: this never reaches `high`, only `medium`. email.sends_10m_max and
+// email.webmail_sends_1h (this model's two most heavily-weighted volume
 // signals, and the ones single_brand_100_45m/brand_colon_country_variant_20m
 // above depend on) can only ever see ONE hour's worth (15) at any given
 // scoring instant — a "low and slow" sender that deliberately paces
 // itself below any single window's threshold is invisible to a
-// windowed-burst detector by construction. Only subject_brand_match (a
-// flat, non-volume signal) and the modest sends_1h/distinct_recipients_1h
+// windowed-burst detector by construction. Only email.subject_brand_match (a
+// flat, non-volume signal) and the modest email.sends_1h/email.distinct_recipients_1h
 // companions contribute here. Detecting a slow-drip campaign like this
 // would need a wider trailing window than any this v0 feature set reads,
 // or a feature that tracks total volume irrespective of concentration —
@@ -601,9 +601,9 @@ func TestReplay_SlowSenderKnownGap(t *testing.T) {
 
 // TestReplay_ModerateVolumeSingleBrandMediumBand replays eval/fixtures/
 // moderate_volume_single_brand.jsonl — round 2's R6: a real replay
-// fixture bounding subject_brand_match specifically (its volume alone,
+// fixture bounding email.subject_brand_match specifically (its volume alone,
 // 15 webmail recipients, is far too small to reach `high` on its own —
-// zeroing subject_brand_match's weight drops this fixture well outside
+// zeroing email.subject_brand_match's weight drops this fixture well outside
 // its band, proving the weight load-bearing on a REAL fixture, not only
 // a synthetic scenario).
 func TestReplay_ModerateVolumeSingleBrandMediumBand(t *testing.T) {
@@ -616,9 +616,9 @@ func TestReplay_ModerateVolumeSingleBrandMediumBand(t *testing.T) {
 
 // TestReplay_RepeatRecipientResendBand replays eval/fixtures/
 // repeat_recipient_resend.jsonl — round 2's R6: a real replay fixture
-// bounding sends_1h and distinct_recipients_1h with DIFFERENT values (the
-// same 5 recipients sent to twice within the hour: sends_1h sums to more
-// than distinct_recipients_1h's deduplicated count), so a wiring swap
+// bounding email.sends_1h and email.distinct_recipients_1h with DIFFERENT values (the
+// same 5 recipients sent to twice within the hour: email.sends_1h sums to more
+// than email.distinct_recipients_1h's deduplicated count), so a wiring swap
 // between the two would be caught here even though every OTHER committed
 // fixture happens to give them identical values.
 func TestReplay_RepeatRecipientResendBand(t *testing.T) {
@@ -632,8 +632,8 @@ func TestReplay_RepeatRecipientResendBand(t *testing.T) {
 // a short buffer") — round 2's R6: this fixture's burst happened
 // entirely within the subject's first day, but by the time this test
 // evaluates it, that burst is well past currentBurstWindow (24h), so
-// sends_10m_max/sends_1h/webmail_sends_1h/distinct_recipients_1h all read
-// 0 — only sends_first_day (a permanent fact, unaffected by how long ago
+// email.sends_10m_max/email.sends_1h/email.webmail_sends_1h/email.distinct_recipients_1h all read
+// 0 — only email.sends_first_day (a permanent fact, unaffected by how long ago
 // its own window closed) is non-zero, isolating it as a REAL fixture
 // rather than only a synthetic scenario.
 func TestReplay_FirstDayBurstThenQuietBand(t *testing.T) {
@@ -652,7 +652,7 @@ func TestReplay_FirstDayBurstThenQuietBand(t *testing.T) {
 // routinely sending ordinary product-update copy that happens to mention
 // a brand ("Our product now integrates with Glowbank Calendar" — not a
 // lure, and not a phrase any community/integration gate exempts) must not
-// get a PERMANENT subject_brand_match lift from that routine mention.
+// get a PERMANENT email.subject_brand_match lift from that routine mention.
 // ageDecayFactor discounts it to its 0.2 floor by this account's age, so
 // this fixture stays low.
 func TestReplay_EstablishedProductCopyBrandMentionStaysLow(t *testing.T) {
