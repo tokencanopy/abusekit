@@ -24,31 +24,31 @@ rules:
     mode: advise
     scorer: local
     inputs:
-      - subject_age_h
-      - resource_velocity_1h
-      - resource_total
-      - key_velocity_1h
-      - key_total
-      - upgrade_delay_min
-      - upgraded
-      - declines_before_first_success
-      - first_funding_prepaid
-      - name_brand_match
-      - name_has_at
-      - first_day_distinct_domains
-      - self_send_before_external
-      - linked_deleted_n
-      - linked_labelled_abusive_n
-      - fingerprint_seen_on_other_subjects
-      - neighbors_truncated
-      - burst_ratio_24h_vs_lifetime
-      - sends_10m_max
-      - sends_1h
-      - sends_first_day
-      - webmail_recipient_share
-      - webmail_sends_1h
-      - distinct_recipients_1h
-      - subject_brand_match
+      - core.subject_age_h
+      - core.resource_velocity_1h
+      - core.resource_total
+      - core.credential_velocity_1h
+      - core.credential_total
+      - core.upgrade_delay_min
+      - core.upgraded
+      - core.declines_before_first_success
+      - core.first_funding_prepaid
+      - brand.name_match
+      - brand.name_has_at
+      - email.first_day_distinct_domains
+      - email.self_send_before_external
+      - core.linked_deleted_n
+      - core.linked_labelled_abusive_n
+      - core.fingerprint_seen_on_other_subjects
+      - core.neighbors_truncated
+      - core.burst_ratio_24h_vs_lifetime
+      - email.sends_10m_max
+      - email.sends_1h
+      - email.sends_first_day
+      - email.webmail_recipient_share
+      - email.webmail_sends_1h
+      - email.distinct_recipients_1h
+      - email.subject_brand_match
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6

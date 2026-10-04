@@ -71,28 +71,28 @@
 #
 # min_high_tier_recall is 0.60, not baseline-minus-the-usual-margin
 # (0.7879 - ~0.09 would round to ~0.70). T5's original reasoning (a T5-era
-# corpus, n=54) found zeroing burst_ratio_24h_vs_lifetime,
-# first_day_distinct_domains, or linked_labelled_abusive_n each
+# corpus, n=54) found zeroing core.burst_ratio_24h_vs_lifetime,
+# email.first_day_distinct_domains, or core.linked_labelled_abusive_n each
 # independently moved this metric to the EXACT same value — that specific
 # three-way tie no longer holds against the S2b-merge corpus (n=66: the
 # same three zeros now give 0.7273 (48/66), 0.6970 (46/66), and 0.7121
 # (47/66) respectively — different corpus composition, no longer
 # coincidentally equal), but the underlying REASON 0.60 stays where it is
-# is unchanged: burst_ratio and linked_labelled_abusive_n are still the
+# is unchanged: burst_ratio and core.linked_labelled_abusive_n are still the
 # deliberately-NOT-gate-breaking weights from the original sweep (T3:
 # burst_ratio is an S5-calibration candidate with no weight change;
-# linked_labelled_abusive_n is real but not solely load-bearing yet), and
+# core.linked_labelled_abusive_n is real but not solely load-bearing yet), and
 # 0.60 sits safely below every one of those three zeroed values (a wider
 # margin than before, not a narrower one) while still catching the one
 # weight this corpus's floors CAN catch outright when zeroed:
-# resource_velocity_1h (0.5152, 34/66 — below 0.60). Honestly reported,
-# same as before: first_day_distinct_domains, self_send_before_external,
-# and linked_deleted_n are, this round too, not independently caught by
+# core.resource_velocity_1h (0.5152, 34/66 — below 0.60). Honestly reported,
+# same as before: email.first_day_distinct_domains, email.self_send_before_external,
+# and core.linked_deleted_n are, this round too, not independently caught by
 # ANY current floor when zeroed alone — a bigger abusive corpus, or a
-# mutation_test.go-style isolated scenario the way neighbors_truncated/
-# name_has_at already need, would restore it.
+# mutation_test.go-style isolated scenario the way core.neighbors_truncated/
+# brand.name_has_at already need, would restore it.
 #
-# A NEGATIVE-signed weight (subject_age_h, upgrade_delay_min) zeroed out
+# A NEGATIVE-signed weight (core.subject_age_h, core.upgrade_delay_min) zeroed out
 # can only ever move recall/high-tier-recall/family-recall UP, never
 # down — those floors are all one-sided minimums and structurally cannot
 # catch a negative weight going missing. Only precision and ECE can move
@@ -102,8 +102,8 @@
 # 0.0055 margin, not the wider ~0.02-0.04 margins used elsewhere in this
 # file) specifically so it — not min_precision, which doesn't move for
 # either of these two weights — is what catches them. Confirmed against
-# the S2b-merge corpus: zeroing subject_age_h (ECE 0.1509) or
-# upgrade_delay_min (ECE 0.1378) each still fails this floor on their
+# the S2b-merge corpus: zeroing core.subject_age_h (ECE 0.1509) or
+# core.upgrade_delay_min (ECE 0.1378) each still fails this floor on their
 # own; see the PR body's weight-sweep table. (This is the SAME mechanism
 # T5 documented, re-derived for the new corpus, not a new one: the
 # feature-set change alone moved baseline ECE from 0.1108 to 0.1265,

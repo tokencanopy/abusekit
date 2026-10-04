@@ -3,7 +3,7 @@
 # config/brands.yaml wherever a replay fixture or mutation scenario needs
 # a brand match: replay fixtures never reference a real brand name
 # (public-repo data-boundary rule, AGENTS.md), so a fixture that needs
-# name_brand_match/subject_brand_match to fire uses one of these instead.
+# brand.name_match/email.subject_brand_match to fire uses one of these instead.
 #
 # Same shape as config/brands.yaml; loaded the identical way
 # (feature.LoadBrandsFile).

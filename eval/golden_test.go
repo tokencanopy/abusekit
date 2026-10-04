@@ -41,7 +41,7 @@ func TestGoldenEventsAndTimers(t *testing.T) {
 	if rows[len(rows)-1].NextRescoreAt != "" {
 		t.Fatal("must drain all timers")
 	}
-	if rows[1].Features["resource_total"] != "3ff0000000000000" {
+	if rows[1].Features["core.resource_total"] != "3ff0000000000000" {
 		t.Fatal("must store float64 bits, not rounded decimals")
 	}
 }
@@ -55,9 +55,9 @@ func TestGoldenReference(t *testing.T) {
 	if err := WriteGoldenFixtures(context.Background(), &out, filepath.Join(repoRoot(t), "eval", "fixtures"), cfg, brands, webmail); err != nil {
 		t.Fatal(err)
 	}
-	name := "reference-flat.jsonl"
+	name := "reference-ns.jsonl"
 	if profile := GoldenProfile(); profile != "amd64-fma" {
-		name = "reference-flat-" + profile + ".jsonl"
+		name = "reference-ns-" + profile + ".jsonl"
 	}
 	want, err := os.ReadFile(filepath.Join(repoRoot(t), "eval", "golden", name))
 	if err != nil {
@@ -90,13 +90,13 @@ func TestGoldenCanonicalTiesAndNoFutureNeighbors(t *testing.T) {
 	var first, third GoldenRow
 	json.Unmarshal(rows[0], &first)
 	json.Unmarshal(rows[2], &third)
-	if first.Features["fingerprint_seen_on_other_subjects"] != "0000000000000000" {
+	if first.Features["core.fingerprint_seen_on_other_subjects"] != "0000000000000000" {
 		t.Fatal("future tied neighbor leaked")
 	}
-	if third.Features["first_funding_prepaid"] != "0000000000000000" {
+	if third.Features["core.first_funding_prepaid"] != "0000000000000000" {
 		t.Fatal("first funding must resolve by producer before id")
 	}
-	if third.Features["fingerprint_seen_on_other_subjects"] != "3ff0000000000000" {
+	if third.Features["core.fingerprint_seen_on_other_subjects"] != "3ff0000000000000" {
 		t.Fatal("accepted tied neighbor missing")
 	}
 }

@@ -19,40 +19,40 @@ import (
 // assertion against a fixture, this check has no numerical fragility at
 // all — a weight set to exactly zero, dropped from the file entirely, or
 // flipped to the wrong sign fails immediately, regardless of how small
-// its magnitude is deliberately kept (upgrade_delay_min's -0.0005 is easy
+// its magnitude is deliberately kept (core.upgrade_delay_min's -0.0005 is easy
 // to miss in a fixture-band check, impossible to miss here).
 //
-// subject_age_h and upgrade_delay_min are the only two negative entries:
+// core.subject_age_h and core.upgrade_delay_min are the only two negative entries:
 // an OLDER account, or one that has gone a long time with no PAID
 // upgrade (design's clamp ceiling), is LESS likely to be a fresh
 // throwaway — see local_weights.yaml's own comments for the full
 // rationale on each.
 var goldenWeightSigns = map[string]int{
-	"subject_age_h":                      -1,
-	"resource_velocity_1h":               1,
-	"resource_total":                     1,
-	"key_velocity_1h":                    1,
-	"key_total":                          1,
-	"upgrade_delay_min":                  -1,
-	"upgraded":                           1,
-	"declines_before_first_success":      1,
-	"first_funding_prepaid":              1,
-	"name_brand_match":                   1,
-	"name_has_at":                        1,
-	"first_day_distinct_domains":         1,
-	"self_send_before_external":          1,
-	"linked_deleted_n":                   1,
-	"linked_labelled_abusive_n":          1,
-	"fingerprint_seen_on_other_subjects": 1,
-	"neighbors_truncated":                1,
-	"burst_ratio_24h_vs_lifetime":        1,
-	"sends_10m_max":                      1,
-	"sends_1h":                           1,
-	"sends_first_day":                    1,
-	"webmail_recipient_share":            1,
-	"webmail_sends_1h":                   1,
-	"distinct_recipients_1h":             1,
-	"subject_brand_match":                1,
+	"core.subject_age_h":                      -1,
+	"core.resource_velocity_1h":               1,
+	"core.resource_total":                     1,
+	"core.credential_velocity_1h":             1,
+	"core.credential_total":                   1,
+	"core.upgrade_delay_min":                  -1,
+	"core.upgraded":                           1,
+	"core.declines_before_first_success":      1,
+	"core.first_funding_prepaid":              1,
+	"brand.name_match":                        1,
+	"brand.name_has_at":                       1,
+	"email.first_day_distinct_domains":        1,
+	"email.self_send_before_external":         1,
+	"core.linked_deleted_n":                   1,
+	"core.linked_labelled_abusive_n":          1,
+	"core.fingerprint_seen_on_other_subjects": 1,
+	"core.neighbors_truncated":                1,
+	"core.burst_ratio_24h_vs_lifetime":        1,
+	"email.sends_10m_max":                     1,
+	"email.sends_1h":                          1,
+	"email.sends_first_day":                   1,
+	"email.webmail_recipient_share":           1,
+	"email.webmail_sends_1h":                  1,
+	"email.distinct_recipients_1h":            1,
+	"email.subject_brand_match":               1,
 }
 
 // TestLocalWeights_GoldenSignsAndNonZero is R2 round 2's static half of
@@ -172,8 +172,8 @@ func loadShippedWebmail(t *testing.T) feature.WebmailSet {
 // loadTestBrands merges the real, public config/brands.yaml with
 // eval/fixtures/test_brands.yaml's entirely fictional entries (S2b's
 // hygiene rule: a replay fixture never references a real brand name) —
-// used wherever a mutation scenario or fixture needs name_brand_match/
-// subject_brand_match to fire against a brand a fixture actually mentions.
+// used wherever a mutation scenario or fixture needs brand.name_match/
+// email.subject_brand_match to fire against a brand a fixture actually mentions.
 func loadTestBrands(t *testing.T) feature.BrandSet {
 	t.Helper()
 	shipped := loadShippedBrands(t)
@@ -240,8 +240,8 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 		{"paid_launch_5d", extractFixture(t, brands, webmail, "paid_launch_5d.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.0, 0.4},
 		{"webmail_spread_1h", extractFixture(t, brands, webmail, "webmail_spread_1h.jsonl", time.Minute, false, feature.NeighborEvidence{}), 0.65, 0.78},
 
-		// --- Round 2, R6: real replay fixtures bounding sends_1h,
-		// sends_first_day, distinct_recipients_1h and subject_brand_match
+		// --- Round 2, R6: real replay fixtures bounding email.sends_1h,
+		// email.sends_first_day, email.distinct_recipients_1h and email.subject_brand_match
 		// (replacing the isolated synthetic scenarios these four used to
 		// need — see isolatedWeightScenarios' own comment). Three
 		// DISTINCT fixtures, each isolating one feature from its
@@ -255,13 +255,13 @@ func mutationScenarios(t *testing.T) []mutationScenario {
 }
 
 // firstDayBurstThenQuietScenario is round 2's R6 fixture bounding
-// sends_first_day specifically: first_day_burst_then_quiet.jsonl's burst
+// email.sends_first_day specifically: first_day_burst_then_quiet.jsonl's burst
 // happens entirely within the subject's first day, but — unlike
 // extractFixture's usual "lastEventAt + a short buffer" evaluation
 // instant — this scenario evaluates 26 hours after the subject's FIRST
-// event, well past currentBurstWindow (24h): sends_10m_max/sends_1h/
-// distinct_recipients_1h/webmail_sends_1h all read 0 (the burst has aged
-// out of the CURRENT window), isolating sends_first_day (a permanent
+// event, well past currentBurstWindow (24h): email.sends_10m_max/email.sends_1h/
+// email.distinct_recipients_1h/email.webmail_sends_1h all read 0 (the burst has aged
+// out of the CURRENT window), isolating email.sends_first_day (a permanent
 // fact, unaffected by how long ago its own window closed) as the only
 // one of the four with a non-zero value here.
 func firstDayBurstThenQuietScenario(t *testing.T, brands feature.BrandSet, webmail feature.WebmailSet) mutationScenario {
@@ -279,11 +279,11 @@ func firstDayBurstThenQuietScenario(t *testing.T, brands feature.BrandSet, webma
 }
 
 // isolatedWeightScenarios is R2 round 2: eight of the eighteen weights
-// (resource_total/key_total — minor companions to their velocity
-// counterparts; upgrade_delay_min — deliberately shrunk ~20x by B5 so it
-// can't swamp the model; subject_age_h, name_has_at,
-// linked_labelled_abusive_n, neighbors_truncated,
-// burst_ratio_24h_vs_lifetime) never move any of the WIDE, realistic
+// (core.resource_total/core.credential_total — minor companions to their velocity
+// counterparts; core.upgrade_delay_min — deliberately shrunk ~20x by B5 so it
+// can't swamp the model; core.subject_age_h, brand.name_has_at,
+// core.linked_labelled_abusive_n, core.neighbors_truncated,
+// core.burst_ratio_24h_vs_lifetime) never move any of the WIDE, realistic
 // fixture bands above by enough to cross an edge, even though each one
 // measurably moves the score (see TestAblation_EveryWeightedFeatureMovesTheScore).
 // TestLocalWeights_GoldenSignsAndNonZero already proves each is
@@ -301,18 +301,18 @@ func firstDayBurstThenQuietScenario(t *testing.T, brands feature.BrandSet, webma
 func isolatedWeightScenarios() []mutationScenario {
 	backdrop := func() map[string]float64 {
 		return map[string]float64{
-			"resource_velocity_1h":               0.75,
-			"resource_total":                     1.25,
-			"key_velocity_1h":                    0.5,
-			"key_total":                          1,
-			"upgraded":                           0.25,
-			"declines_before_first_success":      0.5,
-			"first_funding_prepaid":              0.25,
-			"name_brand_match":                   0.25,
-			"first_day_distinct_domains":         0.75,
-			"self_send_before_external":          0.5,
-			"linked_deleted_n":                   0.5,
-			"fingerprint_seen_on_other_subjects": 0.25,
+			"core.resource_velocity_1h":               0.75,
+			"core.resource_total":                     1.25,
+			"core.credential_velocity_1h":             0.5,
+			"core.credential_total":                   1,
+			"core.upgraded":                           0.25,
+			"core.declines_before_first_success":      0.5,
+			"core.first_funding_prepaid":              0.25,
+			"brand.name_match":                        0.25,
+			"email.first_day_distinct_domains":        0.75,
+			"email.self_send_before_external":         0.5,
+			"core.linked_deleted_n":                   0.5,
+			"core.fingerprint_seen_on_other_subjects": 0.25,
 		}
 	}
 	withTarget := func(name string, value float64) map[string]float64 {
@@ -321,27 +321,27 @@ func isolatedWeightScenarios() []mutationScenario {
 		return v
 	}
 	return []mutationScenario{
-		// subject_age_h: negative weight, so zeroing INCREASES risk —
+		// core.subject_age_h: negative weight, so zeroing INCREASES risk —
 		// base=0.160, zeroed=0.235.
-		{"isolated_subject_age_h", withTarget("subject_age_h", 24), 0.05, 0.20},
-		// resource_total: base=0.309, zeroed=0.231.
-		{"isolated_resource_total", withTarget("resource_total", 20), 0.27, 0.36},
-		// key_total: base=0.269, zeroed=0.231.
-		{"isolated_key_total", withTarget("key_total", 10), 0.25, 0.30},
-		// upgrade_delay_min: negative weight, zeroing INCREASES risk —
+		{"isolated_subject_age_h", withTarget("core.subject_age_h", 24), 0.05, 0.20},
+		// core.resource_total: base=0.309, zeroed=0.231.
+		{"isolated_resource_total", withTarget("core.resource_total", 20), 0.27, 0.36},
+		// core.credential_total: base=0.269, zeroed=0.231.
+		{"isolated_key_total", withTarget("core.credential_total", 10), 0.25, 0.30},
+		// core.upgrade_delay_min: negative weight, zeroing INCREASES risk —
 		// base=0.130, zeroed=0.235.
-		{"isolated_upgrade_delay_min", withTarget("upgrade_delay_min", 1440), 0.05, 0.185},
-		// name_has_at: base=0.336, zeroed=0.235.
-		{"isolated_name_has_at", withTarget("name_has_at", 1), 0.29, 0.40},
-		// linked_labelled_abusive_n: base=0.579, zeroed=0.235.
-		{"isolated_linked_labelled_abusive_n", withTarget("linked_labelled_abusive_n", 1), 0.42, 0.75},
-		// neighbors_truncated: base=0.293, zeroed=0.235.
-		{"isolated_neighbors_truncated", withTarget("neighbors_truncated", 1), 0.27, 0.35},
-		// burst_ratio_24h_vs_lifetime: base=0.293, zeroed=0.235.
-		{"isolated_burst_ratio_24h_vs_lifetime", withTarget("burst_ratio_24h_vs_lifetime", 1.0), 0.27, 0.35},
+		{"isolated_upgrade_delay_min", withTarget("core.upgrade_delay_min", 1440), 0.05, 0.185},
+		// brand.name_has_at: base=0.336, zeroed=0.235.
+		{"isolated_name_has_at", withTarget("brand.name_has_at", 1), 0.29, 0.40},
+		// core.linked_labelled_abusive_n: base=0.579, zeroed=0.235.
+		{"isolated_linked_labelled_abusive_n", withTarget("core.linked_labelled_abusive_n", 1), 0.42, 0.75},
+		// core.neighbors_truncated: base=0.293, zeroed=0.235.
+		{"isolated_neighbors_truncated", withTarget("core.neighbors_truncated", 1), 0.27, 0.35},
+		// core.burst_ratio_24h_vs_lifetime: base=0.293, zeroed=0.235.
+		{"isolated_burst_ratio_24h_vs_lifetime", withTarget("core.burst_ratio_24h_vs_lifetime", 1.0), 0.27, 0.35},
 		// Round 2's R6 fix round replaced the isolated synthetic scenarios
-		// that used to bound sends_1h, sends_first_day,
-		// distinct_recipients_1h and subject_brand_match with REAL replay
+		// that used to bound email.sends_1h, email.sends_first_day,
+		// email.distinct_recipients_1h and email.subject_brand_match with REAL replay
 		// fixtures instead (see mutationScenarios' own "Round 2, R6"
 		// block) — a reviewer's own finding: a synthetic-only scenario
 		// proves a weight moves SOME feature vector's score, but not that
@@ -507,9 +507,9 @@ func TestR1_AgeDecayContinuityProbe(t *testing.T) {
 // s2bWeightNames are the seven weights this PR adds — the ones
 // TestWeightMutation_NewWeightsSurviveHalfAndDoubleSweep sweeps.
 var s2bWeightNames = []string{
-	"sends_10m_max", "sends_1h", "sends_first_day",
-	"webmail_recipient_share", "webmail_sends_1h", "distinct_recipients_1h",
-	"subject_brand_match",
+	"email.sends_10m_max", "email.sends_1h", "email.sends_first_day",
+	"email.webmail_recipient_share", "email.webmail_sends_1h", "email.distinct_recipients_1h",
+	"email.subject_brand_match",
 }
 
 // TestWeightMutation_NewWeightsSurviveHalfAndDoubleSweep is round 2's R6:

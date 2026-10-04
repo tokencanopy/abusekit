@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"io"
+	"strings"
 )
 
 // maxJSONLLineBytes bounds one JSONL row (dataset, labels, or corpus
@@ -88,8 +90,9 @@ func scanJSONL(r io.Reader, fn func(line int, raw []byte) error) error {
 // pull the right subset out of one corpus row, the same convention
 // event-replay Points use (see replay.go).
 type snapshotRow struct {
-	ID    string `json:"id"`
-	Input struct {
+	FeatureKeySpace string `json:"feature_key_space"`
+	ID              string `json:"id"`
+	Input           struct {
 		Features map[string]float64  `json:"features"`
 		Text     map[string][]string `json:"text"`
 		Context  string              `json:"context"`
@@ -108,7 +111,7 @@ var validSplits = map[string]bool{"": true, "train": true, "test": true}
 // LoadSnapshotCorpus parses a label-snapshot corpus (design §4.6) from
 // r: one JSON object per line, `{id, input:{features,text,context},
 // label, split, source, meta}`. Every row is validated against the
-// schema in eval/schema/corpus-v1.schema.json (mirrored here in Go, not
+// schema in eval/schema/corpus-v2.schema.json (mirrored here in Go, not
 // re-read from that file at runtime — see the schema file's own header
 // comment); a row that fails is reported as a RowError with its 1-based
 // line number, collected into rowErrs. A malformed JSON line, an empty
@@ -144,6 +147,10 @@ func LoadSnapshotCorpus(r io.Reader) (Dataset, []RowError, error) {
 		if err := dec.Decode(&row); err != nil {
 			return fail("bad_json", "invalid JSON or unknown field: %w", err)
 		}
+		if err := dec.Decode(new(any)); err != io.EOF {
+			return fail("bad_json", "expected exactly one JSON value per line")
+		}
+
 		if row.ID == "" {
 			return fail("missing_id", "id is required")
 		}
@@ -159,6 +166,17 @@ func LoadSnapshotCorpus(r io.Reader) (Dataset, []RowError, error) {
 		}
 		if len(row.Input.Features) == 0 && len(row.Input.Text) == 0 {
 			return fail("empty_input", "input.features and input.text are both empty")
+		}
+
+		if err := registry.ValidateKeys(row.Input.Features); err != nil {
+			code := "invalid_feature_name"
+			if strings.HasPrefix(err.Error(), "feature_renamed:") {
+				code = "feature_renamed"
+			}
+			return fail(code, "%v", err)
+		}
+		if row.FeatureKeySpace != registry.KeySpace {
+			return fail("feature_key_space", "feature_key_space must be %s", registry.KeySpace)
 		}
 
 		meta := row.Meta

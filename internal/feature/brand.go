@@ -33,7 +33,7 @@ type BrandEntry struct {
 
 // BrandSet is a loaded, ready-to-match set of brand names (config/brands.yaml).
 // The zero value matches nothing — a caller that hasn't loaded a brand list
-// simply gets name_brand_match held at 0, never a panic or an error.
+// simply gets brand.name_match held at 0, never a panic or an error.
 //
 // Matching is WORD/TOKEN-boundary-aware (S3 fix round — the original v0
 // substring check produced both false positives, "Pineapple"/"Grapple"/
@@ -60,7 +60,7 @@ type BrandEntry struct {
 //
 // brandWords is one pre-tokenized name/alias word sequence, tagged with
 // the CANONICAL brand name (BrandEntry.Name) it belongs to — S2b:
-// subject_brand_match needs to count DISTINCT brands, so a match has to
+// email.subject_brand_match needs to count DISTINCT brands, so a match has to
 // be traceable back to which brand identity fired, not just "something
 // matched" (the original bool-only Matches contract).
 type brandWords struct {
@@ -182,7 +182,7 @@ func hasIntegrationToken(words []string) bool {
 //
 // Applied ONLY to subject-line matching (MatchedBrandNamesForSubject),
 // NEVER to a resource/agent NAME (MatchedBrandNames) — R3: an earlier
-// round applied it to both, which suppressed name_brand_match for an
+// round applied it to both, which suppressed brand.name_match for an
 // ordinary agent name like "<brand> Support Chat".
 var communityPhraseWords = [][]string{
 	{"group", "meetup"},
@@ -236,7 +236,7 @@ func (b BrandSet) Matches(text string) bool {
 // (BrandEntry.Name — an entry matched via an alias still reports its
 // canonical name, never the alias text) whose word sequence appears in
 // text, applying the integration-token gate — this is the matcher
-// name_brand_match uses against a resource/agent's raw name. The
+// brand.name_match uses against a resource/agent's raw name. The
 // community-phrase gate (R3 fix round) does NOT apply here — see
 // MatchedBrandNamesForSubject for the subject-line-specific variant that
 // does.
@@ -248,7 +248,7 @@ func (b BrandSet) MatchedBrandNames(text string) map[string]struct{} {
 	return b.matched(text, true, false)
 }
 
-// MatchedBrandNamesForSubject is subject_brand_match's matcher (S2b's S1
+// MatchedBrandNamesForSubject is email.subject_brand_match's matcher (S2b's S1
 // fix round): brands are matched WITHOUT gating on words inside the
 // subject line itself the way MatchedBrandNames' integration-token gate
 // does — a bulk-phishing subject routinely contains "tracking" or "api"

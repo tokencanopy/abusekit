@@ -43,7 +43,7 @@ var epoch = time.Date(2031, 1, 1, 0, 0, 0, 0, time.UTC)
 // "label"-typed event convention (fix round B1/T4): a row of this type
 // in the events file means "an operator/outcome label was recorded for
 // this subject at this instant", read only by neighbour evidence
-// resolution (linked_labelled_abusive_n), never by feature.Extract
+// resolution (core.linked_labelled_abusive_n), never by feature.Extract
 // itself. Duplicated here rather than imported since eval/gen is its own
 // `package main`, not `package eval`.
 const labelEventType = "label"
@@ -133,8 +133,8 @@ var abusiveFamilies = []struct {
 	{"abusive_fast", genFast},
 	{"abusive_dormant_then_blast", genDormantThenBlast},
 	{"abusive_slow_operator", genSlowOperator},
-	// F9 TODO: S2b's webmail_recipient_share/webmail_sends_1h/
-	// subject_brand_match otherwise read 0 across the ENTIRE corpus —
+	// F9 TODO: S2b's email.webmail_recipient_share/email.webmail_sends_1h/
+	// email.subject_brand_match otherwise read 0 across the ENTIRE corpus —
 	// every other family's recipient_domain is a synthetic .example.test
 	// name and no family ever sets subject_line at all.
 	{"abusive_webmail_blast", genWebmailBlast},
@@ -334,7 +334,7 @@ func domainName(slug string, n int) string {
 // "debit" otherwise (fix round T5: "jitter the prepaid share in abusive
 // families" — a real operator doesn't EXCLUSIVELY pay with prepaid
 // cards, and a corpus where every single abusive success used one would
-// teach first_funding_prepaid as a near-perfect discriminator it isn't
+// teach core.first_funding_prepaid as a near-perfect discriminator it isn't
 // in reality; genBenignPrepaid already proves the converse — a benign
 // customer using one — so this closes the gap from the other side).
 func abusiveFunding(rng *rand.Rand) string {

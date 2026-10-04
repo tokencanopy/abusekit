@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"time"
 )
 
@@ -32,6 +33,9 @@ type CorpusExample struct {
 // (design: "A label enters the gate corpus only after a second source...
 // agrees"), which is harness territory (S4), not this insert.
 func (s *Store) InsertCorpusExample(ctx context.Context, tenant string, ex CorpusExample) (int64, error) {
+	if err := registry.ValidateKeys(ex.Features); err != nil {
+		return 0, err
+	}
 	eventSliceJSON, err := json.Marshal(ex.EventSlice)
 	if err != nil {
 		return 0, fmt.Errorf("store: marshal corpus event slice for %s: %w", ex.Subject, err)
@@ -43,10 +47,10 @@ func (s *Store) InsertCorpusExample(ctx context.Context, tenant string, ex Corpu
 
 	var id int64
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO corpus_examples (tenant, subject, label_id, decision_at, event_slice, features, split, gated)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, false)
+		INSERT INTO corpus_examples (tenant, subject, label_id, decision_at, event_slice, features, split, gated, feature_key_space)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, false, $8)
 		RETURNING id
-	`, tenant, ex.Subject, ex.LabelID, ex.DecisionAt, eventSliceJSON, featuresJSON, ex.Split).Scan(&id)
+	`, tenant, ex.Subject, ex.LabelID, ex.DecisionAt, eventSliceJSON, featuresJSON, ex.Split, registry.KeySpace).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("store: insert corpus example for %s: %w", ex.Subject, err)
 	}
@@ -59,18 +63,19 @@ func (s *Store) InsertCorpusExample(ctx context.Context, tenant string, ex Corpu
 // the harness (eval package), not this package, knows how to turn an
 // event slice back into text-field values, and re-decoding Features into
 // a Go map here would just be thrown away again the moment it's
-// re-marshaled for corpus-v1's `input.features`.
+// re-marshaled for corpus-v2's `input.features`.
 type CorpusExportRow struct {
-	ID          int64
-	Subject     string
-	DecisionAt  time.Time
-	EventSlice  json.RawMessage
-	Features    json.RawMessage
-	Split       string
-	Label       string
-	LabelSource string
-	Rule        string
-	Gated       bool
+	FeatureKeySpace string
+	ID              int64
+	Subject         string
+	DecisionAt      time.Time
+	EventSlice      json.RawMessage
+	Features        json.RawMessage
+	Split           string
+	Label           string
+	LabelSource     string
+	Rule            string
+	Gated           bool
 }
 
 // ListCorpusExamples returns every corpus_examples row for tenant,
@@ -87,7 +92,7 @@ type CorpusExportRow struct {
 // see and reason about the gap instead of silently exporting nothing.
 func (s *Store) ListCorpusExamples(ctx context.Context, tenant, split string) ([]CorpusExportRow, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT c.id, c.subject, c.decision_at, c.event_slice, c.features, c.split, c.gated,
+		SELECT c.id, c.subject, c.decision_at, c.event_slice, c.features, c.split, c.gated, c.feature_key_space,
 		       l.label, l.source, l.rule
 		FROM corpus_examples c
 		JOIN labels l ON l.id = c.label_id AND l.tenant = c.tenant
@@ -102,7 +107,7 @@ func (s *Store) ListCorpusExamples(ctx context.Context, tenant, split string) ([
 	var out []CorpusExportRow
 	for rows.Next() {
 		var r CorpusExportRow
-		if err := rows.Scan(&r.ID, &r.Subject, &r.DecisionAt, &r.EventSlice, &r.Features, &r.Split, &r.Gated,
+		if err := rows.Scan(&r.ID, &r.Subject, &r.DecisionAt, &r.EventSlice, &r.Features, &r.Split, &r.Gated, &r.FeatureKeySpace,
 			&r.Label, &r.LabelSource, &r.Rule); err != nil {
 			return nil, fmt.Errorf("store: scan corpus example row: %w", err)
 		}

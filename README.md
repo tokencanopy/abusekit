@@ -87,7 +87,7 @@ proper S3b design pass.
 Two are S2b additions:
 
 - `--webmail` (env `ABUSEKIT_WEBMAIL_CONFIG`, default `config/webmail.yaml`) — the public list of
-  consumer webmail provider domains `webmail_recipient_share`/`webmail_sends_1h` match against.
+  consumer webmail provider domains `email.webmail_recipient_share`/`email.webmail_sends_1h` match against.
 - `--brands-extra` (env `ABUSEKIT_BRANDS_EXTRA_CONFIG`, **no default**) — an optional path to a
   private, `config/brands.yaml`-shaped brand list, merged (`feature.MergeBrandSets`) alongside the
   shipped public `--brands` list. Empty (the default) merges in nothing. This is how an operator
@@ -125,7 +125,7 @@ positive subject was first flagged at).
 Two corpus shapes (design §4.6), both JSONL:
 
 - **Label-snapshot**: `{id, input:{features,text,context}, label, split, source, meta}` — one row
-  per already-resolved decision point. Schema: `eval/schema/corpus-v1.schema.json`.
+  per already-resolved decision point. Schema: `eval/schema/corpus-v2.schema.json`.
 - **Event-replay pair**: an events file (`{subject,type,at,data,links?}`, internal/event's own wire
   shape) plus a labels file (`{subject,label,category?,source,decision_at:{<slice>:<RFC3339>}}`).
   Each subject's feature vector is rebuilt from events STRICTLY BEFORE its decision_at, using
@@ -159,10 +159,10 @@ go build -o abusekit ./cmd/abusekit
   --slice full --floors eval/floors.yaml
 
 # A raw scoring pipe for an external framework — stdin/stdout JSONL, no persistence.
-echo '{"id":"x","input":{"features":{"subject_age_h":0.1}}}' | \
+echo '{"id":"x","input":{"features":{"core.subject_age_h":0.1}}}' | \
   ./abusekit score --jsonl --rule new_account_velocity --scorer local
 
-# Export labelled corpus_examples rows (design §4.9) as a corpus-v1 file
+# Export labelled corpus_examples rows (design §4.9) as a corpus-v2 file
 # `abusekit eval` can read straight back in. KNOWN GAP: nothing yet marks
 # a row `gated` (design's "a label enters the gate corpus only after a
 # second source agrees") — every row is exported regardless, with its
@@ -222,10 +222,27 @@ after each event and scheduled rescore:
 
 ```sh
 abusekit eval --golden --brands-extra eval/fixtures/test_brands.yaml \
-  --golden-check eval/golden/reference-flat.jsonl
+  --golden-check eval/golden/reference-ns.jsonl
 ```
 
-On ARM64, select `eval/golden/reference-flat-arm64.jsonl`; on AMD64 without FMA,
-select `eval/golden/reference-flat-amd64-no-fma.jsonl`. The replay pins
+On ARM64, select `eval/golden/reference-ns-arm64.jsonl`; on AMD64 without FMA,
+select `eval/golden/reference-ns-amd64-no-fma.jsonl`. The replay pins
 float64 bits, rule hashes, scorer versions, and rescore times without a database
 or vendor calls. See [the baseline contract](eval/golden/README.md).
+
+### Feature key migration (`ns-v1`)
+
+Feature keys now belong to `core.*`, `email.*`, or `brand.*`. For example,
+`key_total` is now `core.credential_total`. Flat-key score/corpus inputs fail
+with `feature_renamed` and the replacement name; no aliases are accepted.
+Corpus-v2 rows and cassette headers require `feature_key_space: ns-v1`.
+Export new corpora after running `abusekit migrate`; migration rewrites stored
+feature keys atomically and rejects unknown flat keys or collisions. Existing
+reason text is retained as version 1; newly rendered reasons use namespaced keys
+and `reason_version: 2`. Keep a database backup when migrating: an older binary
+cannot interpret the new feature keys. No hosted deployment is part of P1.
+
+Scoring values and rescore timing are unchanged. Fixed registry order preserves
+legacy floating-point arithmetic; the immutable P0 and new P1 replay references
+prove equality on all three numeric profiles. Hashes, scorer versions, and file
+SHAs deliberately change once. See [the rename contract](docs/design/2026-09-29-generic-feature-packs.md#52-the-one-time-rename-bit-exact).

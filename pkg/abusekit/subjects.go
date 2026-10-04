@@ -12,16 +12,17 @@ import (
 // Signal is one rule's contribution to a Subject's score (design §4.4).
 // Risk/Flagged are nil when Status is "unscored".
 type Signal struct {
-	Rule        string   `json:"rule"`
-	Mode        string   `json:"mode,omitempty"`
-	Status      string   `json:"status"`
-	Risk        *float64 `json:"risk,omitempty"`
-	Flagged     *bool    `json:"flagged,omitempty"`
-	Model       string   `json:"model,omitempty"`
-	Checkpoint  string   `json:"checkpoint,omitempty"`
-	Calibration string   `json:"calibration,omitempty"`
-	Reason      string   `json:"reason,omitempty"`
-	ErrorCode   string   `json:"error_code,omitempty"`
+	Rule          string   `json:"rule"`
+	Mode          string   `json:"mode,omitempty"`
+	Status        string   `json:"status"`
+	Risk          *float64 `json:"risk,omitempty"`
+	Flagged       *bool    `json:"flagged,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	Checkpoint    string   `json:"checkpoint,omitempty"`
+	Calibration   string   `json:"calibration,omitempty"`
+	Reason        string   `json:"reason,omitempty"`
+	ReasonVersion int      `json:"reason_version,omitempty"`
+	ErrorCode     string   `json:"error_code,omitempty"`
 }
 
 // Subject is the response shape of GET /v1/subjects/{subject} and

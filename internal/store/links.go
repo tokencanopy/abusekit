@@ -19,7 +19,7 @@ const (
 // subject (design §4.2's identity graph), deduplicated across keys,
 // capped at capPerKey subjects per individual (kind, hash) and capTotal
 // overall. truncated is true if either cap was reached, so a caller can
-// surface `neighbors_truncated` as a feature rather than silently
+// surface `core.neighbors_truncated` as a feature rather than silently
 // under-counting evidence.
 //
 // capPerKey <= 0 uses DefaultNeighborCapPerKey; capTotal <= 0 uses
@@ -32,10 +32,10 @@ func (s *Store) Neighbors(ctx context.Context, tenant, subject string, capPerKey
 // (e.g. []string{"card_fingerprint_hash"}), rather than every kind the
 // subject happens to have a link row under. internal/feature (S2) uses
 // this twice: once with every kind except "asn" for the general linked_*
-// evidence (design §4.2's linked_deleted_n/linked_labelled_abusive_n —
+// evidence (design §4.2's core.linked_deleted_n/core.linked_labelled_abusive_n —
 // see feature.Config.IncludeASN for why ASN is excluded by default), and
 // once with only "card_fingerprint_hash" for
-// fingerprint_seen_on_other_subjects, which is specifically about a
+// core.fingerprint_seen_on_other_subjects, which is specifically about a
 // reused payment fingerprint, not general same-tenant link-sharing.
 //
 // kinds must be non-empty (use Neighbors for "every kind").
@@ -161,7 +161,7 @@ func (s *Store) neighbors(ctx context.Context, tenant, subject string, capPerKey
 
 // PropagateToNeighbors bumps dirty_seq for every same-tenant subject
 // sharing any link key with subject (capped at DefaultNeighborCapTotal),
-// so their linked_deleted_n/linked_labelled_abusive_n features — computed
+// so their core.linked_deleted_n/core.linked_labelled_abusive_n features — computed
 // from evidence that just changed for THIS subject — get rescored rather
 // than sitting stale until their own next unrelated event (S2 fix round).
 // Called after a subject is labelled "abusive" (PutLabel) or permanently
@@ -196,8 +196,8 @@ func (s *Store) PropagateToNeighbors(ctx context.Context, tenant, subject string
 // NeighborOutcomes reports, among the given same-tenant subjects (typically
 // a Neighbors/NeighborsByKinds result), how many have ever emitted a
 // PERMANENT subject.deleted event and how many carry at least one
-// "abusive" label — the two counts internal/feature's linked_deleted_n and
-// linked_labelled_abusive_n features need (design §4.2). Both are computed
+// "abusive" label — the two counts internal/feature's core.linked_deleted_n and
+// core.linked_labelled_abusive_n features need (design §4.2). Both are computed
 // with one query each rather than round-tripping once per neighbor.
 //
 // Only mode="permanent" counts toward deletedCount (N3 fix round): a

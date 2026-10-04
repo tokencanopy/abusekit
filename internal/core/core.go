@@ -89,6 +89,13 @@ const (
 	SkipInputUnchanged SkipReason = "input_unchanged"
 )
 
+// Vector carries raw scorer values and per-feature hash bucket widths.
+// HashQuantum never rounds values sent to a scorer; absent/zero widths hash exactly.
+type Vector struct {
+	Values      map[string]float64
+	HashQuantum map[string]float64
+}
+
 // Plan decides, purely, which calls to make for one subject's rule set
 // given its current feature vector and text inputs (design §4.7).
 //
@@ -101,7 +108,8 @@ const (
 //     (LastInputHash, LastRisk) to decide staging and skipping.
 //
 // Plan never mutates its inputs and never calls a Scorer.
-func Plan(features map[string]float64, text map[string][]string, rules []RuleState) []Call {
+func Plan(vector Vector, text map[string][]string, rules []RuleState) []Call {
+	features := vector.Values
 	maxLocalRisk, haveLocalRisk := maxRiskByScorer(rules, "local")
 
 	calls := make([]Call, 0, len(rules))
@@ -118,7 +126,7 @@ func Plan(features map[string]float64, text map[string][]string, rules []RuleSta
 		call := Call{
 			Rule:      r,
 			Request:   req,
-			InputHash: inputHash(rs, req),
+			InputHash: inputHash(rs, req, vector.HashQuantum),
 		}
 
 		if skip := stageSkip(r, features, maxLocalRisk, haveLocalRisk); skip {
@@ -160,7 +168,7 @@ func maxRiskByScorer(rules []RuleState, scorer string) (max float64, have bool) 
 //     example: `new_account_velocity_jev` only fires after
 //     `new_account_velocity` itself looks suspicious).
 //   - max_subject_age_h / min_subject_age_h: run only while
-//     features["subject_age_h"] is within the given bound (design's
+//     features["core.subject_age_h"] is within the given bound (design's
 //     `lure_similarity` stops looking at accounts older than a week).
 //
 // A rule with no `stage` is never skipped by this function.
@@ -174,12 +182,12 @@ func stageSkip(r config.Rule, features map[string]float64, maxLocalRisk float64,
 		}
 	}
 	if v, ok := r.Stage["max_subject_age_h"]; ok {
-		if features["subject_age_h"] > v {
+		if features["core.subject_age_h"] > v {
 			return true
 		}
 	}
 	if v, ok := r.Stage["min_subject_age_h"]; ok {
-		if features["subject_age_h"] < v {
+		if features["core.subject_age_h"] < v {
 			return true
 		}
 	}
@@ -209,10 +217,10 @@ func collectText(text map[string][]string, names []string) []string {
 // currently on record, the benign label (flipping which label counts as
 // "not abusive" changes risk polarity even with an unchanged label SET),
 // and the resolved request — with its Features quantized first (R7 round
-// 2, see quantizeAgeFeaturesForHash). json.Marshal serializes map keys in
+// 2, via Vector.HashQuantum). json.Marshal serializes map keys in
 // sorted order, so the digest doesn't depend on Go's randomized map
 // iteration.
-func inputHash(rs RuleState, req model.ScoreRequest) string {
+func inputHash(rs RuleState, req model.ScoreRequest, quanta map[string]float64) string {
 	payload := struct {
 		Rule          string
 		Scorer        string
@@ -225,7 +233,7 @@ func inputHash(rs RuleState, req model.ScoreRequest) string {
 		Text          []string
 	}{
 		rs.Rule.Name, rs.Rule.Scorer, rs.ScorerVersion, req.RenderVersion, rs.CalibrationID, rs.Rule.BenignLabel,
-		req.Labels, quantizeAgeFeaturesForHash(req.Features), req.Text,
+		req.Labels, quantizeForHash(req.Features, quanta), req.Text,
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
@@ -247,35 +255,12 @@ func inputHash(rs RuleState, req model.ScoreRequest) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// quantizeAgeFeaturesForHash returns a copy of features with
-// subject_age_h floored to a 1-hour bucket and upgrade_delay_min floored
-// to a 60-minute bucket before hashing (R7 round 2). Proven necessary:
-// both are continuously-drifting elapsed-time features for any subject
-// not yet at internal/feature's clamp ceiling (B5 fix round) — they
-// change on literally every tick even with no new event at all — so
-// hashing them at full precision meant a rule that reads either one
-// (design's shipped new_account_velocity does) never repeated its input
-// hash across two consecutive rounds, permanently defeating
-// SkipInputUnchanged (S6/S7) for exactly new, still-under-clamp accounts,
-// the population this system most needs to score efficiently. A value
-// already AT its clamp ceiling is already a whole-bucket multiple (24 and
-// 1440 both divide evenly), so clamped values are untouched by the floor.
-//
-// Every other feature passes through unchanged: only these two specific,
-// known-continuously-drifting names get bucketed — a feature genuinely
-// changing in value (e.g. resource_total incrementing) must still change
-// the hash exactly as before.
-func quantizeAgeFeaturesForHash(features map[string]float64) map[string]float64 {
-	if len(features) == 0 {
-		return features
-	}
+// quantizeForHash buckets only the hash copy; scorer inputs retain full precision.
+func quantizeForHash(features map[string]float64, quanta map[string]float64) map[string]float64 {
 	out := make(map[string]float64, len(features))
 	for k, v := range features {
-		switch k {
-		case "subject_age_h":
-			v = math.Floor(v)
-		case "upgrade_delay_min":
-			v = math.Floor(v/60) * 60
+		if q := quanta[k]; q > 0 && !math.IsInf(q, 0) {
+			v = math.Floor(v/q) * q
 		}
 		out[k] = v
 	}
@@ -304,7 +289,8 @@ type RuleOutcome struct {
 	ErrorCode string
 	// Reason is a pre-rendered explanation (internal/model's template
 	// explainer, S2/S4) — Combine only forwards it onto the signal.
-	Reason string
+	Reason        string
+	ReasonVersion int
 	// Calibration is accepted for the caller's own bookkeeping but is NOT
 	// consulted by Combine (R7, round 2): the id actually recorded on the
 	// signal always comes from whichever CalibrationSet entry matched (or
@@ -318,16 +304,17 @@ type RuleOutcome struct {
 // the `signals` array in the GET /v1/subjects/{subject} response (design
 // §4.4), minus HTTP-layer concerns (added in S3).
 type Signal struct {
-	Rule        string
-	Mode        config.Mode
-	Status      string // "scored" | "unscored"
-	Risk        float64
-	Flagged     bool
-	Model       string
-	Checkpoint  string
-	Calibration string
-	Reason      string
-	ErrorCode   string
+	Rule          string
+	Mode          config.Mode
+	Status        string // "scored" | "unscored"
+	Risk          float64
+	Flagged       bool
+	Model         string
+	Checkpoint    string
+	Calibration   string
+	Reason        string
+	ReasonVersion int
+	ErrorCode     string
 }
 
 // Verdict is Combine's pure output for one subject's scoring round.
@@ -545,6 +532,7 @@ func Combine(outcomes []RuleOutcome, params CombineParams, calib CalibrationSet)
 		sig.Checkpoint = o.Result.Checkpoint
 		sig.Calibration = calibrationID
 		sig.Reason = o.Reason
+		sig.ReasonVersion = o.ReasonVersion
 		signals = append(signals, sig)
 
 		if o.Rule.Mode == config.ModeAdvise {

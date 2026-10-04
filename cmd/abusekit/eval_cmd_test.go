@@ -79,7 +79,7 @@ floors:
 // (runEval, not eval.Run directly — see eval/floors_test.go's
 // TestGate_WeightRegressionFailsFloors for the equivalent in-process
 // check) against the real eval/floors.yaml must fail the gate (exit 1).
-// resource_velocity_1h is one of 9 (of 18) weights the PR body's own
+// core.resource_velocity_1h is one of 9 (of 18) weights the PR body's own
 // weight-zeroing sweep found DOES break the gate; the other 9 pass when
 // zeroed, each with a documented reason in the PR body (redundant with
 // an already-gated feature, genuinely small/secondary by design, or
@@ -90,7 +90,7 @@ func TestRunEval_MutatedWeightsBreaksGate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read shipped weights: %v", err)
 	}
-	mutated := strings.Replace(string(shipped), "resource_velocity_1h: 0.35", "resource_velocity_1h: 0.0", 1)
+	mutated := strings.Replace(string(shipped), "core.resource_velocity_1h: 0.35", "core.resource_velocity_1h: 0.0", 1)
 	if mutated == string(shipped) {
 		t.Fatalf("mutation did not match any line in config/local_weights.yaml — has it been reformatted?")
 	}
@@ -102,7 +102,7 @@ func TestRunEval_MutatedWeightsBreaksGate(t *testing.T) {
 	args := syntheticCorpusArgs(t, "--weights", weightsPath, "--floors", filepath.Join(root, "eval", "floors.yaml"), "--out", filepath.Join(t.TempDir(), "run.json"))
 	err = runEval(args)
 	if err == nil {
-		t.Fatalf("zeroing resource_velocity_1h did not break the gate")
+		t.Fatalf("zeroing core.resource_velocity_1h did not break the gate")
 	}
 	var ec *exitError
 	if !errors.As(err, &ec) || ec.code != 1 {
@@ -183,7 +183,7 @@ func TestScoreOneRow_MatchesEvalScoreOne(t *testing.T) {
 	scorer, _ := cfg.ScorerFor(rule)
 
 	row := scoreRow{ID: "x"}
-	row.Input.Features = map[string]float64{"subject_age_h": 0.1}
+	row.Input.Features = map[string]float64{"core.subject_age_h": 0.1}
 	got := scoreOneRow(context.Background(), row, rule, scorer, cfg.Tiers, "v1")
 	want, _, err := eval.ScoreOne(context.Background(), rule, scorer, eval.Options{Tiers: cfg.Tiers, PromptVersion: "v1"}, eval.Point{Features: row.Input.Features})
 	if err != nil {

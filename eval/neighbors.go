@@ -58,7 +58,7 @@ type linkRef struct {
 // earlier incarnation's own vantage point) — evaluating every
 // incarnation against the dataset's final state instead would make even
 // the FIRST incarnation see every later one already deleted, trivially
-// inflating linked_deleted_n for a case design §1.2(c) specifically
+// inflating core.linked_deleted_n for a case design §1.2(c) specifically
 // expects to be hard for exactly the first two.
 //
 // labelledAt holds every "label" event (see LoadReplayDataset's own doc
@@ -107,7 +107,7 @@ type datasetNeighbors struct {
 // events themselves (LoadReplayDataset routes them separately — a
 // label-posting action was never a real account-activity event, and
 // leaving it in the slice feature.Extract reads would let it corrupt
-// e.g. subject_age_h's first-seen anchor).
+// e.g. core.subject_age_h's first-seen anchor).
 func newDatasetNeighbors(eventsBySubject map[string][]event.Event, labelEventsBySubject map[string][]labelledAt) *datasetNeighbors {
 	n := &datasetNeighbors{
 		byKindHash:           map[string]map[string][]linkRef{},

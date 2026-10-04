@@ -65,7 +65,7 @@ func newFixture(t *testing.T) (deps config.Dependencies, reg *model.Registry) {
 
 	deps = config.Dependencies{
 		Registry: reg,
-		Features: config.NewFeatureSet("subject_age_h", "resource_velocity_1h"),
+		Features: config.NewFeatureSet("core.subject_age_h", "core.resource_velocity_1h"),
 		Vendors: map[string]config.VendorEntry{
 			"local":      {Name: "local", Policy: model.DataPolicy{AllowsText: false, TermsVersion: "n/a"}},
 			"textvendor": {Name: "textvendor", Policy: model.DataPolicy{AllowsText: true, TermsVersion: "v1"}},
@@ -82,7 +82,7 @@ rules:
   - name: new_account_velocity
     mode: advise
     scorer: local
-    inputs: [subject_age_h, resource_velocity_1h]
+    inputs: [core.subject_age_h, core.resource_velocity_1h]
     labels: [benign, suspicious, abusive]
     benign_label: benign
     threshold: 0.6
@@ -131,7 +131,7 @@ rules:
   - name: r1
     mode: advise
     scorer: does_not_exist
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -206,7 +206,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [suspicious, abusive]
     benign_label: benign
     threshold: 0.5
@@ -221,7 +221,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -237,7 +237,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -287,7 +287,7 @@ rules:
   - name: base
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -309,14 +309,14 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -333,7 +333,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -348,7 +348,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     theshold: 0.5
@@ -363,7 +363,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
 `,
@@ -377,7 +377,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: .nan
@@ -392,7 +392,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -407,7 +407,7 @@ rules:
   - name: local_rule
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -446,7 +446,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive, benign]
     benign_label: benign
     threshold: 0.5
@@ -461,7 +461,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, "", abusive]
     benign_label: benign
     threshold: 0.5
@@ -476,7 +476,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h, subject_age_h]
+    inputs: [core.subject_age_h, core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -491,7 +491,7 @@ rules:
   - name: local_rule
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -507,7 +507,7 @@ rules:
   - name: r1/bad
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -523,7 +523,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -544,7 +544,7 @@ rules:
   - name: r1
     mode: shadow
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -575,7 +575,7 @@ rules:
   - name: base
     mode: advise
     scorer: local
-    inputs: [subject_age_h, resource_velocity_1h]
+    inputs: [core.subject_age_h, core.resource_velocity_1h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -701,7 +701,7 @@ func TestShippedConfigsLoadTogether(t *testing.T) {
 	// source of truth cmd/abusekit uses) instead of a hand-copied literal,
 	// so this test can't silently drift from what Extract actually
 	// computes the way the S1-era literal here did the moment B5/S1 fix
-	// round added `upgraded`/`neighbors_truncated`.
+	// round added `core.upgraded`/`core.neighbors_truncated`.
 	features := config.NewFeatureSet(feature.Names...)
 	cfg, err := config.Load(rulesData, config.Dependencies{
 		Registry: reg,
@@ -745,7 +745,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -768,7 +768,7 @@ rules:
   - name: r1
     mode: advise
     scorer: local
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5
@@ -798,7 +798,7 @@ func TestLoad_RejectsVendorPolicyMismatch(t *testing.T) {
 
 	deps := config.Dependencies{
 		Registry: reg,
-		Features: config.NewFeatureSet("subject_age_h"),
+		Features: config.NewFeatureSet("core.subject_age_h"),
 		Vendors: map[string]config.VendorEntry{
 			// AllowsText disagrees with drift.DataPolicyValue above.
 			"driftvendor": {Name: "driftvendor", Policy: model.DataPolicy{AllowsText: true, TermsVersion: "v1"}},
@@ -810,7 +810,7 @@ rules:
   - name: r1
     mode: advise
     scorer: driftvendor
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5

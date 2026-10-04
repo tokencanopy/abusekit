@@ -24,13 +24,14 @@ type VerdictRecord struct {
 	Calibration string
 	Probs       map[string]float64
 	// Risk is nil when Status == "unscored".
-	Risk      *float64
-	Flagged   bool
-	Reason    string
-	LLMReason *string
-	InputHash string
-	Status    string // "scored" | "unscored"
-	ErrorCode string
+	Risk          *float64
+	Flagged       bool
+	Reason        string
+	ReasonVersion int
+	LLMReason     *string
+	InputHash     string
+	Status        string // "scored" | "unscored"
+	ErrorCode     string
 }
 
 // SubjectSummary is the round-level result (internal/core.Verdict, minus
@@ -110,11 +111,11 @@ func (s *Store) UpsertVerdicts(ctx context.Context, tenant, subject string, dirt
 		err = tx.QueryRow(ctx, `
 			INSERT INTO verdicts
 				(tenant, subject, rule, mode, scorer, model, checkpoint, render, calibration,
-				 probs, risk, flagged, reason, llm_reason, input_hash, status, error_code)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+				 probs, risk, flagged, reason, llm_reason, input_hash, status, error_code, reason_version)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
 			RETURNING id
 		`, tenant, subject, r.Rule, r.Mode, r.Scorer, r.Model, r.Checkpoint, r.Render, r.Calibration,
-			probsJSON, r.Risk, r.Flagged, r.Reason, r.LLMReason, r.InputHash, r.Status, r.ErrorCode,
+			probsJSON, r.Risk, r.Flagged, r.Reason, r.LLMReason, r.InputHash, r.Status, r.ErrorCode, r.ReasonVersion,
 		).Scan(&id)
 		if err != nil {
 			return nil, fmt.Errorf("store: insert verdict for rule %s: %w", r.Rule, err)
@@ -192,18 +193,19 @@ type SubjectSignal struct {
 	// API's ETag is a hash of the ids behind one response, so a caller can
 	// tell "the exact same verdicts" from "something changed" via
 	// If-None-Match without re-fetching the body.
-	ID          int64
-	Rule        string
-	Mode        string
-	Status      string
-	Risk        float64
-	Flagged     bool
-	Model       string
-	Checkpoint  string
-	Calibration string
-	Reason      string
-	ErrorCode   string
-	ScoredAt    time.Time
+	ID            int64
+	Rule          string
+	Mode          string
+	Status        string
+	Risk          float64
+	Flagged       bool
+	Model         string
+	Checkpoint    string
+	Calibration   string
+	Reason        string
+	ReasonVersion int
+	ErrorCode     string
+	ScoredAt      time.Time
 }
 
 // SubjectView is the read model behind GET /v1/subjects/{subject}
@@ -266,15 +268,16 @@ type LatestVerdict struct {
 	// gone quiet — from any other rule's stage gating). This can be an
 	// OLDER row than the one InputHash/Status/ErrorCode came from. Risk nil
 	// means this rule has never been scored at all.
-	Risk        *float64
-	Mode        string
-	Scorer      string
-	Model       string
-	Checkpoint  string
-	Calibration string
-	Reason      string
-	Flagged     bool
-	Probs       map[string]float64
+	Risk          *float64
+	Mode          string
+	Scorer        string
+	Model         string
+	Checkpoint    string
+	Calibration   string
+	Reason        string
+	ReasonVersion int
+	Flagged       bool
+	Probs         map[string]float64
 }
 
 // LatestVerdicts returns each rule's most recent verdict for (tenant,
@@ -311,7 +314,7 @@ func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map
 	// this may be an older row than the one above if the rule's most recent
 	// attempt(s) left it unscored.
 	scoredRows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (rule) rule, risk, mode, scorer, model, checkpoint, calibration, reason, flagged, probs
+		SELECT DISTINCT ON (rule) rule, risk, mode, scorer, model, checkpoint, calibration, reason, reason_version, flagged, probs
 		FROM verdicts
 		WHERE tenant = $1 AND subject = $2 AND status = 'scored'
 		ORDER BY rule, scored_at DESC, id DESC
@@ -321,12 +324,13 @@ func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map
 	}
 	for scoredRows.Next() {
 		var (
+			reasonVersion                                              int
 			rule, mode, scorer, model, checkpoint, calibration, reason string
 			risk                                                       *float64
 			flagged                                                    bool
 			probsJSON                                                  []byte
 		)
-		if err := scoredRows.Scan(&rule, &risk, &mode, &scorer, &model, &checkpoint, &calibration, &reason, &flagged, &probsJSON); err != nil {
+		if err := scoredRows.Scan(&rule, &risk, &mode, &scorer, &model, &checkpoint, &calibration, &reason, &reasonVersion, &flagged, &probsJSON); err != nil {
 			scoredRows.Close()
 			return nil, fmt.Errorf("store: scan latest scored verdict row: %w", err)
 		}
@@ -345,6 +349,7 @@ func (s *Store) LatestVerdicts(ctx context.Context, tenant, subject string) (map
 		lv.Checkpoint = checkpoint
 		lv.Calibration = calibration
 		lv.Reason = reason
+		lv.ReasonVersion = reasonVersion
 		lv.Flagged = flagged
 		lv.Probs = probs
 		out[rule] = lv
@@ -433,7 +438,7 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 
 	query := `
 		SELECT DISTINCT ON (rule)
-			id, rule, mode, status, risk, flagged, model, checkpoint, calibration, reason, error_code, scored_at
+			id, rule, mode, status, risk, flagged, model, checkpoint, calibration, reason, reason_version, error_code, scored_at
 		FROM verdicts
 		WHERE tenant = $1 AND subject = $2`
 	args := []any{tenant, subject}
@@ -463,7 +468,7 @@ func (s *Store) SubjectView(ctx context.Context, tenant, subject string, current
 		var sig SubjectSignal
 		var risk *float64
 		if err := rows.Scan(&sig.ID, &sig.Rule, &sig.Mode, &sig.Status, &risk, &sig.Flagged, &sig.Model,
-			&sig.Checkpoint, &sig.Calibration, &sig.Reason, &sig.ErrorCode, &sig.ScoredAt); err != nil {
+			&sig.Checkpoint, &sig.Calibration, &sig.Reason, &sig.ReasonVersion, &sig.ErrorCode, &sig.ScoredAt); err != nil {
 			return nil, fmt.Errorf("store: scan verdict row: %w", err)
 		}
 		if risk != nil {

@@ -18,6 +18,7 @@ import (
 	"github.com/tokencanopy/abusekit/internal/core"
 	"github.com/tokencanopy/abusekit/internal/event"
 	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 )
 
 // GoldenRow pins the unbounded evaluator's exact output at an event or timer.
@@ -141,7 +142,7 @@ func WriteGolden(ctx context.Context, out io.Writer, name string, input io.Reade
 			scorer, _ := cfg.ScorerFor(rule)
 			states = append(states, core.RuleState{Rule: rule, ScorerVersion: scorer.Version(), CalibrationID: "none"})
 		}
-		calls := core.Plan(values, extractTextFields(accepted[subject]), states)
+		calls := core.Plan(core.Vector{Values: values, HashQuantum: registry.HashQuanta()}, extractTextFields(accepted[subject]), states)
 		outcomes := make([]core.RuleOutcome, 0, len(calls))
 		for i, call := range calls {
 			scorer, _ := cfg.ScorerFor(call.Rule)

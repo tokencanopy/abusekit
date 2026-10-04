@@ -44,27 +44,27 @@ func TestLoadReplayDataset_StrictlyBeforeDecisionAt(t *testing.T) {
 	if !ok {
 		t.Fatalf("no SliceEarly15m point")
 	}
-	if got := early.Features["resource_total"]; got != 1 {
-		t.Errorf("early_15m resource_total = %v, want 1 (the event AT decision_at must not leak in)", got)
+	if got := early.Features["core.resource_total"]; got != 1 {
+		t.Errorf("early_15m core.resource_total = %v, want 1 (the event AT decision_at must not leak in)", got)
 	}
 
 	full, ok := subj.Points[SliceFull]
 	if !ok {
 		t.Fatalf("no SliceFull point")
 	}
-	if got := full.Features["resource_total"]; got != 3 {
-		t.Errorf("full resource_total = %v, want 3 (all three events)", got)
+	if got := full.Features["core.resource_total"]; got != 3 {
+		t.Errorf("full core.resource_total = %v, want 3 (all three events)", got)
 	}
 }
 
 // TestLoadReplayDataset_NeighborEvidenceRespectsChronology proves
-// linked_deleted_n is evaluated AS OF the scored subject's own
+// core.linked_deleted_n is evaluated AS OF the scored subject's own
 // decision_at, not as of the end of the whole dataset (neighbors.go's
 // evidenceAsOf) — this is what makes an early churn incarnation
 // legitimately hard to catch (design §1.2(c)): "subject_early" is scored
 // BEFORE its linked neighbor's deletion happens, so it must see
-// linked_deleted_n=0; "subject_late" is scored AFTER that same deletion,
-// so it must see linked_deleted_n=1.
+// core.linked_deleted_n=0; "subject_late" is scored AFTER that same deletion,
+// so it must see core.linked_deleted_n=1.
 func TestLoadReplayDataset_NeighborEvidenceRespectsChronology(t *testing.T) {
 	events := strings.NewReader(`
 {"subject":"neighbor","type":"subject.created","at":"2031-01-01T00:00:00Z","links":{"email_hash":"` + hash64("shared-email") + `"},"data":{"channel":"signup"}}
@@ -92,13 +92,13 @@ func TestLoadReplayDataset_NeighborEvidenceRespectsChronology(t *testing.T) {
 	for _, s := range ds.Subjects {
 		byID[s.ID] = s
 	}
-	early := byID["subject_early"].Points[SliceFull].Features["linked_deleted_n"]
-	late := byID["subject_late"].Points[SliceFull].Features["linked_deleted_n"]
+	early := byID["subject_early"].Points[SliceFull].Features["core.linked_deleted_n"]
+	late := byID["subject_late"].Points[SliceFull].Features["core.linked_deleted_n"]
 	if early != 0 {
-		t.Errorf("subject_early (scored BEFORE neighbor's deletion) linked_deleted_n = %v, want 0", early)
+		t.Errorf("subject_early (scored BEFORE neighbor's deletion) core.linked_deleted_n = %v, want 0", early)
 	}
 	if late != 1 {
-		t.Errorf("subject_late (scored AFTER neighbor's deletion) linked_deleted_n = %v, want 1", late)
+		t.Errorf("subject_late (scored AFTER neighbor's deletion) core.linked_deleted_n = %v, want 1", late)
 	}
 }
 
@@ -154,7 +154,7 @@ func relabelEvents() string {
 // acct_a's ground truth from "abusive" to "suspicious" — both POSITIVE
 // under benign_label "benign", so nothing about the binary ground-truth
 // split changes — must leave every subject's Points byte-for-byte
-// DeepEqual, because linked_labelled_abusive_n (and every other feature)
+// DeepEqual, because core.linked_labelled_abusive_n (and every other feature)
 // is computed ENTIRELY from the events file plus `label`-typed rows in
 // it, never from labels.jsonl's own ground truth being evaluated.
 func TestLoadReplayDataset_RelabellingGroundTruthDoesNotChangeFeatures(t *testing.T) {
@@ -212,7 +212,7 @@ func TestLoadReplayDataset_FlippingLaterSubjectsLabelChangesNothing(t *testing.T
 }
 
 // TestLoadReplayDataset_LabelEventChronologyPerSlice proves
-// linked_labelled_abusive_n comes from a `label`-typed EVENT (fix round
+// core.linked_labelled_abusive_n comes from a `label`-typed EVENT (fix round
 // B1), visible only strictly before the asked-for slice's own
 // decision_at: "poster" posts a label event at 00:20; "target" (linked by
 // email) has an early_15m decision point at 00:15 (BEFORE the label
@@ -235,11 +235,11 @@ func TestLoadReplayDataset_LabelEventChronologyPerSlice(t *testing.T) {
 	}
 	pts := pointsByID(ds)["target"]
 
-	if got := pts[SliceEarly15m].Features["linked_labelled_abusive_n"]; got != 0 {
-		t.Errorf("early_15m (BEFORE poster's label event) linked_labelled_abusive_n = %v, want 0", got)
+	if got := pts[SliceEarly15m].Features["core.linked_labelled_abusive_n"]; got != 0 {
+		t.Errorf("early_15m (BEFORE poster's label event) core.linked_labelled_abusive_n = %v, want 0", got)
 	}
-	if got := pts[SliceFull].Features["linked_labelled_abusive_n"]; got != 1 {
-		t.Errorf("full (AFTER poster's label event) linked_labelled_abusive_n = %v, want 1", got)
+	if got := pts[SliceFull].Features["core.linked_labelled_abusive_n"]; got != 1 {
+		t.Errorf("full (AFTER poster's label event) core.linked_labelled_abusive_n = %v, want 1", got)
 	}
 }
 
@@ -308,7 +308,7 @@ func TestLoadReplayDataset_MissingSliceBeforeAnyEvent(t *testing.T) {
 		t.Fatalf("full has no Point; want one (it resolves normally)")
 	}
 
-	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"resource_total"}}
+	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"core.resource_total"}}
 	scorer := fake.New()
 	run, err := Run(context.Background(), ds, rule, scorer, Options{Slice: SliceEarly15m})
 	if err != nil {
@@ -355,7 +355,7 @@ func TestLoadReplayDataset_SkippedEventTaintsWholeSubject(t *testing.T) {
 		t.Fatalf("HasSkippedEvents = false, want true")
 	}
 
-	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"resource_total"}}
+	rule := config.Rule{Name: "r", Mode: config.ModeAdvise, Scorer: "fake", Labels: []string{"benign", "abusive"}, BenignLabel: "benign", Threshold: 0.5, Inputs: []string{"core.resource_total"}}
 	run, err := Run(context.Background(), ds, rule, fake.New(), Options{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -373,7 +373,7 @@ func TestLoadReplayDataset_SkippedEventTaintsWholeSubject(t *testing.T) {
 // LoadReplayDataset actually threads its webmail parameter into
 // feature.Extract, not just accepts one — a webmail-heavy subject (every
 // content.sent recipient_domain on the loaded WebmailSet) must score a
-// non-zero webmail_recipient_share, and the SAME subject scored against
+// non-zero email.webmail_recipient_share, and the SAME subject scored against
 // an EMPTY WebmailSet must read exactly 0 for it: without the wiring,
 // both runs would silently agree at 0, which is exactly the bug this
 // guards against (a caller passing --webmail and having it never reach
@@ -394,9 +394,9 @@ func TestLoadReplayDataset_WebmailRecipientShareIsNonZero(t *testing.T) {
 	if len(ds.Subjects) != 1 {
 		t.Fatalf("len(Subjects) = %d, want 1", len(ds.Subjects))
 	}
-	got := ds.Subjects[0].Points[SliceFull].Features["webmail_recipient_share"]
+	got := ds.Subjects[0].Points[SliceFull].Features["email.webmail_recipient_share"]
 	if got != 1.0 {
-		t.Fatalf("webmail_recipient_share = %v, want 1.0 (every recipient_domain is on the loaded WebmailSet)", got)
+		t.Fatalf("email.webmail_recipient_share = %v, want 1.0 (every recipient_domain is on the loaded WebmailSet)", got)
 	}
 
 	// Same events, empty WebmailSet: must read back to 0, proving the
@@ -412,9 +412,9 @@ func TestLoadReplayDataset_WebmailRecipientShareIsNonZero(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadReplayDataset (empty webmail): %v (rowErrs=%v)", err, rowErrs2)
 	}
-	got2 := ds2.Subjects[0].Points[SliceFull].Features["webmail_recipient_share"]
+	got2 := ds2.Subjects[0].Points[SliceFull].Features["email.webmail_recipient_share"]
 	if got2 != 0.0 {
-		t.Fatalf("webmail_recipient_share (empty WebmailSet) = %v, want 0", got2)
+		t.Fatalf("email.webmail_recipient_share (empty WebmailSet) = %v, want 0", got2)
 	}
 }
 

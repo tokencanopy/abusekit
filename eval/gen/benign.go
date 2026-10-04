@@ -13,7 +13,7 @@ import (
 // integration-adjacent word (internal/feature.BrandSet's own suppression
 // list: integration, webhook, sync, relay, notifier, tracking, bot,
 // connector, api, import, export) — a legitimate integration name that
-// must NOT trip name_brand_match, matching the design's own reviewed
+// must NOT trip brand.name_match, matching the design's own reviewed
 // false-positive cases ("Stripe Webhook Relay", "PayPal integration")
 // generalized across every brand in the shipped list, not just the two
 // or three the hand-written fixtures happened to cover.
@@ -131,7 +131,7 @@ func genDay1ReceiptsFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRo
 // genSupportDeskLaterFanout: a support inbox that only starts replying to
 // many distinct domains several days after signup, spread across several
 // following days — task brief's "support desks replying to many domains
-// on later days". Deliberately outside first_day_distinct_domains' window
+// on later days". Deliberately outside email.first_day_distinct_domains' window
 // (design §8 open question 9: "No v0 feature reacts to a fan-out that
 // happens AFTER day 1").
 func genSupportDeskLaterFanout(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
@@ -247,7 +247,7 @@ func genTrialZeroDollar(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) 
 
 // genBenignPrepaid: an ordinary customer whose card just happens to be
 // prepaid, succeeding on the first attempt with no other signal firing —
-// task brief's "benign prepaid" (fix round S3). first_funding_prepaid
+// task brief's "benign prepaid" (fix round S3). core.first_funding_prepaid
 // (internal/feature) is a real fraud signal in the abusive families
 // (burst/fast/churn all pay with a prepaid card specifically because a
 // stolen card is often prepaid), but plenty of genuine customers use one
@@ -295,8 +295,8 @@ func genBenignPrepaid(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 // wires up an agent and a key, and starts sending to a couple of real
 // external domains all within the SAME DAY it signs up. Every one of
 // those is individually a real (if weak) fraud signal in
-// config/local_weights.yaml (first_funding_prepaid, resource_velocity_1h/
-// key_velocity_1h, first_day_distinct_domains, burst_ratio_24h_vs_lifetime
+// config/local_weights.yaml (core.first_funding_prepaid, core.resource_velocity_1h/
+// core.credential_velocity_1h, email.first_day_distinct_domains, core.burst_ratio_24h_vs_lifetime
 // all fire), and stacking them together is exactly what an actually
 // abusive account also looks like on day 0 — the honest difference is
 // only that this account keeps behaving ordinarily afterward and this
@@ -314,7 +314,7 @@ func genBenignPrepaidEagerDay0(rng *rand.Rand, idx int) ([]event.Event, eval.Lab
 	b.add(3*time.Minute, "payment.attempt", event.Links{}, map[string]any{"outcome": "succeeded", "funding": "prepaid", "amount_minor": float64(1900), "currency": "usd"})
 	b.add(4*time.Minute, "subscription.changed", event.Links{}, map[string]any{"plan": "starter", "status": "active", "amount_minor": float64(1900)})
 
-	agents := 1 + rng.Intn(2) // 1..2 — enough to move resource_velocity_1h, not a full blast
+	agents := 1 + rng.Intn(2) // 1..2 — enough to move core.resource_velocity_1h, not a full blast
 	t := 10*time.Minute + secondJitter(rng)
 	for i := 0; i < agents; i++ {
 		b.add(t, "resource.created", event.Links{}, map[string]any{"kind": "agent", "name": fmt.Sprintf("Agent %d", i+1), "address_domain": domain})
@@ -343,7 +343,7 @@ func genBenignPrepaidEagerDay0(rng *rand.Rand, idx int) ([]event.Event, eval.Lab
 // genBenignDeclineThenSuccess: an ordinary customer who mistypes their
 // card number (or it's briefly expired) once or twice before it goes
 // through, with unremarkable usage afterward — task brief's "benign
-// decline-then-success" (fix round S3). declines_before_first_success
+// decline-then-success" (fix round S3). core.declines_before_first_success
 // (weight 0.6) is a real fraud signal in burst/fast (repeated stolen-card
 // attempts), but an ordinary fat-fingered retry looks identical at the
 // feature level; this family is the benign counter-example.
@@ -383,7 +383,7 @@ func genBenignDeclineThenSuccess(rng *rand.Rand, idx int) ([]event.Event, eval.L
 // genBenignSharedCardHousehold builds a small group (2..3) of INDEPENDENT
 // benign accounts sharing the same card_fingerprint_hash — task brief's
 // "benign shared-card households" (fix round S3): a family or small team
-// paying with one shared card. fingerprint_seen_on_other_subjects (weight
+// paying with one shared card. core.fingerprint_seen_on_other_subjects (weight
 // 1.0) fires for every member, exactly as it would for a stolen-card
 // churn ring — this family is the honest counter-example proving the
 // feature alone isn't damning; each member is otherwise unremarkable and
@@ -427,7 +427,7 @@ func genBenignSharedCardHousehold(rng *rand.Rand, groupIdx int) []incarnation {
 // permanently deletes its account (nothing abusive about it — people
 // leave products); much later subject B signs up again with the SAME
 // email (a returning customer, or a family member sharing an inbox) and
-// behaves completely ordinarily. linked_deleted_n (weight 1.3) fires for
+// behaves completely ordinarily. core.linked_deleted_n (weight 1.3) fires for
 // B the same way it would for a churn incarnation's second-or-later
 // member — this pair is the honest counter-example: ONE deleted
 // neighbour, on its own, is not damning.

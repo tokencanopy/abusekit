@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"os"
 	"strings"
 
@@ -15,13 +16,14 @@ import (
 )
 
 // corpusExportRow is `abusekit corpus export`'s output shape: the
-// label-snapshot corpus-v1 schema (design §4.6, eval/schema/
-// corpus-v1.schema.json) — this is the SAME shape eval.LoadSnapshotCorpus
+// label-snapshot corpus-v2 schema (design §4.6, eval/schema/
+// corpus-v2.schema.json) — this is the SAME shape eval.LoadSnapshotCorpus
 // reads, so `abusekit corpus export ... > corpus.jsonl` output is always
 // a valid `abusekit eval --dataset corpus.jsonl` input.
 type corpusExportRow struct {
-	ID    string `json:"id"`
-	Input struct {
+	FeatureKeySpace string `json:"feature_key_space"`
+	ID              string `json:"id"`
+	Input           struct {
 		Features map[string]float64  `json:"features"`
 		Text     map[string][]string `json:"text,omitempty"`
 		Context  string              `json:"context,omitempty"`
@@ -74,7 +76,7 @@ func parseCorpusExportFlags(args []string) (corpusFlags, error) {
 
 // runCorpus dispatches `abusekit corpus <subcommand>`. `export` is the
 // only one S4 implements — design §4.9's `abusekit corpus export --split
-// all|train|test --schema corpus-v1.json > corpus.jsonl`.
+// all|train|test --schema corpus-v2.json > corpus.jsonl`.
 func runCorpus(args []string) error {
 	if len(args) == 0 || args[0] != "export" {
 		return exitCode2(fmt.Errorf("usage: abusekit corpus export [flags] (only \"export\" is implemented)"))
@@ -84,7 +86,7 @@ func runCorpus(args []string) error {
 
 // runCorpusExport reads every corpus_examples row for --tenant (design
 // §4.9's `corpus_examples`, written by internal/serve's POST /v1/labels
-// handler) and writes it to stdout as one corpus-v1 JSONL line per row.
+// handler) and writes it to stdout as one corpus-v2 JSONL line per row.
 //
 // Known, deliberate gap (S4 scope decision — not fixed here): design
 // §4.9 says "A label enters the gate corpus only after a second source
@@ -133,7 +135,11 @@ func runCorpusExport(args []string) error {
 }
 
 func corpusRowToExportRow(row store.CorpusExportRow) (corpusExportRow, error) {
+	if row.FeatureKeySpace != registry.KeySpace {
+		return corpusExportRow{}, fmt.Errorf("feature_key_space: cannot export %q as %s", row.FeatureKeySpace, registry.KeySpace)
+	}
 	var out corpusExportRow
+	out.FeatureKeySpace = registry.KeySpace
 	out.ID = fmt.Sprintf("corpus_%d", row.ID)
 	out.Label = row.Label
 	out.Split = row.Split

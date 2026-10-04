@@ -129,7 +129,7 @@ func genDormantThenBlast(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow)
 		// Roughly half agents, half keys — matching the existing
 		// hand-written eval/fixtures/dormant_then_blast.jsonl (5
 		// agents + 5 keys), which is what makes both
-		// resource_velocity_1h AND key_velocity_1h fire together; an
+		// core.resource_velocity_1h AND core.credential_velocity_1h fire together; an
 		// agents-only burst under-weights this family relative to the
 		// weights it was originally tuned against.
 		kind := "agent"
@@ -147,7 +147,7 @@ func genDormantThenBlast(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow)
 
 	sendCount := 15 + rng.Intn(16) // 15..30
 	// Sends follow shortly after the resource burst, and the whole burst
-	// (agents + sends) stays within resource_velocity_1h's trailing 1h
+	// (agents + sends) stays within core.resource_velocity_1h's trailing 1h
 	// window from the LAST event (the one Slice "full" anchors on) — NOT
 	// spread across a further hour, which would push the early
 	// resource.created events outside that window by the time the last
@@ -224,7 +224,7 @@ func genSlowOperator(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 // that file's own header comment) that genWebmailBlast's recipients
 // rotate through. Every OTHER family's recipient_domain is a synthetic
 // `.example.test` name (public-repo data-boundary rule), which is exactly
-// why S2b's webmail_recipient_share/webmail_sends_1h read 0 across the
+// why S2b's email.webmail_recipient_share/email.webmail_sends_1h read 0 across the
 // entire corpus until this family exists — a real webmail-domain-heavy
 // blast needs a real webmail domain to recognize, and a fictional one
 // would prove nothing about WebmailSet's actual matching.
@@ -234,10 +234,10 @@ var webmailBlastDomains = []string{"gmail.com", "yahoo.com", "outlook.com", "hot
 // disposable-email account with the same fast decline/success/upgrade/
 // resource-burst shape as genFast, followed by a content.sent blast to
 // REAL consumer webmail addresses instead of the corpus's usual synthetic
-// domains, so webmail_recipient_share and webmail_sends_1h are actually
+// domains, so email.webmail_recipient_share and email.webmail_sends_1h are actually
 // exercised end to end (rather than reading 0 for the whole corpus, as
 // they otherwise would). No brand mention anywhere — this family isolates
-// the webmail-volume signal from subject_brand_match, which
+// the webmail-volume signal from email.subject_brand_match, which
 // genSubjectLure below exercises instead.
 func genWebmailBlast(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_webmailblast_%03d", idx)
@@ -304,9 +304,9 @@ var subjectLureTemplates = []string{
 // content.sent blast whose subject_line carries a fictional-brand lure
 // (never a real one — see subjectLureBrands), to REGULAR synthetic
 // `.example.test` recipients (never a webmail domain — this family
-// isolates subject_brand_match from the webmail-volume signal
+// isolates email.subject_brand_match from the webmail-volume signal
 // genWebmailBlast exercises instead). No resource/agent name mentions a
-// brand at all, so any name_brand_match observed on these subjects would
+// brand at all, so any brand.name_match observed on these subjects would
 // be a real bug, not this family's own construction.
 func genSubjectLure(rng *rand.Rand, idx int) ([]event.Event, eval.LabelRow) {
 	subject := fmt.Sprintf("acct_gen_subjectlure_%03d", idx)

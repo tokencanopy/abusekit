@@ -84,8 +84,8 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   fixture originally also carried, and raised its send volume from 20 to
   100 distinct recipients: the review required proof that volume/recipient
   signals ALONE — with no brand or resource evidence at all — still carry
-  this shape to `high`, exercising `sends_10m_max`/`sends_1h`/
-  `distinct_recipients_1h`'s history-relative `burstFactor` (see
+  this shape to `high`, exercising `email.sends_10m_max`/`email.sends_1h`/
+  `email.distinct_recipients_1h`'s history-relative `burstFactor` (see
   `internal/feature.burstFactor`/`priorTenMinutePeak`) directly: this
   subject has no prior sending history at all, so its burst reads at
   close to full strength.
@@ -96,8 +96,8 @@ against the seeds in the table above as part of this fixture-hygiene pass.
   fanning out to 30 distinct real customer domains; an agent literally
   named "PayPal integration" that only ever self-sends (10 times). Each
   one previously scored `high` (0.94/0.96/0.99) on an UNCAPPED count
-  feature alone (`self_send_before_external` or
-  `first_day_distinct_domains`) — see `internal/feature`'s
+  feature alone (`email.self_send_before_external` or
+  `email.first_day_distinct_domains`) — see `internal/feature`'s
   `selfSendBeforeExternalCap` (a hard cap) and
   `firstDayDistinctDomainsLogScale` (round 3, D2: a log1p(n) curve
   replacing R1's original hard cap, so volume above it is still
@@ -163,9 +163,9 @@ against the seeds in the table above as part of this fixture-hygiene pass.
     `high` on the strength of that real prior history.
   - `webmail_spread_1h.jsonl` — 80 webmail recipients spread evenly
     across a full hour (8-minute intervals, deliberately NOT concentrated
-    into any 10-minute window) — isolates `webmail_sends_1h`'s own
-    contribution from `sends_10m_max`'s (which stays modest here), so the
-    mutation sweep can prove `webmail_sends_1h` load-bearing on a REAL
+    into any 10-minute window) — isolates `email.webmail_sends_1h`'s own
+    contribution from `email.sends_10m_max`'s (which stays modest here), so the
+    mutation sweep can prove `email.webmail_sends_1h` load-bearing on a REAL
     fixture rather than only a synthetic scenario (R6).
 
 See `internal/worker/replay_test.go`, `replay_churn_test.go`,
@@ -178,7 +178,7 @@ bounded which weight.
   "meetup" individually — too broad, false-positiving on "<brand>: chat
   with support") with three whole PHRASES ("group meetup", "fan club",
   "community event"), and restricted it to subject-line matching only
-  (never a resource/agent name, restoring name_brand_match for a name
+  (never a resource/agent name, restoring brand.name_match for a name
   like "<brand> Support Chat"). `community_group_photo_walk.jsonl` is the
   required fixture: a day-0 community-group account posting an ordinary
   update with NO community phrase ("Fictabook photo walk this Saturday")
@@ -207,28 +207,28 @@ bounded which weight.
     and `docs/design`'s own §8 open-questions entry for why.
 
 - **S2b's round 2 (R6)** replaced the isolated synthetic scenarios that
-  used to bound `sends_1h`, `sends_first_day`, `distinct_recipients_1h`
-  and `subject_brand_match` with real replay fixtures — a reviewer's own
+  used to bound `email.sends_1h`, `email.sends_first_day`, `email.distinct_recipients_1h`
+  and `email.subject_brand_match` with real replay fixtures — a reviewer's own
   finding: a synthetic scenario proves a weight moves SOME feature
   vector's score, but not that the shipped feature-extraction code
   actually produces that vector for a real fixture. Three DISTINCT
   fixtures, so a wiring swap between two features would fail a test:
-  - `moderate_volume_single_brand.jsonl` — bounds `subject_brand_match`:
+  - `moderate_volume_single_brand.jsonl` — bounds `email.subject_brand_match`:
     modest volume (15 webmail recipients) far too small to reach `high`
     alone, plus one brand mention.
-  - `repeat_recipient_resend.jsonl` — bounds `sends_1h` AND
-    `distinct_recipients_1h` with DIFFERENT values: the same 5
-    recipients sent to twice within the hour, so `sends_1h`'s sum
-    exceeds `distinct_recipients_1h`'s deduplicated count (every other
+  - `repeat_recipient_resend.jsonl` — bounds `email.sends_1h` AND
+    `email.distinct_recipients_1h` with DIFFERENT values: the same 5
+    recipients sent to twice within the hour, so `email.sends_1h`'s sum
+    exceeds `email.distinct_recipients_1h`'s deduplicated count (every other
     committed fixture happens to give the two identical values).
-  - `first_day_burst_then_quiet.jsonl` — bounds `sends_first_day`,
+  - `first_day_burst_then_quiet.jsonl` — bounds `email.sends_first_day`,
     evaluated 26 hours after the subject's first event (see
     `internal/worker/replay_test.go`'s `TestReplay_FirstDayBurstThenQuietBand`)
-    so the burst has aged out of `sends_10m_max`/`sends_1h`/
-    `webmail_sends_1h`/`distinct_recipients_1h`'s current window
+    so the burst has aged out of `email.sends_10m_max`/`email.sends_1h`/
+    `email.webmail_sends_1h`/`email.distinct_recipients_1h`'s current window
     entirely, isolating the one feature (a permanent fact) that hasn't.
 
-- **S2b's round 2 (R7)** age-decays `subject_brand_match` (the same
+- **S2b's round 2 (R7)** age-decays `email.subject_brand_match` (the same
   `ageDecayFactor` R1 already applies to the volume features), so an
   established sender's routine product copy mentioning a generic brand
   doesn't read as a permanent lift forever. `established_product_copy_brand_mention.jsonl`
@@ -317,8 +317,8 @@ those numbers became the CI gate's floors.
   real brand, this repo's hygiene rule for fabricated lure prose)
   respectively. Every other family's recipient_domain is a synthetic
   `.example.test` name and no other family ever sets `subject_line` at
-  all, so without these two, S2b's `webmail_recipient_share`/
-  `webmail_sends_1h`/`subject_brand_match` read 0 across the entire
+  all, so without these two, S2b's `email.webmail_recipient_share`/
+  `email.webmail_sends_1h`/`email.subject_brand_match` read 0 across the entire
   corpus — proven, not assumed (`eval.TestLoadReplayDataset_WebmailRecipientShareIsNonZero`
   proves the harness threads a WebmailSet through at all; the gate's own
   weight-zeroing sweep, PR body, shows these two families' effect on the

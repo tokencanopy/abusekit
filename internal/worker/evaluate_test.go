@@ -272,7 +272,7 @@ func TestEvaluateSubject_SyncOnlyCarriesForwardVendorVerdict(t *testing.T) {
 		t.Fatalf("expected the subject to remain stale (dirty_seq > scored_seq) after a syncOnly carry-forward round")
 	}
 
-	// fake_rule's only declared input is subject_age_h, which never changes
+	// fake_rule's only declared input is core.subject_age_h, which never changes
 	// on its own while now is frozen — advancing the clock before the
 	// second Tick is what makes core.Plan see genuinely different inputs
 	// for the vendor rule (rather than replaying its own SkipInputUnchanged

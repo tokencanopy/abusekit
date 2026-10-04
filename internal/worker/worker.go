@@ -26,6 +26,7 @@ import (
 	"github.com/tokencanopy/abusekit/internal/core"
 	"github.com/tokencanopy/abusekit/internal/event"
 	"github.com/tokencanopy/abusekit/internal/feature"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"github.com/tokencanopy/abusekit/internal/model"
 	"github.com/tokencanopy/abusekit/internal/store"
 )
@@ -104,8 +105,8 @@ type Deps struct {
 	Store     Store
 	Config    *config.Config
 	Neighbors feature.Neighbors  // feature.NewStoreNeighbors(realStore, cfg) in production; feature.NoNeighbors is a valid choice too.
-	Brands    feature.BrandSet   // config/brands.yaml merged with an optional brands_extra, loaded once at startup; the zero value holds name_brand_match/subject_brand_match at 0.
-	Webmail   feature.WebmailSet // config/webmail.yaml, loaded once at startup (S2b); the zero value holds webmail_recipient_share/webmail_sends_1h at 0.
+	Brands    feature.BrandSet   // config/brands.yaml merged with an optional brands_extra, loaded once at startup; the zero value holds brand.name_match/email.subject_brand_match at 0.
+	Webmail   feature.WebmailSet // config/webmail.yaml, loaded once at startup (S2b); the zero value holds email.webmail_recipient_share/email.webmail_sends_1h at 0.
 
 	// Calibration is consulted by internal/core.Combine the same way it
 	// would be by the harness (S4). v0 has no vendor scorer needing a
@@ -754,7 +755,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			// R7 round 2, proven: LatestVerdict.InputHash reflects the
 			// literal latest row regardless of status. Feeding an ERRORED
 			// round's hash to Plan as LastInputHash meant that once
-			// quantization (below) made subject_age_h/upgrade_delay_min
+			// quantization (below) made core.subject_age_h/core.upgrade_delay_min
 			// repeat across rounds, a rule already PAST its backoff window
 			// would match that stale error hash and skip re-invoking the
 			// scorer at all — silently freezing on the SAME error forever
@@ -777,7 +778,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		return core.Verdict{}, nil, time.Time{}, false, fmt.Errorf("prune rule_state: %w", err)
 	}
 
-	calls := core.Plan(fr.Features.Map(), nil, ruleStates) // N1 fix round: nil Text — v0 has no text-input rule registered yet (S5 adds the first one); Plan's own doc comment covers what a non-nil map would do.
+	calls := core.Plan(core.Vector{Values: fr.Features.Map(), HashQuantum: registry.HashQuanta()}, nil, ruleStates) // N1 fix round: nil Text — v0 has no text-input rule registered yet (S5 adds the first one); Plan's own doc comment covers what a non-nil map would do.
 	results := make([]*model.ScoreResult, len(calls))
 	outcomes := make([]core.RuleOutcome, len(calls))
 	isElevated := elevated(d.CurrentTier)
@@ -837,7 +838,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			if lv, ok := latest[r.Name]; ok && lv.Status == "scored" {
 				res := model.ScoreResult{Probs: lv.Probs, Model: lv.Model, Checkpoint: lv.Checkpoint, Render: call.Request.RenderVersion}
 				results[i] = &res
-				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason}
+				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason, ReasonVersion: lv.ReasonVersion}
 				inputHashOverride[i] = lv.InputHash
 			} else {
 				// R3 (round 2 fix round): nothing to carry forward, and
@@ -890,7 +891,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			if lv, ok := latest[r.Name]; ok && lv.Status == "scored" {
 				res := model.ScoreResult{Probs: lv.Probs, Model: lv.Model, Checkpoint: lv.Checkpoint, Render: call.Request.RenderVersion}
 				results[i] = &res
-				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason}
+				outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: lv.Reason, ReasonVersion: lv.ReasonVersion}
 			} else if ok {
 				outcomes[i] = core.RuleOutcome{Rule: r, Unscored: true, ErrorCode: lv.ErrorCode}
 			} else {
@@ -1017,7 +1018,7 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 		if r.Scorer == "local" {
 			reason = renderReason(fr.Features)
 		}
-		outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: reason}
+		outcomes[i] = core.RuleOutcome{Rule: r, Result: &res, Reason: reason, ReasonVersion: 2}
 	}
 
 	// R3 (round 2 fix round): drop every omitted index from calls,
@@ -1078,20 +1079,21 @@ func (w *Worker) computeVerdict(ctx, scoreCtx context.Context, d store.DirtySubj
 			inputHash = inputHashOverride[i]
 		}
 		records[i] = store.VerdictRecord{
-			Rule:        sig.Rule,
-			Mode:        string(sig.Mode),
-			Scorer:      call.Rule.Scorer,
-			Model:       sig.Model,
-			Checkpoint:  sig.Checkpoint,
-			Render:      call.Request.RenderVersion,
-			Calibration: sig.Calibration,
-			Probs:       probs,
-			Risk:        risk,
-			Flagged:     sig.Flagged,
-			Reason:      sig.Reason,
-			InputHash:   inputHash,
-			Status:      sig.Status,
-			ErrorCode:   sig.ErrorCode,
+			Rule:          sig.Rule,
+			Mode:          string(sig.Mode),
+			Scorer:        call.Rule.Scorer,
+			Model:         sig.Model,
+			Checkpoint:    sig.Checkpoint,
+			Render:        call.Request.RenderVersion,
+			Calibration:   sig.Calibration,
+			Probs:         probs,
+			Risk:          risk,
+			Flagged:       sig.Flagged,
+			Reason:        sig.Reason,
+			ReasonVersion: sig.ReasonVersion,
+			InputHash:     inputHash,
+			Status:        sig.Status,
+			ErrorCode:     sig.ErrorCode,
 		}
 	}
 

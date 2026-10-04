@@ -217,7 +217,7 @@ rules:
   - name: fake_rule
     mode: advise
     scorer: fake_test_scorer
-    inputs: [subject_age_h]
+    inputs: [core.subject_age_h]
     labels: [benign, abusive]
     benign_label: benign
     threshold: 0.5

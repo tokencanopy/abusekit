@@ -27,7 +27,7 @@ const evalTenant = "eval"
 // B1) for "an operator/outcome label was recorded for this subject at
 // this instant" — NOT a real design §4.3 vocabulary entry (production
 // labels live in a separate `labels` table, never the `events` stream;
-// see design §4.9). A replay corpus that wants linked_labelled_abusive_n
+// see design §4.9). A replay corpus that wants core.linked_labelled_abusive_n
 // to be exercised at all includes rows of this type; one that doesn't
 // simply gets that feature held at 0 for every subject, which is honest
 // (nothing "knew" a neighbour was labelled). Data shape: `{"label":
@@ -136,7 +136,7 @@ type ReplayInput struct {
 // resolve `label`-typed events' positive/negative class — see
 // neighbors.go's labelledAsOf); pass config.Rule.BenignLabel, never a
 // literal. webmail is threaded straight through to every feature.Extract
-// call below (S2b's webmail_recipient_share/webmail_sends_1h need it);
+// call below (S2b's email.webmail_recipient_share/email.webmail_sends_1h need it);
 // the zero value (feature.WebmailSet{}) matches every domain as
 // non-webmail, same as passing no webmail config at all.
 //
@@ -472,7 +472,7 @@ func parseEventRows(path string, r io.Reader) (map[string][]event.Event, map[str
 				// event is never part of feature-relevant activity
 				// history (see labelEventType's own doc comment), so
 				// dropping one can't produce a partial ACTIVITY history —
-				// only a gap in linked_labelled_abusive_n evidence, a
+				// only a gap in core.linked_labelled_abusive_n evidence, a
 				// different and much softer concern T2 doesn't ask for.
 				rowErrs = append(rowErrs, RowError{Source: path, Line: line, Code: "bad_label_event", Err: fmt.Errorf("events: subject %q: a %q event needs a non-empty string data.label", row.Subject, labelEventType)})
 				return nil

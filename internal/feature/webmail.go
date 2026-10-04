@@ -1,6 +1,6 @@
 // webmail.go — config/webmail.yaml's loaded domain set: a public list of
 // major consumer webmail providers, used only to compute
-// webmail_recipient_share and webmail_sends_1h (§4.5). Deliberately a
+// email.webmail_recipient_share and email.webmail_sends_1h (§4.5). Deliberately a
 // flat, public list of well-known provider domain names (gmail.com,
 // outlook.com, ...) — see config/webmail.yaml's own header for why this
 // stays public-repo-safe (AGENTS.md's data-boundary rule).
@@ -16,8 +16,8 @@ import (
 
 // WebmailSet is a loaded, ready-to-query set of webmail domains
 // (config/webmail.yaml). The zero value matches nothing — a caller that
-// hasn't loaded a webmail list simply gets webmail_recipient_share/
-// webmail_sends_1h held at 0, never a panic or an error.
+// hasn't loaded a webmail list simply gets email.webmail_recipient_share/
+// email.webmail_sends_1h held at 0, never a panic or an error.
 type WebmailSet struct {
 	domains map[string]struct{}
 }

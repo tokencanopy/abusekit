@@ -174,8 +174,8 @@ func TestLocalContract(t *testing.T) {
 			BenignLabel: "benign",
 			Bias:        -2,
 			Weight: map[string]float64{
-				"resource_velocity_1h": 0.8,
-				"name_brand_match":     1.2,
+				"core.resource_velocity_1h": 0.8,
+				"brand.name_match":          1.2,
 			},
 		}
 		s, err := local.New(w)
@@ -188,7 +188,7 @@ func TestLocalContract(t *testing.T) {
 		New: newLocal,
 		ValidRequest: model.ScoreRequest{
 			Labels:   []string{"benign", "suspicious", "abusive"},
-			Features: map[string]float64{"resource_velocity_1h": 3, "name_brand_match": 1},
+			Features: map[string]float64{"core.resource_velocity_1h": 3, "brand.name_match": 1},
 		},
 		RejectedLabelSets: [][]string{
 			{"suspicious", "abusive"}, // missing the required benign label

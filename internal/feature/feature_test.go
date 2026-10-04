@@ -261,16 +261,16 @@ func TestResourceCount_VelocityAndTotal(t *testing.T) {
 	now := at(2*time.Hour + 30*time.Minute)
 
 	if got := resourceCount(events, "", now, time.Hour); got != 1 {
-		t.Errorf("resource_velocity_1h = %v, want 1 (only r3 is within the last hour)", got)
+		t.Errorf("core.resource_velocity_1h = %v, want 1 (only r3 is within the last hour)", got)
 	}
 	if got := resourceCount(events, "", now, 0); got != 3 {
-		t.Errorf("resource_total = %v, want 3 (resource.created only, not resource.deleted)", got)
+		t.Errorf("core.resource_total = %v, want 3 (resource.created only, not resource.deleted)", got)
 	}
 	if got := resourceCount(events, "key", now, 0); got != 1 {
-		t.Errorf("key_total = %v, want 1", got)
+		t.Errorf("core.credential_total = %v, want 1", got)
 	}
 	if got := resourceCount(events, "key", now, time.Hour); got != 0 {
-		t.Errorf("key_velocity_1h = %v, want 0 (the one key is 2h old)", got)
+		t.Errorf("core.credential_velocity_1h = %v, want 0 (the one key is 2h old)", got)
 	}
 }
 
@@ -284,7 +284,7 @@ func TestResourceCount_KindNormalization(t *testing.T) {
 	}
 	now := at(time.Minute)
 	if got := resourceCount(events, "key", now, 0); got != 3 {
-		t.Errorf("key_total with mixed-case/whitespace kind = %v, want 3", got)
+		t.Errorf("core.credential_total with mixed-case/whitespace kind = %v, want 3", got)
 	}
 }
 
@@ -296,7 +296,7 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 16 {
-			t.Errorf("upgrade_delay_min = %v, want 16", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 16", got)
 		}
 	})
 	t.Run("a trialing subscription with a price is NOT an upgrade (R5, round 2)", func(t *testing.T) {
@@ -305,11 +305,11 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 			ev("u1", "subscription.changed", 16*time.Minute, map[string]any{"plan": "plan_b", "status": "trialing", "amount_minor": float64(2900)}),
 		}
 		if u := upgraded(events); u != 0 {
-			t.Errorf("upgraded = %v, want 0 for a trialing subscription (a price on file is not the same as actually being charged)", u)
+			t.Errorf("core.upgraded = %v, want 0 for a trialing subscription (a price on file is not the same as actually being charged)", u)
 		}
 		got := upgradeDelayMinutes(events, base, at(45*time.Minute))
 		if got != 45 {
-			t.Errorf("upgrade_delay_min = %v, want 45 (falls back to elapsed-so-far; the trialing event must not count as the upgrade)", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 45 (falls back to elapsed-so-far; the trialing event must not count as the upgrade)", got)
 		}
 	})
 	t.Run("active status with a price after a trialing one: only the active one counts", func(t *testing.T) {
@@ -319,11 +319,11 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 			ev("u2", "subscription.changed", 20*time.Minute, map[string]any{"plan": "plan_b", "status": "active", "amount_minor": float64(2900)}),
 		}
 		if u := upgraded(events); u != 1 {
-			t.Errorf("upgraded = %v, want 1", u)
+			t.Errorf("core.upgraded = %v, want 1", u)
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 20 {
-			t.Errorf("upgrade_delay_min = %v, want 20 (the active event, not the earlier trialing one)", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 20 (the active event, not the earlier trialing one)", got)
 		}
 	})
 	t.Run("a free-plan change is not an upgrade (B5, proven)", func(t *testing.T) {
@@ -333,30 +333,30 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 		}
 		got := upgradeDelayMinutes(events, base, at(45*time.Minute))
 		if got != 45 {
-			t.Errorf("upgrade_delay_min = %v, want 45 (falls back to elapsed-so-far; the free-plan event must not count)", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 45 (falls back to elapsed-so-far; the free-plan event must not count)", got)
 		}
 		if u := upgraded(events); u != 0 {
-			t.Errorf("upgraded = %v, want 0 for a free-plan change", u)
+			t.Errorf("core.upgraded = %v, want 0 for a free-plan change", u)
 		}
 	})
 	t.Run("a subscription.changed with no amount_minor at all is not an upgrade", func(t *testing.T) {
 		events := []event.Event{ev("u1", "subscription.changed", time.Minute, map[string]any{"plan": "free"})}
 		if u := upgraded(events); u != 0 {
-			t.Errorf("upgraded = %v, want 0", u)
+			t.Errorf("core.upgraded = %v, want 0", u)
 		}
 	})
 	t.Run("no upgrade yet: falls back to minutes elapsed so far", func(t *testing.T) {
 		events := []event.Event{ev("s1", "subject.created", 0, nil)}
 		got := upgradeDelayMinutes(events, base, at(45*time.Minute))
 		if got != 45 {
-			t.Errorf("upgrade_delay_min = %v, want 45", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 45", got)
 		}
 	})
 	t.Run("clamps at 24h even for a very old non-upgraded account (B5, proven)", func(t *testing.T) {
 		events := []event.Event{ev("s1", "subject.created", 0, nil)}
 		got := upgradeDelayMinutes(events, base, at(14*24*time.Hour))
 		if got != upgradeDelayClampMinutes {
-			t.Errorf("upgrade_delay_min = %v, want the clamp ceiling %v", got, upgradeDelayClampMinutes)
+			t.Errorf("core.upgrade_delay_min = %v, want the clamp ceiling %v", got, upgradeDelayClampMinutes)
 		}
 	})
 	t.Run("out-of-order delivery: earliest PAID subscription.changed wins regardless of slice order", func(t *testing.T) {
@@ -366,7 +366,7 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 5 {
-			t.Errorf("upgrade_delay_min = %v, want 5 (the earliest event, even though it's later in the slice)", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 5 (the earliest event, even though it's later in the slice)", got)
 		}
 	})
 	t.Run("a free change before a later paid one: only the paid one counts", func(t *testing.T) {
@@ -376,10 +376,10 @@ func TestUpgradeDelayMinutes(t *testing.T) {
 		}
 		got := upgradeDelayMinutes(events, base, at(time.Hour))
 		if got != 10 {
-			t.Errorf("upgrade_delay_min = %v, want 10 (the first PAID event, not the earlier free one)", got)
+			t.Errorf("core.upgrade_delay_min = %v, want 10 (the first PAID event, not the earlier free one)", got)
 		}
 		if u := upgraded(events); u != 1 {
-			t.Errorf("upgraded = %v, want 1", u)
+			t.Errorf("core.upgraded = %v, want 1", u)
 		}
 	})
 }
@@ -393,7 +393,7 @@ func TestDeclinesBeforeFirstSuccess(t *testing.T) {
 			ev("p4", "payment.attempt", 30*time.Second, map[string]any{"outcome": "declined"}), // after success: not counted
 		}
 		if got := declinesBeforeFirstSuccess(events); got != 2 {
-			t.Errorf("declines_before_first_success = %v, want 2", got)
+			t.Errorf("core.declines_before_first_success = %v, want 2", got)
 		}
 	})
 	t.Run("no success yet: counts every decline so far", func(t *testing.T) {
@@ -403,7 +403,7 @@ func TestDeclinesBeforeFirstSuccess(t *testing.T) {
 			ev("p3", "payment.attempt", 20*time.Second, map[string]any{"outcome": "blocked"}),
 		}
 		if got := declinesBeforeFirstSuccess(events); got != 2 {
-			t.Errorf("declines_before_first_success = %v, want 2", got)
+			t.Errorf("core.declines_before_first_success = %v, want 2", got)
 		}
 	})
 	t.Run("out-of-order delivery: a decline delivered after success but timestamped before it still counts", func(t *testing.T) {
@@ -412,7 +412,7 @@ func TestDeclinesBeforeFirstSuccess(t *testing.T) {
 			ev("p1", "payment.attempt", 10*time.Second, map[string]any{"outcome": "declined"}), // earlier At, delivered second
 		}
 		if got := declinesBeforeFirstSuccess(events); got != 1 {
-			t.Errorf("declines_before_first_success = %v, want 1", got)
+			t.Errorf("core.declines_before_first_success = %v, want 1", got)
 		}
 	})
 }
@@ -424,7 +424,7 @@ func TestFirstFundingPrepaid(t *testing.T) {
 			ev("p2", "payment.attempt", 10*time.Second, map[string]any{"outcome": "succeeded", "funding": "prepaid"}),
 		}
 		if got := firstFundingPrepaid(events); got != 1 {
-			t.Errorf("first_funding_prepaid = %v, want 1", got)
+			t.Errorf("core.first_funding_prepaid = %v, want 1", got)
 		}
 	})
 	t.Run("first success is not prepaid", func(t *testing.T) {
@@ -432,13 +432,13 @@ func TestFirstFundingPrepaid(t *testing.T) {
 			ev("p1", "payment.attempt", 0, map[string]any{"outcome": "succeeded", "funding": "credit"}),
 		}
 		if got := firstFundingPrepaid(events); got != 0 {
-			t.Errorf("first_funding_prepaid = %v, want 0", got)
+			t.Errorf("core.first_funding_prepaid = %v, want 0", got)
 		}
 	})
 	t.Run("no success yet", func(t *testing.T) {
 		events := []event.Event{ev("p1", "payment.attempt", 0, map[string]any{"outcome": "declined", "funding": "prepaid"})}
 		if got := firstFundingPrepaid(events); got != 0 {
-			t.Errorf("first_funding_prepaid = %v, want 0", got)
+			t.Errorf("core.first_funding_prepaid = %v, want 0", got)
 		}
 	})
 	t.Run("out-of-order delivery: chronologically-first success decides, not delivery order", func(t *testing.T) {
@@ -447,7 +447,7 @@ func TestFirstFundingPrepaid(t *testing.T) {
 			ev("p1", "payment.attempt", 10*time.Second, map[string]any{"outcome": "succeeded", "funding": "prepaid"}),
 		}
 		if got := firstFundingPrepaid(events); got != 1 {
-			t.Errorf("first_funding_prepaid = %v, want 1 (the earlier success, funding=prepaid)", got)
+			t.Errorf("core.first_funding_prepaid = %v, want 1 (the earlier success, funding=prepaid)", got)
 		}
 	})
 }
@@ -466,27 +466,27 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 	t.Run("brand match on the raw name", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
 		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
-			t.Errorf("name_brand_match = %v, want 1", got)
+			t.Errorf("brand.name_match = %v, want 1", got)
 		}
 	})
 	t.Run("no brand match", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "Notifications Agent"})}
 		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 0 {
-			t.Errorf("name_brand_match = %v, want 0", got)
+			t.Errorf("brand.name_match = %v, want 0", got)
 		}
 	})
 	t.Run("empty BrandSet never matches", func(t *testing.T) {
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "PayPal Support"})}
 		if got := boolToFloat(len(namedBrandNames(events, BrandSet{})) > 0); got != 0 {
-			t.Errorf("name_brand_match with an empty BrandSet = %v, want 0", got)
+			t.Errorf("brand.name_match with an empty BrandSet = %v, want 0", got)
 		}
 	})
 	t.Run("has_at checks the RAW name, not a folded form", func(t *testing.T) {
 		// '@' folds to 'a' in Skeleton (event.Skeleton's leetspeak table), so
-		// name_has_at must read the raw "name" field.
+		// brand.name_has_at must read the raw "name" field.
 		events := []event.Event{ev("r1", "resource.created", 0, map[string]any{"name": "support@agent"})}
 		if got := nameHasAt(events); got != 1 {
-			t.Errorf("name_has_at = %v, want 1", got)
+			t.Errorf("brand.name_has_at = %v, want 1", got)
 		}
 	})
 	t.Run("resource.deleted also counts", func(t *testing.T) {
@@ -496,7 +496,7 @@ func TestNameBrandMatchAndHasAt(t *testing.T) {
 		// gate, so it uses a name the gate leaves alone.
 		events := []event.Event{ev("r1", "resource.deleted", 0, map[string]any{"name": "PayPal Alert"})}
 		if got := boolToFloat(len(namedBrandNames(events, brands)) > 0); got != 1 {
-			t.Errorf("name_brand_match = %v, want 1", got)
+			t.Errorf("brand.name_match = %v, want 1", got)
 		}
 	})
 }
@@ -525,18 +525,18 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 		// the raw count: firstDayDistinctDomainsLogScale * log1p(3).
 		want := firstDayDistinctDomainsLogScale * math.Log1p(3)
 		if got := firstDayDistinctDomains(events, base, day); math.Abs(got-want) > 1e-9 {
-			t.Errorf("first_day_distinct_domains = %v, want %v (log1p(3) scaled)", got, want)
+			t.Errorf("email.first_day_distinct_domains = %v, want %v (log1p(3) scaled)", got, want)
 		}
 	})
 	t.Run("sends after the first day don't count", func(t *testing.T) {
 		events := []event.Event{ev("c1", "content.sent", day+time.Hour, map[string]any{"recipient_domain": "late.example.test"})}
 		if got := firstDayDistinctDomains(events, base, day); got != 0 {
-			t.Errorf("first_day_distinct_domains = %v, want 0", got)
+			t.Errorf("email.first_day_distinct_domains = %v, want 0", got)
 		}
 	})
 	t.Run("no domains at all is exactly zero", func(t *testing.T) {
 		if got := firstDayDistinctDomains(nil, base, day); got != 0 {
-			t.Errorf("first_day_distinct_domains = %v, want 0", got)
+			t.Errorf("email.first_day_distinct_domains = %v, want 0", got)
 		}
 	})
 	// D2 round 3: replaced the hard cap of 10 with a log1p(n) curve scaled
@@ -547,20 +547,20 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 	t.Run("n=10 matches the old hard cap's value exactly (weight-compatible)", func(t *testing.T) {
 		got := firstDayDistinctDomains(domainsFor(10), base, day)
 		if math.Abs(got-10) > 1e-9 {
-			t.Errorf("first_day_distinct_domains(10 domains) = %v, want 10 (log1p scaling must reproduce the old cap's contribution exactly at n=10)", got)
+			t.Errorf("email.first_day_distinct_domains(10 domains) = %v, want 10 (log1p scaling must reproduce the old cap's contribution exactly at n=10)", got)
 		}
 	})
 	t.Run("n=150 is meaningfully higher than n=10 (not flat past the old cap)", func(t *testing.T) {
 		at10 := firstDayDistinctDomains(domainsFor(10), base, day)
 		at150 := firstDayDistinctDomains(domainsFor(150), base, day)
 		if at150 <= at10+5 {
-			t.Errorf("first_day_distinct_domains(150) = %v, first_day_distinct_domains(10) = %v — want the former meaningfully higher (>=+5), not flat past the old cap", at150, at10)
+			t.Errorf("email.first_day_distinct_domains(150) = %v, email.first_day_distinct_domains(10) = %v — want the former meaningfully higher (>=+5), not flat past the old cap", at150, at10)
 		}
 	})
 	t.Run("n=30 (benign_receipts_fanout's own count) still lands well under a doubling of the old cap", func(t *testing.T) {
 		got := firstDayDistinctDomains(domainsFor(30), base, day)
 		if got < 10 || got > 20 {
-			t.Errorf("first_day_distinct_domains(30) = %v, want in [10,20] (grows past the old cap's 10, but compressed by log1p, not linear)", got)
+			t.Errorf("email.first_day_distinct_domains(30) = %v, want in [10,20] (grows past the old cap's 10, but compressed by log1p, not linear)", got)
 		}
 	})
 	t.Run("strictly monotonic in the number of distinct domains", func(t *testing.T) {
@@ -568,7 +568,7 @@ func TestFirstDayDistinctDomains(t *testing.T) {
 		for _, n := range []int{1, 5, 10, 30, 100, 300} {
 			got := firstDayDistinctDomains(domainsFor(n), base, day)
 			if got <= prev {
-				t.Errorf("first_day_distinct_domains(%d) = %v, want strictly greater than the previous n's %v", n, got, prev)
+				t.Errorf("email.first_day_distinct_domains(%d) = %v, want strictly greater than the previous n's %v", n, got, prev)
 			}
 			prev = got
 		}
@@ -584,19 +584,19 @@ func TestSelfSendBeforeExternal(t *testing.T) {
 			ev("c4", "content.sent", 3*time.Minute, map[string]any{"recipient_is_own_identity": true}), // after external: not counted
 		}
 		if got := selfSendBeforeExternal(events); got != 2 {
-			t.Errorf("self_send_before_external = %v, want 2", got)
+			t.Errorf("email.self_send_before_external = %v, want 2", got)
 		}
 	})
 	t.Run("no external send yet: every self-send counts", func(t *testing.T) {
 		events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"recipient_is_own_identity": true})}
 		if got := selfSendBeforeExternal(events); got != 1 {
-			t.Errorf("self_send_before_external = %v, want 1", got)
+			t.Errorf("email.self_send_before_external = %v, want 1", got)
 		}
 	})
 	t.Run("no self-sends at all", func(t *testing.T) {
 		events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"recipient_is_own_identity": false})}
 		if got := selfSendBeforeExternal(events); got != 0 {
-			t.Errorf("self_send_before_external = %v, want 0", got)
+			t.Errorf("email.self_send_before_external = %v, want 0", got)
 		}
 	})
 	t.Run("out-of-order delivery: earliest external send wins regardless of slice order", func(t *testing.T) {
@@ -606,7 +606,7 @@ func TestSelfSendBeforeExternal(t *testing.T) {
 			ev("c2", "content.sent", time.Minute, map[string]any{"recipient_is_own_identity": true}),
 		}
 		if got := selfSendBeforeExternal(events); got != 2 {
-			t.Errorf("self_send_before_external = %v, want 2", got)
+			t.Errorf("email.self_send_before_external = %v, want 2", got)
 		}
 	})
 	t.Run("saturates at the cap (R1 round 2)", func(t *testing.T) {
@@ -615,7 +615,7 @@ func TestSelfSendBeforeExternal(t *testing.T) {
 			events = append(events, ev(fmt.Sprintf("c%d", i), "content.sent", time.Duration(i)*time.Minute, map[string]any{"recipient_is_own_identity": true}))
 		}
 		if got := selfSendBeforeExternal(events); got != selfSendBeforeExternalCap {
-			t.Errorf("self_send_before_external = %v, want the cap %v (8 self-sends before ever sending externally must not swamp the model uncapped)", got, selfSendBeforeExternalCap)
+			t.Errorf("email.self_send_before_external = %v, want the cap %v (8 self-sends before ever sending externally must not swamp the model uncapped)", got, selfSendBeforeExternalCap)
 		}
 	})
 }
@@ -1043,7 +1043,7 @@ func TestKeyVelocity_RecognisesAliasedKinds(t *testing.T) {
 	}
 	got := resourceCount(events, resourceKindKey, at(0), time.Hour)
 	if got != 3 {
-		t.Errorf("key_velocity_1h with aliased kinds = %v, want 3 (the agent kind must not count)", got)
+		t.Errorf("core.credential_velocity_1h with aliased kinds = %v, want 3 (the agent kind must not count)", got)
 	}
 }
 
@@ -1062,7 +1062,7 @@ func TestSends1h_HistoryRelativeNotCalendarGated(t *testing.T) {
 	}
 	young := sends1h(events, firstSeenAt.Add(6*24*time.Hour), firstSeenAt, time.Hour)
 	if young <= 0 {
-		t.Errorf("sends_1h (young account, no prior history) = %v, want a strongly positive burst_factor-driven value", young)
+		t.Errorf("email.sends_1h (young account, no prior history) = %v, want a strongly positive burst_factor-driven value", young)
 	}
 
 	// An established account (60 days old) with a comparable REAL prior
@@ -1080,10 +1080,10 @@ func TestSends1h_HistoryRelativeNotCalendarGated(t *testing.T) {
 	oldNow := firstSeenAt.Add(60 * 24 * time.Hour)
 	old := sends1h(establishedEvents, oldNow, firstSeenAt, time.Hour)
 	if old <= 0 {
-		t.Errorf("sends_1h (established, real prior baseline) = %v, want > 0 (never a hard 0)", old)
+		t.Errorf("email.sends_1h (established, real prior baseline) = %v, want > 0 (never a hard 0)", old)
 	}
 	if old >= young {
-		t.Errorf("sends_1h established=%v must read LOWER than young=%v despite an equal or larger raw burst", old, young)
+		t.Errorf("email.sends_1h established=%v must read LOWER than young=%v despite an equal or larger raw burst", old, young)
 	}
 }
 
@@ -1097,7 +1097,7 @@ func TestSends10mMax_GatedByAccountAgeAndCappedNotLifetime(t *testing.T) {
 	now := firstSeenAt.Add(2 * time.Hour)
 	got := sends10mMax(events, now, firstSeenAt)
 	if got != 200 {
-		t.Errorf("sends_10m_max (young account) = %v, want 200 (both events in the same 10m window)", got)
+		t.Errorf("email.sends_10m_max (young account) = %v, want 200 (both events in the same 10m window)", got)
 	}
 
 	// The SAME historical burst, viewed 60 days later (an established
@@ -1106,7 +1106,7 @@ func TestSends10mMax_GatedByAccountAgeAndCappedNotLifetime(t *testing.T) {
 	longAfter := firstSeenAt.Add(60 * 24 * time.Hour)
 	gotLater := sends10mMax(events, longAfter, firstSeenAt)
 	if gotLater != 0 {
-		t.Errorf("sends_10m_max (60 days after a first-week burst) = %v, want 0", gotLater)
+		t.Errorf("email.sends_10m_max (60 days after a first-week burst) = %v, want 0", gotLater)
 	}
 }
 
@@ -1120,7 +1120,7 @@ func TestSendsFirstDay_NotGatedByAccountAge(t *testing.T) {
 	now := firstSeenAt.Add(60 * 24 * time.Hour)
 	got := sendsFirstDay(events, firstSeenAt, now, 24*time.Hour)
 	if got != 40 {
-		t.Errorf("sends_first_day (60 days later) = %v, want 40 (permanent, not gated)", got)
+		t.Errorf("email.sends_first_day (60 days later) = %v, want 40 (permanent, not gated)", got)
 	}
 }
 
@@ -1129,7 +1129,7 @@ func TestSends10mMax_FutureDatedEventsExcluded(t *testing.T) {
 	events := []event.Event{ev("c1", "content.sent", 2*time.Hour, map[string]any{"recipient_count": float64(999)})}
 	now := at(time.Hour)
 	if got := sends10mMax(events, now, base); got != 0 {
-		t.Errorf("sends_10m_max with a future-dated event = %v, want 0", got)
+		t.Errorf("email.sends_10m_max with a future-dated event = %v, want 0", got)
 	}
 }
 
@@ -1172,7 +1172,7 @@ func TestWebmailSends1h_ComputedDirectlyNotShareTimesVolume(t *testing.T) {
 	now := at(time.Hour)
 	got := webmailSends1h(events, now, firstSeenAt, time.Hour, webmail)
 	if got != 40 {
-		t.Errorf("webmail_sends_1h = %v, want 40 (direct computation, not share*volume)", got)
+		t.Errorf("email.webmail_sends_1h = %v, want 40 (direct computation, not share*volume)", got)
 	}
 }
 
@@ -1188,11 +1188,11 @@ func TestWebmailRecipientShare_LifetimeAndNotGated(t *testing.T) {
 	now := firstSeenAt.Add(60 * 24 * time.Hour)
 	got := webmailRecipientShare(events, now, webmail)
 	if math.Abs(got-0.1) > 1e-9 {
-		t.Errorf("webmail_recipient_share = %v, want 0.1", got)
+		t.Errorf("email.webmail_recipient_share = %v, want 0.1", got)
 	}
 }
 
-// --- S2b: subject_brand_match (S1, S2) -----------------------------------
+// --- S2b: email.subject_brand_match (S1, S2) -----------------------------------
 
 func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
 	brands := smallTestBrands()
@@ -1201,7 +1201,7 @@ func TestSubjectBrandMatch_NotGatedBySubjectsOwnWords(t *testing.T) {
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Your PayPal package tracking update"})}
 	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != 1 {
-		t.Errorf("subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
+		t.Errorf("email.subject_brand_match = %v, want 1 (subject's own words must not gate this)", got)
 	}
 }
 
@@ -1215,7 +1215,7 @@ func TestSubjectBrandMatch_ExemptsOnlyTheAdjacentBrand(t *testing.T) {
 	exempt := map[string]struct{}{"PayPal": {}}
 	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, exempt)
 	if got != 1 {
-		t.Errorf("subject_brand_match = %v, want 1 (Stripe must still count; only PayPal is exempt)", got)
+		t.Errorf("email.subject_brand_match = %v, want 1 (Stripe must still count; only PayPal is exempt)", got)
 	}
 }
 
@@ -1225,7 +1225,7 @@ func TestSubjectBrandMatch_ExcludesBrandsAlreadyNamed(t *testing.T) {
 	alreadyNamed := map[string]struct{}{"PayPal": {}}
 	got := subjectBrandMatch(events, at(time.Hour), base, time.Hour, brands, alreadyNamed, nil)
 	if got != 0 {
-		t.Errorf("subject_brand_match = %v, want 0 (S2: already counted by name_brand_match)", got)
+		t.Errorf("email.subject_brand_match = %v, want 0 (S2: already counted by brand.name_match)", got)
 	}
 }
 
@@ -1234,13 +1234,13 @@ func TestSubjectBrandMatch_CapsAtThree(t *testing.T) {
 	events := []event.Event{ev("c1", "content.sent", 0, map[string]any{"subject_line": "Fictaone Fictatwo Fictathree Fictafour update"})}
 	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != subjectBrandMatchCap {
-		t.Errorf("subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
+		t.Errorf("email.subject_brand_match = %v, want capped at %v", got, subjectBrandMatchCap)
 	}
 }
 
 // TestSubjectBrandMatch_ExcludesSelfSends is round 2's R4: a self-send
 // (recipient_is_own_identity: true) must not count toward
-// subject_brand_match, the same exclusion every other send-volume
+// email.subject_brand_match, the same exclusion every other send-volume
 // feature already applies (isSelfSend) — the design's own [S2b] amendment
 // says these features "measure reach to OTHER recipients", and a
 // self-test rehearsal mentioning a brand in its own subject line is not
@@ -1252,11 +1252,11 @@ func TestSubjectBrandMatch_ExcludesSelfSends(t *testing.T) {
 	}
 	got := subjectBrandMatch(events, at(30*time.Minute), base, time.Hour, brands, nil, nil)
 	if got != 0 {
-		t.Errorf("subject_brand_match (self-send only) = %v, want 0", got)
+		t.Errorf("email.subject_brand_match (self-send only) = %v, want 0", got)
 	}
 }
 
-// --- Round 2, R7: subject_brand_match is age-decayed, never a permanent
+// --- Round 2, R7: email.subject_brand_match is age-decayed, never a permanent
 // lift for an established sender ------------------------------------------
 
 // TestSubjectBrandMatch_AgeDecayed is round 2's R7: an established
@@ -1273,16 +1273,16 @@ func TestSubjectBrandMatch_AgeDecayed(t *testing.T) {
 	// Young: firstSeenAt close to the event itself (age ~30min).
 	young := subjectBrandMatch(events, now, at(60*24*time.Hour), time.Hour, brands, nil, nil)
 	if young != 1 {
-		t.Errorf("subject_brand_match (young account) = %v, want 1", young)
+		t.Errorf("email.subject_brand_match (young account) = %v, want 1", young)
 	}
 
 	// Established: firstSeenAt 60 days before the event (age ~60d).
 	old := subjectBrandMatch(events, now, base, time.Hour, brands, nil, nil)
 	if old >= young {
-		t.Errorf("subject_brand_match (established account, same mention) = %v, must read LOWER than a young account's %v", old, young)
+		t.Errorf("email.subject_brand_match (established account, same mention) = %v, must read LOWER than a young account's %v", old, young)
 	}
 	if old <= 0 {
-		t.Errorf("subject_brand_match (established account) = %v, want > 0 (never a hard 0 — ageDecayFactor floors at 0.2)", old)
+		t.Errorf("email.subject_brand_match (established account) = %v, want > 0 (never a hard 0 — ageDecayFactor floors at 0.2)", old)
 	}
 }
 
@@ -1332,7 +1332,7 @@ func TestExemptSubjectBrands_LiveAgentExemptsOnlyItsOwnBrand(t *testing.T) {
 // TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing is round 2's
 // R2: a live agent whose name matches a brand but carries no integration
 // token at all must not exempt anything (that's an ordinary
-// brand-impersonating name, already caught by name_brand_match/S2 — not
+// brand-impersonating name, already caught by brand.name_match/S2 — not
 // a legitimate-integration signal).
 func TestExemptSubjectBrands_NoIntegrationTokenExemptsNothing(t *testing.T) {
 	brands := mechanismBrands()
@@ -1429,7 +1429,7 @@ func TestBurstFactor_HistoryRelative(t *testing.T) {
 }
 
 // TestSends10mMax_TrailingWindowNotWholeHistory is R1: "Replace
-// sends_10m_max's whole-history maximum with a trailing window, so a
+// email.sends_10m_max's whole-history maximum with a trailing window, so a
 // burst stops contributing once it leaves the window" — an old burst
 // (more than currentBurstWindow ago) must no longer count toward the
 // CURRENT search, even though it's still within the 30-day history
@@ -1443,6 +1443,6 @@ func TestSends10mMax_TrailingWindowNotWholeHistory(t *testing.T) {
 	now := at(48 * time.Hour) // 2 days after the old burst
 	got := sends10mMax(events, now, base)
 	if got != 0 {
-		t.Errorf("sends_10m_max = %v, want 0 (the only burst is outside the 24h current window)", got)
+		t.Errorf("email.sends_10m_max = %v, want 0 (the only burst is outside the 24h current window)", got)
 	}
 }

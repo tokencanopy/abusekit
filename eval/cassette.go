@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tokencanopy/abusekit/internal/feature/registry"
 	"os"
 	"sort"
 	"sync"
@@ -46,8 +47,9 @@ func (k CassetteKey) storageKey() string {
 // before marshaling. DatasetSHA (fix round S8) records which corpus this
 // cassette's entries were recorded against — see Cassette.VerifyDatasetSHA.
 type cassetteFile struct {
-	DatasetSHA string              `json:"dataset_sha,omitempty"`
-	Entries    []cassetteFileEntry `json:"entries"`
+	FeatureKeySpace string              `json:"feature_key_space"`
+	DatasetSHA      string              `json:"dataset_sha,omitempty"`
+	Entries         []cassetteFileEntry `json:"entries"`
 }
 
 type cassetteFileEntry struct {
@@ -80,6 +82,9 @@ func LoadCassette(path string) (*Cassette, error) {
 	var f cassetteFile
 	if err := json.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("eval: parse cassette %s: %w", path, err)
+	}
+	if f.FeatureKeySpace != registry.KeySpace {
+		return nil, fmt.Errorf("eval: cassette feature_key_space %q does not match %s", f.FeatureKeySpace, registry.KeySpace)
 	}
 	c.datasetSHA = f.DatasetSHA
 	for _, e := range f.Entries {
@@ -150,7 +155,7 @@ func (c *Cassette) Save() error {
 		entries = append(entries, e)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key.storageKey() < entries[j].Key.storageKey() })
-	b, err := json.MarshalIndent(cassetteFile{DatasetSHA: c.datasetSHA, Entries: entries}, "", "  ")
+	b, err := json.MarshalIndent(cassetteFile{FeatureKeySpace: registry.KeySpace, DatasetSHA: c.datasetSHA, Entries: entries}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("eval: marshal cassette: %w", err)
 	}

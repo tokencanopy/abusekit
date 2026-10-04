@@ -322,7 +322,7 @@ func TestBrandSet_CaseSensitiveShortToken(t *testing.T) {
 // integrationTokens.
 // TestBrandSet_NameMatchingNeverCommunityGated is round 2's R3: the
 // community-context gate applies ONLY to subject-line matching, never to
-// a resource/agent NAME — restores name_brand_match for a name like
+// a resource/agent NAME — restores brand.name_match for a name like
 // "<brand> Support Chat" or "<brand> Group Meetup Organizer".
 func TestBrandSet_NameMatchingNeverCommunityGated(t *testing.T) {
 	brands := NewBrandSet([]BrandEntry{{Name: "Fictabook"}})

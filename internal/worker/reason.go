@@ -19,10 +19,10 @@ import (
 // feature values only.
 func renderReason(f feature.Features) string {
 	return fmt.Sprintf(
-		"resource_velocity_1h=%.0f key_velocity_1h=%.0f declines_before_first_success=%.0f "+
-			"first_funding_prepaid=%.0f name_brand_match=%.0f name_has_at=%.0f "+
-			"self_send_before_external=%.0f linked_deleted_n=%.0f linked_labelled_abusive_n=%.0f "+
-			"fingerprint_seen_on_other_subjects=%.0f burst_ratio_24h_vs_lifetime=%.2f",
+		"core.resource_velocity_1h=%.0f core.credential_velocity_1h=%.0f core.declines_before_first_success=%.0f "+
+			"core.first_funding_prepaid=%.0f brand.name_match=%.0f brand.name_has_at=%.0f "+
+			"email.self_send_before_external=%.0f core.linked_deleted_n=%.0f core.linked_labelled_abusive_n=%.0f "+
+			"core.fingerprint_seen_on_other_subjects=%.0f core.burst_ratio_24h_vs_lifetime=%.2f",
 		f.ResourceVelocity1h, f.KeyVelocity1h, f.DeclinesBeforeFirstSuccess,
 		f.FirstFundingPrepaid, f.NameBrandMatch, f.NameHasAt,
 		f.SelfSendBeforeExternal, f.LinkedDeletedN, f.LinkedLabelledAbusiveN,

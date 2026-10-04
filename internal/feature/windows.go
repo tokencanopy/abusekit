@@ -637,7 +637,7 @@ func priorTenMinutePeak(events []event.Event, now time.Time) float64 {
 // pathological event or account can't swamp the local scorer's linear
 // model through raw magnitude alone — matching NameBrandMatch/
 // SubjectBrandMatch's own capped spirit. A plain cap (rather than
-// first_day_distinct_domains' log1p curve) is the better fit here: log1p
+// email.first_day_distinct_domains' log1p curve) is the better fit here: log1p
 // is already a substantial fraction of its own eventual ceiling at very
 // SMALL n, which would give an ordinary handful-of-recipients send nearly
 // as much weight, proportionally, as a genuine mass blast — backwards for
@@ -767,7 +767,7 @@ const sends10mMaxWindow = 10 * time.Minute
 // evadable (an account that simply waited past it read as fully
 // established regardless of whether it had ever actually sent anything
 // before) and the whole-history search itself wrong on its own terms —
-// "replace sends_10m_max's whole-history maximum with a trailing window,
+// "replace email.sends_10m_max's whole-history maximum with a trailing window,
 // so a burst stops contributing once it leaves the window" — a burst from
 // 40 days ago should not still register as "the current burst" just
 // because nothing more recent happened to beat it.
@@ -868,7 +868,7 @@ func webmailSends1h(events []event.Event, now, firstSeenAt time.Time, window tim
 // field — the same evidence nameBrandMatch reduces to a single 0/1, kept
 // here as a set so subjectBrandMatch can exclude a brand already counted
 // there (S2b's S2 fix round: "do not double-count the same brand across
-// name_brand_match and subject_brand_match"). Matched on the RAW name,
+// brand.name_match and email.subject_brand_match"). Matched on the RAW name,
 // not the precomputed name_skeleton — see nameBrandMatch's own doc
 // comment for why.
 func namedBrandNames(events []event.Event, brands BrandSet) map[string]struct{} {
@@ -912,7 +912,7 @@ func namedBrandNames(events []event.Event, brands BrandSet) map[string]struct{} 
 // Matched via BrandSet.MatchedBrandNamesForSubject (no integration-token
 // gate on the NAME text itself) rather than MatchedBrandNames: a name
 // like "Stripe Webhook Relay" is EXACTLY the shape the integration-token
-// gate suppresses when matching for name_brand_match — here we need the
+// gate suppresses when matching for brand.name_match — here we need the
 // opposite, to identify WHICH brand an already-known-to-be-an-integration
 // name is about.
 func exemptSubjectBrands(events []event.Event, brands BrandSet) map[string]struct{} {
@@ -960,8 +960,8 @@ func exemptSubjectBrands(events []event.Event, brands BrandSet) map[string]struc
 // never gated by words inside the subject line itself) matched across
 // every content.sent subject_line within the trailing window ending at
 // now, EXCLUDING any brand already counted by namedBrandNames (S2 fix
-// round: caps the combined per-brand contribution of name_brand_match
-// and subject_brand_match) and any brand in exemptBrands (R2 fix round:
+// round: caps the combined per-brand contribution of brand.name_match
+// and email.subject_brand_match) and any brand in exemptBrands (R2 fix round:
 // exemptSubjectBrands' precise, per-brand integration-name exemption —
 // see its own doc comment), capped at subjectBrandMatchCap, then
 // multiplied by ageDecayFactor (round 2, R7 fix round — see its own doc

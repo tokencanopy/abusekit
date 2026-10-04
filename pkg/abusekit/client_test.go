@@ -3,6 +3,7 @@ package abusekit_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -168,6 +169,14 @@ func TestClient_EvaluateReachesHigh(t *testing.T) {
 	}
 	if subj.Tier != "high" {
 		t.Fatalf("tier = %q, want high\nsignals: %+v", subj.Tier, subj.Signals)
+	}
+	if len(subj.Signals) == 0 {
+		t.Fatal("missing scored signals")
+	}
+	for _, sig := range subj.Signals {
+		if sig.Status == "scored" && (sig.ReasonVersion != 2 || !strings.Contains(sig.Reason, "core.resource_velocity_1h=")) {
+			t.Fatalf("SDK lost namespaced reason/version: %+v", sig)
+		}
 	}
 	if !subj.EvaluatedNow {
 		t.Fatalf("expected EvaluatedNow=true")
